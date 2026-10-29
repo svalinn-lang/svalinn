@@ -1,0 +1,1 @@
+module A; struct S { e: E; } enum E { A(i32), B } fn main() -> i32 { return 0; }

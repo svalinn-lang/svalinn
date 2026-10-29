@@ -783,13 +783,50 @@ unsafe fn parse_enum() {
     let n = expect_id();
     let ed = find_enum(n);
     expectop("{");
+    var pl = 0;   // largest payload
     while !isop("}") {
         if ed.nv >= 128 { die(cur().line, "too many enum variants"); }
-        ed.vn[ed.nv] = expect_id();
+        let vline = cur().line;
+        let vn = expect_id();
+        var i = 0;
+        while i < ed.nv {
+            if strcmp(ed.vn[i], vn) == 0 { dief(vline, "duplicate variant '%s' in enum '%s'", vn as i64, n as i64, 0); }
+            i += 1;
+        }
+        let v = ed.nv;
+        ed.vn[v] = vn;
         ed.nv += 1;
+        if acceptop("(") {
+            // Variant(T1, T2, ...): the values it carries, laid out like struct fields after the tag
+            var off = 8;
+            if isop(")") { dief(vline, "variant '%s' needs at least one value type (or no parentheses)", vn as i64, 0, 0); }
+            var more = true;
+            while more {
+                let fl = cur().line;
+                if ed.vnf[v] >= MAXVF { dief(fl, "too many values in variant '%s' (at most %d)", vn as i64, MAXVF as i64, 0); }
+                let ft = parse_type();
+                need_complete(ft, fl);
+                if ft.kind == TY_VOID { die(fl, "a variant cannot hold 'void'"); }
+                if has_iface(ft) { dief(fl, IFACE_MSG, tname(ft) as i64, 0, 0); }
+                off = (off + ft.align - 1) / ft.align * ft.align;
+                ed.vft[v * MAXVF + ed.vnf[v]] = ft;
+                ed.voff[v * MAXVF + ed.vnf[v]] = off;
+                ed.vnf[v] += 1;
+                off += ft.size;
+                more = acceptop(",");
+            }
+            expectop(")");
+            if off - 8 > pl { pl = off - 8; }
+        }
         if !acceptop(",") { break; }
     }
     expectop("}");
+    if ed.data != 0 {
+        // tag + the largest payload
+        ed.ty.size = 8 + (pl + 7) / 8 * 8;
+        ed.ty.align = 8;
+    }
+    ed.done = 1;
 }
 
 unsafe fn parse_fn_ex(cls: *StructDef, is_unsafe: i32, is_extern: i32, is_static: i32, vis: i32, is_ctor: i32, force: *u8, ifc: *Iface) {
@@ -1183,6 +1220,21 @@ unsafe fn prescan() {
                 ed.ty.ed = ed;
                 enums[nenums] = ed;
                 nenums += 1;
+                // a '(' in the body: variants carry values
+                if toks[i + 2].kind == TK_OP && streq(toks[i + 2].s, "{") {
+                    var j = i + 3;
+                    while toks[j].kind != TK_EOF && !(toks[j].kind == TK_OP && streq(toks[j].s, "}")) {
+                        if toks[j].kind == TK_OP && streq(toks[j].s, "(") {
+                            ed.data = 1;
+                            ed.ty.kind = TY_DATA;
+                            ed.ty.size = 8;
+                            ed.ty.align = 8;
+                            ed.ty.sign = 0;
+                            break;
+                        }
+                        j += 1;
+                    }
+                }
             }
         }
         i += 1;

@@ -152,6 +152,16 @@ unsafe fn d_expr(e: *Expr) {
     else if k == E_ENUMVAL {
         ps("(enumval "); ps(e.a.name as String); ps("."); ps(e.name as String); ps(" "); pn(e.ival); d_ty(e); ps(")");
     }
+    else if k == E_VARIANT {
+        let ed = e.ty.ed;
+        ps("(variant "); ps(ed.name as String); ps("."); ps(ed.vn[e.ival] as String); ps(" "); pn(e.ival);
+        var va = e.args;
+        while va != null { ps(" "); d_expr(va); va = va.next; }
+        if dump_typed != 0 && e.tmp != 0 { printf(" t%d", e.tmp as i64, 0, 0); }
+        if dump_typed != 0 && e.dflag != 0 { printf(" f%d", e.dflag as i64, 0, 0); }
+        d_ty(e);
+        ps(")");
+    }
     else if k == E_SLIT {
         ps("(slit "); ps(e.name as String);
         var fi = e.args;
@@ -210,6 +220,11 @@ unsafe fn d_stmt(s: *Stmt) {
             ps(" (arm ");
             d_expr_opt(c.e);
             if dump_typed != 0 && c.lv != null { printf(" @%d", c.lv.off as i64, 0, 0); }
+            var j = 0;
+            while j < MAXVF {
+                if dump_typed != 0 && c.vlv[j] != null { printf(" @%d", c.vlv[j].off as i64, 0, 0); }
+                j += 1;
+            }
             ps(" ");
             d_stmt(c.body);
             ps(")");

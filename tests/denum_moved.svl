@@ -1,0 +1,10 @@
+module A;
+class C { public: ctor() { } dtor { } }
+enum Slot { Free, Busy(C) }
+fn use_slot(s: Slot) { }
+fn main() -> i32 {
+    let s = Slot.Busy(C());
+    use_slot(s);
+    use_slot(s);
+    return 0;
+}

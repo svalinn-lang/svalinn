@@ -22,6 +22,8 @@ let TY_IFACE: i32 = 13;
 let TY_FLOAT: i32 = 14;
 let TY_FLIT: i32 = 15;
 let TY_TASK: i32 = 16;
+let TY_DATA: i32 = 17;   // enum whose variants carry values
+let MAXVF: i32 = 8;      // values per enum variant
 let IFACE_MSG: String = "interface type '%s' can only be used as a function parameter (it borrows the object)";
 
 struct Type {
@@ -38,7 +40,8 @@ struct Iface { name: *u8; ty: *Type; m: [64]*Func; nm: i32; }
 
 var ifaces: [64]*Iface;
 var nifaces: i32;
-struct EnumDef { name: *u8; vn: [128]*u8; nv: i32; ty: *Type; }
+// data: some variant carries values; variant v's value j has type vft[v * MAXVF + j] at offset voff[...] (after the 8-byte tag)
+struct EnumDef { name: *u8; vn: [128]*u8; nv: i32; ty: *Type; data: i32; done: i32; vnf: [128]i32; vft: [1024]*Type; voff: [1024]i32; }
 
 var structs: [256]*StructDef;
 var nstructs: i32;
@@ -130,7 +133,7 @@ unsafe fn mk_option(t: *Type) -> *Type {   // tag 0 Some, 1 None
     r.opt = 1;
     return r;
 }
-unsafe fn is_agg(t: *Type) -> bool { return t.kind == TY_STRUCT || t.kind == TY_ARRAY || t.kind == TY_RESULT || t.kind == TY_IFACE || t.kind == TY_TASK; }
+unsafe fn is_agg(t: *Type) -> bool { return t.kind == TY_STRUCT || t.kind == TY_ARRAY || t.kind == TY_RESULT || t.kind == TY_IFACE || t.kind == TY_TASK || t.kind == TY_DATA; }
 // handle of a running async call
 unsafe fn mk_task(e: *Type) -> *Type {
     let t = zalloc(sizeof(Type)) as *Type;
@@ -169,6 +172,17 @@ unsafe fn move_only(t: *Type) -> bool {
     if t.kind == TY_TASK { return true; }
     if t.kind == TY_ARRAY { return move_only(t.elem); }
     if t.kind == TY_RESULT { return move_only(t.elem) || move_only(t.err); }
+    if t.kind == TY_DATA {
+        var v = 0;
+        while v < t.ed.nv {
+            var j = 0;
+            while j < t.ed.vnf[v] {
+                if move_only(t.ed.vft[v * MAXVF + j]) { return true; }
+                j += 1;
+            }
+            v += 1;
+        }
+    }
     if t.kind == TY_STRUCT {
         var c = t.sd;
         while c != null {
@@ -187,6 +201,17 @@ unsafe fn has_drop(t: *Type) -> bool {
     if t.kind == TY_TASK || t.kind == TY_STR { return true; }   // dropping a task waits for it; strings are reference counted
     if t.kind == TY_ARRAY { return has_drop(t.elem); }
     if t.kind == TY_RESULT { return has_drop(t.elem) || has_drop(t.err); }
+    if t.kind == TY_DATA {
+        var v = 0;
+        while v < t.ed.nv {
+            var j = 0;
+            while j < t.ed.vnf[v] {
+                if has_drop(t.ed.vft[v * MAXVF + j]) { return true; }
+                j += 1;
+            }
+            v += 1;
+        }
+    }
     if t.kind == TY_STRUCT {
         var c = t.sd;
         while c != null {
@@ -214,6 +239,18 @@ unsafe fn implements(sd: *StructDef, ifc: *Iface) -> bool {
     return false;
 }
 unsafe fn has_ptr(t: *Type) -> bool {
+    if t.kind == TY_DATA {
+        var v = 0;
+        while v < t.ed.nv {
+            var j = 0;
+            while j < t.ed.vnf[v] {
+                if has_ptr(t.ed.vft[v * MAXVF + j]) { return true; }
+                j += 1;
+            }
+            v += 1;
+        }
+        return false;
+    }
     if t.kind == TY_PTR { return true; }
     if t.kind == TY_RESULT { return has_ptr(t.elem) || has_ptr(t.err); }
     return t.kind == TY_ARRAY && has_ptr(t.elem);
@@ -228,7 +265,7 @@ unsafe fn same(a: *Type, b: *Type) -> bool {
     if k == TY_PTR { return same(a.elem, b.elem); }
     if k == TY_ARRAY { return a.n == b.n && same(a.elem, b.elem); }
     if k == TY_STRUCT { return a.sd == b.sd; }
-    if k == TY_ENUM { return a.ed == b.ed; }
+    if k == TY_ENUM || k == TY_DATA { return a.ed == b.ed; }
     if k == TY_RESULT { return a.opt == b.opt && same(a.elem, b.elem) && same(a.err, b.err); }
     if k == TY_IFACE { return a.ifc == b.ifc; }
     if k == TY_TASK { return same(a.elem, b.elem); }
@@ -265,7 +302,7 @@ unsafe fn tname_into(ref b: StrBuf, t: *Type) {
         tname_into(ref b, t.elem);
     }
     else if k == TY_STRUCT { sb_cat_c(ref b, t.sd.name); }
-    else if k == TY_ENUM { sb_cat_c(ref b, t.ed.name); }
+    else if k == TY_ENUM || k == TY_DATA { sb_cat_c(ref b, t.ed.name); }
     else if k == TY_RESULT && t.opt != 0 {
         sb_cat(ref b, "Option<");
         tname_into(ref b, t.elem);
@@ -318,6 +355,7 @@ unsafe fn find_enum(n: *u8) -> *EnumDef {
 
 unsafe fn need_complete(t: *Type, line: i32) {
     if t.kind == TY_STRUCT && t.sd.done == 0 { dief(line, "struct '%s' is incomplete here", t.sd.name as i64, 0, 0); }
+    if t.kind == TY_DATA && t.ed.done == 0 { dief(line, "enum '%s' is incomplete here", t.ed.name as i64, 0, 0); }
     if t.kind == TY_ARRAY { need_complete(t.elem, line); }
     if t.kind == TY_RESULT { need_complete(t.elem, line); need_complete(t.err, line); }
     if t.kind == TY_TASK { need_complete(t.elem, line); }

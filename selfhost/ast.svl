@@ -26,6 +26,7 @@ let E_FLOAT: i32 = 18;
 let E_AWAIT: i32 = 19;
 let E_SLIT: i32 = 20;    // struct literal: args are E_FINIT nodes
 let E_FINIT: i32 = 21;   // one field of a struct literal: name, value in a
+let E_VARIANT: i32 = 22; // Enum.Variant(values) of an enum with data: ival = variant, values in args
 
 let O_ADD: i32 = 0;
 let O_SUB: i32 = 1;
@@ -98,6 +99,7 @@ struct Stmt {
     temps: *Expr;      // temporaries with destructors created by this statement
     init_store: i32;   // constructor: first assignment of a field (still zero, nothing to drop)
     bnd: *Local;       // optimizer: for-loop bound
+    vlv: [8]*Local;    // match arm on an enum with data: one binding per value (MAXVF)
 }
 
 struct Func {
