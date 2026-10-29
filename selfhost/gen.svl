@@ -538,6 +538,27 @@ unsafe fn gen_expr0(e: *Expr) {
         }
         emit1("lea rax, [rbp-%d]", e.tmp as i64);
     }
+    else if k == E_VARIANT {
+        // tag + values in the expression's temporary
+        let ed = e.ty.ed;
+        let v = e.ival as i32;
+        var a = e.args;
+        var j = 0;
+        while a != null {
+            let ft = ed.vft[v * MAXVF + j];
+            let off = ed.voff[v * MAXVF + j];
+            gen_expr(a);
+            if is_agg(ft) {
+                emit("mov rsi, rax");
+                emit1("lea rdi, [rbp-%d]", (e.tmp - off) as i64);
+                gen_copy(ft.size);
+            } else { store_local(ft, e.tmp - off); }
+            a = a.next;
+            j += 1;
+        }
+        emit2("mov QWORD PTR [rbp-%d], %lld", e.tmp as i64, e.ival);
+        emit1("lea rax, [rbp-%d]", e.tmp as i64);
+    }
     else if k == E_CALL {
         let ib = try_inline(e);
         if ib != null { inl_depth += 1; gen_expr(ib); inl_depth -= 1; return; }
@@ -1020,6 +1041,58 @@ unsafe fn gen_stmt0(s: *Stmt) {
         gen_expr(s.e);
         emit1("mov QWORD PTR [rbp-%d], rax", s.slot1 as i64);
         temps_drop(s);
+        if s.e.ty.kind == TY_DATA {
+            // compare the tag, then move the values into the bindings ('_' drops its value)
+            let ed = s.e.ty.ed;
+            var da = s.list;
+            while da != null {
+                let Ln = newlbl();
+                let p = da.e;
+                scope_open();
+                if p != null {
+                    let v = p.ival as i32;
+                    emit1("mov rax, QWORD PTR [rbp-%d]", s.slot1 as i64);
+                    emit1("cmp QWORD PTR [rax], %lld", p.ival);
+                    emit1("jne .L%d", Ln as i64);
+                    var j = 0;
+                    while j < ed.vnf[v] {
+                        let ft = ed.vft[v * MAXVF + j];
+                        let off = ed.voff[v * MAXVF + j];
+                        let b = da.vlv[j];
+                        if j != 0 { emit1("mov rax, QWORD PTR [rbp-%d]", s.slot1 as i64); }
+                        if b != null {
+                            if is_agg(ft) {
+                                emit1("lea rsi, [rax+%d]", off as i64);
+                                emit1("lea rdi, [rbp-%d]", b.off as i64);
+                                gen_copy(ft.size);
+                            } else {
+                                var src: [32]u8;
+                                snprintf(&src[0], 32, "[rax+%d]", off as i64, 0, 0);
+                                load(ft, &src[0] as String);
+                                store_var(b);
+                                xlive(b);
+                            }
+                            if b.dflag != 0 { reg_local(b); }
+                        } else if has_drop(ft) {
+                            emit1("lea rdi, [rax+%d]", off as i64);
+                            call_drop(ft);
+                        }
+                        j += 1;
+                    }
+                } else if has_drop(s.e.ty) {
+                    // '_' arm
+                    emit1("mov rdi, QWORD PTR [rbp-%d]", s.slot1 as i64);
+                    call_drop(s.e.ty);
+                }
+                gen_stmt(da.body);
+                scope_close();
+                emit1("jmp .L%d", Lend as i64);
+                place(Ln);
+                da = da.next;
+            }
+            place(Lend);
+            return;
+        }
         if s.e.ty.kind == TY_RESULT {
             var ra = s.list;
             while ra != null {
@@ -1433,6 +1506,37 @@ unsafe fn gen_program(o: *u8) {
                 call_drop(t.err);
             }
             place(Lx);
+        } else if t.kind == TY_DATA {
+            // the values of the variant in the tag
+            let ed = t.ed;
+            let Lx = newlbl();
+            var v = 0;
+            while v < ed.nv {
+                var any = false;
+                var j = 0;
+                while j < ed.vnf[v] {
+                    if has_drop(ed.vft[v * MAXVF + j]) { any = true; }
+                    j += 1;
+                }
+                if any {
+                    let Ln = newlbl();
+                    emit1("cmp QWORD PTR [rbx], %d", v as i64);
+                    emit1("jne .L%d", Ln as i64);
+                    j = ed.vnf[v] - 1;
+                    while j >= 0 {
+                        let ft = ed.vft[v * MAXVF + j];
+                        if has_drop(ft) {
+                            emit1("lea rdi, [rbx+%d]", ed.voff[v * MAXVF + j] as i64);
+                            call_drop(ft);
+                        }
+                        j -= 1;
+                    }
+                    emit1("jmp .L%d", Lx as i64);
+                    place(Ln);
+                }
+                v += 1;
+            }
+            place(Lx);
         }
         emit("pop r12");
         emit("pop rbx");
@@ -1507,6 +1611,42 @@ unsafe fn gen_program(o: *u8) {
                     emit("lea rdi, [rbx+8]");
                     call_copy(t.err);
                 }
+            }
+            place(Lx);
+        } else if t.kind == TY_DATA {
+            let ed = t.ed;
+            let Lx = newlbl();
+            var v = 0;
+            while v < ed.nv {
+                var any = false;
+                var j = 0;
+                while j < ed.vnf[v] {
+                    if has_drop(ed.vft[v * MAXVF + j]) { any = true; }
+                    j += 1;
+                }
+                if any {
+                    let Ln = newlbl();
+                    emit1("cmp QWORD PTR [rbx], %d", v as i64);
+                    emit1("jne .L%d", Ln as i64);
+                    j = 0;
+                    while j < ed.vnf[v] {
+                        let ft = ed.vft[v * MAXVF + j];
+                        let off = ed.voff[v * MAXVF + j];
+                        if has_drop(ft) {
+                            if ft.kind == TY_STR {
+                                emit1("mov rax, QWORD PTR [rbx+%d]", off as i64);
+                                str_retain("rax");
+                            } else {
+                                emit1("lea rdi, [rbx+%d]", off as i64);
+                                call_copy(ft);
+                            }
+                        }
+                        j += 1;
+                    }
+                    emit1("jmp .L%d", Lx as i64);
+                    place(Ln);
+                }
+                v += 1;
             }
             place(Lx);
         }

@@ -147,7 +147,7 @@ static void lex(const char *src, int fidx) {
 }
 
 /* ============================ types ============================ */
-typedef enum { TY_VOID, TY_BOOL, TY_INT, TY_STR, TY_PTR, TY_STRUCT, TY_ARRAY, TY_ENUM, TY_ILIT, TY_NULL, TY_RESULT, TY_RESPEND, TY_PARAM, TY_IFACE, TY_FLOAT, TY_FLIT, TY_TASK } TyKind;
+typedef enum { TY_VOID, TY_BOOL, TY_INT, TY_STR, TY_PTR, TY_STRUCT, TY_ARRAY, TY_ENUM, TY_ILIT, TY_NULL, TY_RESULT, TY_RESPEND, TY_PARAM, TY_IFACE, TY_FLOAT, TY_FLIT, TY_TASK, TY_DATA } TyKind;   /* TY_DATA: enum whose variants carry values */
 typedef struct Type Type; typedef struct StructDef StructDef; typedef struct EnumDef EnumDef;
 typedef struct Expr Expr; typedef struct Generic Generic; typedef struct Iface Iface; typedef struct Func Func;
 typedef struct { char *name; Type *ty; int off; int is_mut, vis; Expr *init; StructDef *owner; } Field;   /* vis: 0 public 1 private 2 protected 3 internal */
@@ -157,10 +157,14 @@ struct Iface { char *name; Type *ty; Func **m; int nm, cm; };   /* interface: me
 static Iface **ifaces; static int nifaces, cifaces;
 static Iface *find_iface(const char *n) { for (int i = 0; i < nifaces; i++) if (!strcmp(ifaces[i]->name, n)) return ifaces[i]; return 0; }
 static int is_sub(StructDef *a, StructDef *b) { for (; a; a = a->base) if (a == b) return 1; return 0; }   /* a is b or derives from b */
+#define MAXVF 8   /* values per enum variant */
+typedef struct { int nf; Type *ft[MAXVF]; int off[MAXVF]; } VarInfo;   /* a variant's values: types and offsets (after the 8-byte tag) */
+struct EnumDef { char *name; char **vn; int nv, cv; Type *ty; int data, done; VarInfo *vi; int nvi, cvi; };   /* data: some variant carries values */
 static int has_drop(Type *t) {   /* values of this type own something and must be destroyed */
     if (t->k == TY_TASK || t->k == TY_STR) return 1;   /* dropping a task waits for it; strings are reference counted */
     if (t->k == TY_ARRAY) return has_drop(t->elem);
     if (t->k == TY_RESULT) return has_drop(t->elem) || has_drop(t->err);
+    if (t->k == TY_DATA) { for (int v = 0; v < t->ed->nvi; v++) for (int j = 0; j < t->ed->vi[v].nf; j++) if (has_drop(t->ed->vi[v].ft[j])) return 1; }
     if (t->k == TY_STRUCT) {
         for (StructDef *c = t->sd; c; c = c->base) if (c->dtor) return 1;
         for (int i = 0; i < t->sd->nf; i++) if (has_drop(t->sd->f[i].ty)) return 1;
@@ -171,6 +175,7 @@ static int move_only(Type *t) {   /* moved, never copied: destructors and tasks 
     if (t->k == TY_TASK) return 1;
     if (t->k == TY_ARRAY) return move_only(t->elem);
     if (t->k == TY_RESULT) return move_only(t->elem) || move_only(t->err);
+    if (t->k == TY_DATA) { for (int v = 0; v < t->ed->nvi; v++) for (int j = 0; j < t->ed->vi[v].nf; j++) if (move_only(t->ed->vi[v].ft[j])) return 1; }
     if (t->k == TY_STRUCT) {
         for (StructDef *c = t->sd; c; c = c->base) if (c->dtor) return 1;
         for (int i = 0; i < t->sd->nf; i++) if (move_only(t->sd->f[i].ty)) return 1;
@@ -178,7 +183,6 @@ static int move_only(Type *t) {   /* moved, never copied: destructors and tasks 
     return 0;
 }
 static int implements(StructDef *sd, Iface *ifc) { for (; sd; sd = sd->base) for (int i = 0; i < sd->nifs; i++) if (sd->ifs[i] == ifc) return 1; return 0; }
-struct EnumDef { char *name; char **vn; int nv, cv; Type *ty; };
 
 static Type ty_void = { TY_VOID, 0, 1 }, ty_bool = { TY_BOOL, 1, 1 }, ty_str = { TY_STR, 8, 8 }, ty_ilit = { TY_ILIT, 8, 8, 1 };
 static Type ty_null = { TY_NULL, 8, 8, 0, 0 };
@@ -199,7 +203,7 @@ static Type *mk_result(Type *t, Type *e) {
     r->k = TY_RESULT; r->elem = t; r->err = e; r->align = 8; r->size = 8 + (pl + 7) / 8 * 8; return r;   /* tag (0 Ok, 1 Err) + payload */
 }
 static Type *mk_option(Type *t) { Type *r = mk_result(t, &ty_void); r->opt = 1; return r; }   /* tag 0 Some, 1 None */
-static int is_agg(Type *t) { return t->k == TY_STRUCT || t->k == TY_ARRAY || t->k == TY_RESULT || t->k == TY_IFACE || t->k == TY_TASK; }
+static int is_agg(Type *t) { return t->k == TY_STRUCT || t->k == TY_ARRAY || t->k == TY_RESULT || t->k == TY_IFACE || t->k == TY_TASK || t->k == TY_DATA; }
 static Type *mk_task(Type *e) { Type *t = xalloc(sizeof *t); t->k = TY_TASK; t->elem = e; t->size = t->align = 8; return t; }   /* handle of a running async call */
 static const char *IFACE_MSG = "interface type '%s' can only be used as a function parameter (it borrows the object)";
 static int has_iface(Type *t) {
@@ -208,7 +212,10 @@ static int has_iface(Type *t) {
     if (t->k == TY_RESULT) return has_iface(t->elem) || has_iface(t->err);
     return 0;
 }
-static int has_ptr(Type *t) { return t->k == TY_PTR || (t->k == TY_ARRAY && has_ptr(t->elem)) || (t->k == TY_RESULT && (has_ptr(t->elem) || has_ptr(t->err))); }
+static int has_ptr(Type *t) {
+    if (t->k == TY_DATA) { for (int v = 0; v < t->ed->nvi; v++) for (int j = 0; j < t->ed->vi[v].nf; j++) if (has_ptr(t->ed->vi[v].ft[j])) return 1; return 0; }
+    return t->k == TY_PTR || (t->k == TY_ARRAY && has_ptr(t->elem)) || (t->k == TY_RESULT && (has_ptr(t->elem) || has_ptr(t->err)));
+}
 
 static int same(Type *a, Type *b) {
     if (a == b) return 1;
@@ -219,7 +226,7 @@ static int same(Type *a, Type *b) {
     case TY_PTR: return same(a->elem, b->elem);
     case TY_ARRAY: return a->n == b->n && same(a->elem, b->elem);
     case TY_STRUCT: return a->sd == b->sd;
-    case TY_ENUM: return a->ed == b->ed;
+    case TY_ENUM: case TY_DATA: return a->ed == b->ed;
     case TY_RESULT: return a->opt == b->opt && same(a->elem, b->elem) && same(a->err, b->err);
     case TY_IFACE: return a->ifc == b->ifc;
     case TY_TASK: return same(a->elem, b->elem);
@@ -236,7 +243,7 @@ static char *tname(Type *t) {
     case TY_INT: if (t->is_char) strcpy(b, "char"); else sprintf(b, "%c%d", t->sign ? 'i' : 'u', t->size * 8); break;
     case TY_PTR: sprintf(b, "*%.120s", tname(t->elem)); break;
     case TY_ARRAY: sprintf(b, "[%lld]%.100s", t->n, tname(t->elem)); break;
-    case TY_STRUCT: sprintf(b, "%.150s", t->sd->name); break; case TY_ENUM: sprintf(b, "%.150s", t->ed->name); break;
+    case TY_STRUCT: sprintf(b, "%.150s", t->sd->name); break; case TY_ENUM: case TY_DATA: sprintf(b, "%.150s", t->ed->name); break;
     case TY_RESULT:
         if (t->opt) { sprintf(b, "Option<%.140s>", tname(t->elem)); break; }
         { char *a = tname(t->elem), *c = tname(t->err); sprintf(b, "Result<%.70s, %.70s>", a, c); break; }
@@ -253,13 +260,14 @@ static StructDef *find_struct(const char *n) { for (int i = 0; i < nstructs; i++
 static EnumDef *find_enum(const char *n) { for (int i = 0; i < nenums; i++) if (!strcmp(enums[i]->name, n)) return enums[i]; return 0; }
 static void need_complete(Type *t, int line) {
     if (t->k == TY_STRUCT && !t->sd->done) die(line, "struct '%s' is incomplete here", t->sd->name);
+    if (t->k == TY_DATA && !t->ed->done) die(line, "enum '%s' is incomplete here", t->ed->name);
     if (t->k == TY_ARRAY) need_complete(t->elem, line);
     if (t->k == TY_RESULT) { need_complete(t->elem, line); need_complete(t->err, line); }
     if (t->k == TY_TASK) need_complete(t->elem, line);
 }
 
 /* ============================ AST ============================ */
-typedef enum { E_INT, E_BOOL, E_STR, E_VAR, E_CALL, E_BIN, E_UN, E_CAST, E_INDEX, E_FIELD, E_REF, E_ENUMVAL, E_SIZEOF, E_MCALL, E_OK, E_ERR, E_TRY, E_TOIFACE, E_FLOAT, E_AWAIT, E_SLIT, E_FINIT } EKind;
+typedef enum { E_INT, E_BOOL, E_STR, E_VAR, E_CALL, E_BIN, E_UN, E_CAST, E_INDEX, E_FIELD, E_REF, E_ENUMVAL, E_SIZEOF, E_MCALL, E_OK, E_ERR, E_TRY, E_TOIFACE, E_FLOAT, E_AWAIT, E_SLIT, E_FINIT, E_VARIANT } EKind;   /* E_VARIANT: Enum.Variant(values) of an enum with data, ival = variant */
 typedef enum { O_ADD, O_SUB, O_MUL, O_DIV, O_MOD, O_AND, O_OR, O_XOR, O_SHL, O_SHR,
                O_EQ, O_NE, O_LT, O_LE, O_GT, O_GE, O_LAND, O_LOR, O_NEG, O_NOT, O_BNOT, O_DEREF, O_ADDR } Op;
 typedef struct Stmt Stmt; typedef struct Local Local;
@@ -281,6 +289,7 @@ struct Stmt {
     Type *dty; Expr *e, *e2; Stmt *body, *els; Stmt **list; int n, cap; Expr **pats; Local **alv;
     Local *lv; int slot1; Expr *temps; Local *bnd;   /* bnd: for-loop bound (optimizer) */   /* temporaries with destructors created by this statement */
     int init_store;   /* constructor: first assignment of a field (it is still zero, nothing to drop) */
+    Local ***vlv;   /* match on an enum with data: the bindings of each arm (MAXVF per arm) */
 };
 #define MAXPARAMS 16
 struct Func {
@@ -676,8 +685,32 @@ static void parse_struct_body(StructDef *sd, int line) {
 }
 static void parse_enum(void) {
     char *n = expect_id(); EnumDef *ed = find_enum(n); expectop("{");
-    while (!isop("}")) { VPUSH(ed->vn, ed->nv, ed->cv, expect_id()); if (!acceptop(",")) break; }
+    int pl = 0;   /* largest payload */
+    while (!isop("}")) {
+        int vline = cur()->line; char *vn = expect_id();
+        for (int i = 0; i < ed->nv; i++) if (!strcmp(ed->vn[i], vn)) die(vline, "duplicate variant '%s' in enum '%s'", vn, n);
+        VPUSH(ed->vn, ed->nv, ed->cv, vn);
+        VarInfo vi; memset(&vi, 0, sizeof vi);
+        if (acceptop("(")) {   /* Variant(T1, T2, ...): the values it carries, laid out like struct fields after the tag */
+            int off = 8;
+            if (isop(")")) die(vline, "variant '%s' needs at least one value type (or no parentheses)", vn);
+            do {
+                int fl = cur()->line;
+                if (vi.nf >= MAXVF) die(fl, "too many values in variant '%s' (at most %d)", vn, MAXVF);
+                Type *ft = parse_type(); need_complete(ft, fl);
+                if (ft->k == TY_VOID) die(fl, "a variant cannot hold 'void'");
+                if (has_iface(ft)) die(fl, IFACE_MSG, tname(ft));
+                off = (off + ft->align - 1) / ft->align * ft->align; vi.ft[vi.nf] = ft; vi.off[vi.nf] = off; vi.nf++; off += ft->size;
+            } while (acceptop(","));
+            expectop(")");
+            if (off - 8 > pl) pl = off - 8;
+        }
+        VPUSH(ed->vi, ed->nvi, ed->cvi, vi);
+        if (!acceptop(",")) break;
+    }
     expectop("}");
+    if (ed->data) { ed->ty->size = 8 + (pl + 7) / 8 * 8; ed->ty->align = 8; }   /* tag + the largest payload */
+    ed->done = 1;
 }
 static const char *vis_name(int v) { static const char *n[] = { "public", "private", "protected", "internal" }; return n[v]; }
 static int vis_of(const char *s) { for (int i = 0; i < 4; i++) if (!strcmp(vis_name(i), s)) return i; return -1; }
@@ -852,7 +885,12 @@ static void prescan(void) {
             char *n = toks[i + 1].s;
             if (find_struct(n) || find_enum(n) || find_generic(n) || find_iface(n)) die(toks[i].line, "type '%s' redefined", n);
             if (toks[i].s[0] != 'e') { StructDef *sd = xalloc(sizeof *sd); sd->name = n; sd->ty = xalloc(sizeof(Type)); sd->ty->k = TY_STRUCT; sd->ty->sd = sd; sd->ty->size = 1; sd->ty->align = 1; VPUSH(structs, nstructs, cstructs, sd); }
-            else { EnumDef *ed = xalloc(sizeof *ed); ed->name = n; ed->ty = xalloc(sizeof(Type)); ed->ty->k = TY_ENUM; ed->ty->size = ed->ty->align = 4; ed->ty->sign = 1; ed->ty->ed = ed; VPUSH(enums, nenums, cenums, ed); }
+            else {
+                EnumDef *ed = xalloc(sizeof *ed); ed->name = n; ed->ty = xalloc(sizeof(Type)); ed->ty->k = TY_ENUM; ed->ty->size = ed->ty->align = 4; ed->ty->sign = 1; ed->ty->ed = ed; VPUSH(enums, nenums, cenums, ed);
+                if (toks[i + 2].k == TK_OP && !strcmp(toks[i + 2].s, "{"))   /* a '(' in the body: variants carry values */
+                    for (int j = i + 3; toks[j].k != TK_EOF && !(toks[j].k == TK_OP && !strcmp(toks[j].s, "}")); j++)
+                        if (toks[j].k == TK_OP && !strcmp(toks[j].s, "(")) { ed->data = 1; ed->ty->k = TY_DATA; ed->ty->size = ed->ty->align = 8; ed->ty->sign = 0; break; }
+            }
         }
     }
 }
@@ -987,7 +1025,7 @@ static void consume(Expr *e) {   /* e's value is taken over by a new owner */
         if (e->lv->is_ref) die(e->line, "cannot move out of '%s' (it is borrowed with 'ref')", e->name);
         if (e->lv->loop < loop_depth) die(e->line, "cannot move '%s' inside a loop (it is declared outside the loop)", e->name);
         e->lv->moved = 1; e->move = 1; return;
-    case E_CALL: case E_OK: case E_ERR: case E_TRY: case E_AWAIT: case E_SLIT: e->consumed = 1; return;
+    case E_CALL: case E_OK: case E_ERR: case E_TRY: case E_AWAIT: case E_SLIT: case E_VARIANT: e->consumed = 1; return;
     case E_UN: if (e->op == O_DEREF) return;   /* raw read through a pointer (unsafe): the programmer owns it */
         /* fallthrough */
     default: die(e->line, "cannot move out of this place: '%s' has a destructor (use 'ref', or a method that takes the value out)", tname(e->ty));
@@ -1383,7 +1421,13 @@ static Type *check_expr(Expr *e) {
         if (e->a->k == E_VAR && !lookup(e->a->name)) {
             EnumDef *ed = find_enum(e->a->name);
             if (ed) {
-                for (int i = 0; i < ed->nv; i++) if (!strcmp(ed->vn[i], e->name)) { e->k = E_ENUMVAL; e->ival = i; return e->ty = ed->ty; }
+                for (int i = 0; i < ed->nv; i++) if (!strcmp(ed->vn[i], e->name)) {
+                    if (!ed->data) { e->k = E_ENUMVAL; e->ival = i; return e->ty = ed->ty; }
+                    if (ed->vi[i].nf) { char qn[300]; snprintf(qn, sizeof qn, "%s.%s", ed->name, e->name); die(e->line, "'%s' carries %d value(s): write %s(...)", qn, ed->vi[i].nf, qn); }
+                    e->k = E_VARIANT; e->ival = i; e->nargs = 0; e->a = 0; e->ty = ed->ty; e->tmp = alloc_slot(ed->ty->size, 8);
+                    if (has_drop(e->ty)) register_temp(e);
+                    return e->ty;
+                }
                 die(e->line, "enum '%s' has no variant '%s'", ed->name, e->name);
             }
         }
@@ -1404,6 +1448,21 @@ static Type *check_expr(Expr *e) {
             sd = cur_fn->cls->base;
             Expr *th = mk(E_VAR, e->line); th->name = "this"; check_expr(th);
             recv = mk(E_REF, e->line); recv->a = th; recv->ty = sd->ty;
+        } else if (o->k == E_VAR && !lookup(o->name) && find_enum(o->name)) {   /* Enum.Variant(values) */
+            EnumDef *ed = find_enum(o->name); int vi = -1;
+            for (int i = 0; i < ed->nv; i++) if (!strcmp(ed->vn[i], e->name)) vi = i;
+            if (vi < 0) die(e->line, "enum '%s' has no variant '%s'", ed->name, e->name);
+            if (!ed->data || !ed->vi[vi].nf) die(e->line, "'%s.%s' carries no values: write it without parentheses", ed->name, e->name);
+            VarInfo *v = &ed->vi[vi];
+            char qn[300]; snprintf(qn, sizeof qn, "%s.%s", ed->name, e->name);
+            if (e->nargs != v->nf) die(e->line, "'%s' takes %d value(s), found %d", qn, v->nf, e->nargs);
+            for (int i = 0; i < e->nargs; i++) {
+                char ctx[400]; snprintf(ctx, sizeof ctx, "value %d of '%s'", i + 1, qn);
+                check_expr(e->args[i]); expect_coerce(e->args[i], v->ft[i], ctx); consume(e->args[i]);
+            }
+            e->k = E_VARIANT; e->ival = vi; e->a = 0; e->ty = ed->ty; e->tmp = alloc_slot(ed->ty->size, 8);
+            if (has_drop(e->ty)) register_temp(e);
+            return e->ty;
         } else if (o->k == E_VAR && !lookup(o->name)) {
             sd = find_struct(o->name);
             if (!sd || !sd->is_class) die(o->line, "undefined variable '%s'", o->name);
@@ -1459,7 +1518,7 @@ static Type *check_expr(Expr *e) {
         return check_expr(e);
     }
     case E_TOIFACE: return e->ty;
-    case E_OK: case E_ERR: return e->ty;
+    case E_OK: case E_ERR: case E_VARIANT: return e->ty;
     case E_AWAIT: {   /* wait for a task and take its result */
         Type *t = check_expr(e->a);
         if (t->k != TY_TASK) die(e->line, "'await' needs a Task (the result of calling an async fn), found '%s'", tname(t));
@@ -1660,6 +1719,39 @@ static void check_stmt0(Stmt *s) {
         int n0 = nlocals; char *pre = snap_moved(), *acc = xalloc((size_t)n0 + 1); int anyc = 0;
 #define ARM_BEGIN() set_moved(pre, n0)
 #define ARM_END(b) do { if (!always_ret(b)) { anyc = 1; for (int q = 0; q < n0; q++) acc[q] |= (char)locals[q]->moved; } } while (0)
+        if (t->k == TY_DATA) {   /* Enum.Variant(a, b) binds the values, Enum.Variant matches a variant without values */
+            EnumDef *ed = t->ed;
+            s->slot1 = alloc_slot(8, 8); s->vlv = xalloc(sizeof(Local **) * (size_t)(s->n + 1));
+            int wild = 0, ncov = 0; char *cov = xalloc((size_t)ed->nv + 1);
+            for (int i = 0; i < s->n; i++) {
+                Expr *p = s->pats[i];
+                if (!p) { wild = 1; ARM_BEGIN(); check_scope_body(s->list[i]); ARM_END(s->list[i]); continue; }
+                if (!((p->k == E_MCALL || p->k == E_FIELD) && p->a->k == E_VAR))
+                    die(p->line, "match patterns on '%s' must be %s.Variant(names) or %s.Variant", ed->name, ed->name, ed->name);
+                if (strcmp(p->a->name, ed->name)) die(p->line, "pattern '%s.%s' does not belong to enum '%s'", p->a->name, p->name, ed->name);
+                int vi = -1;
+                for (int j = 0; j < ed->nv; j++) if (!strcmp(ed->vn[j], p->name)) vi = j;
+                if (vi < 0) die(p->line, "enum '%s' has no variant '%s'", ed->name, p->name);
+                VarInfo *v = &ed->vi[vi]; int nb = p->k == E_MCALL ? p->nargs : 0;
+                if (nb != v->nf) {
+                    if (!v->nf) die(p->line, "pattern '%s.%s' takes no bindings", ed->name, p->name);
+                    char qn[300]; snprintf(qn, sizeof qn, "%s.%s", ed->name, p->name);
+                    die(p->line, "pattern '%s' needs %d binding(s), found %d", qn, v->nf, nb);
+                }
+                for (int j = 0; j < nb; j++) if (p->args[j]->k != E_VAR) die(p->args[j]->line, "a pattern binding must be a name or '_'");
+                p->ival = vi; if (!cov[vi]) { cov[vi] = 1; ncov++; }
+                ARM_BEGIN();
+                int mark = nlocals, off = cur_off, base = scope_base; scope_base = nlocals;
+                s->vlv[i] = xalloc(sizeof(Local *) * MAXVF);
+                for (int j = 0; j < nb; j++) if (strcmp(p->args[j]->name, "_")) s->vlv[i][j] = declare(p->args[j]->name, v->ft[j], 0, 0, p->line);
+                check_scope_body(s->list[i]);
+                nlocals = mark; cur_off = off; scope_base = base;
+                ARM_END(s->list[i]);
+            }
+            if (!wild && ncov < ed->nv) die(s->line, "non-exhaustive match: not all variants of '%s' are covered (add '_ =>')", ed->name);
+            set_moved(anyc ? acc : pre, n0);
+            break;
+        }
         if (t->k == TY_RESULT) {
             s->slot1 = alloc_slot(8, 8); s->alv = xalloc(sizeof(Local *) * (size_t)(s->n + 1));
             int wild = 0, cov[2] = { 0, 0 };
@@ -2032,6 +2124,7 @@ static void oa_stmt(Stmt *s) {
         for (int i = 0; i < s->n; i++) {
             int mark = nodecl;
             if (s->alv && s->alv[i]) { oa_note(s->alv[i]); odeclare(s->alv[i]); }
+            if (s->vlv && s->vlv[i]) for (int j = 0; j < MAXVF; j++) if (s->vlv[i][j]) { oa_note(s->vlv[i][j]); odeclare(s->vlv[i][j]); }
             oa_stmt(s->list[i]); opos++; oscope_end(mark);
         }
         break;
@@ -2107,7 +2200,7 @@ static int has_call(Expr *e) {   /* could evaluating e call a function (clobberi
         if (opt && e->fn && e->fn->is_extern && !strcmp(e->fn->name, "sqrt") && e->nargs == 1 && e->ty->size == 8 && fbase < 7) return has_call(e->args[0]);
     }
     switch (e->k) {
-    case E_CALL: case E_AWAIT: case E_TRY: case E_OK: case E_ERR: case E_TOIFACE: case E_MCALL: return 1;
+    case E_CALL: case E_AWAIT: case E_TRY: case E_OK: case E_ERR: case E_TOIFACE: case E_MCALL: case E_VARIANT: return 1;
     default: break;
     }
     if (has_call(e->a) || has_call(e->b)) return 1;
@@ -2817,6 +2910,16 @@ static void gen_expr0(Expr *e) {
         if (e->k == E_VAR && !e->lv->is_ref && !e->lv->is_global && !is_agg(e->ty)) { char m[32]; snprintf(m, sizeof m, "[rbp-%d]", e->lv->off); load(e->ty, m); break; }
         gen_addr(e); if (!is_agg(e->ty)) load(e->ty, "[rax]"); break;
     case E_REF: gen_addr(e->a); break;
+    case E_VARIANT: {   /* tag + values in the expression's temporary */
+        VarInfo *v = &e->ty->ed->vi[e->ival];
+        for (int i = 0; i < e->nargs; i++) {
+            Type *ft = v->ft[i]; gen_expr(e->args[i]);
+            if (is_agg(ft)) { emit("mov rsi, rax"); emit("lea rdi, [rbp-%d]", e->tmp - v->off[i]); gen_copy(ft->size); }
+            else store_local(ft, e->tmp - v->off[i]);
+        }
+        emit("mov QWORD PTR [rbp-%d], %lld", e->tmp, e->ival);
+        emit("lea rax, [rbp-%d]", e->tmp); break;
+    }
     case E_SLIT:   /* fill the temporary field by field */
         for (int i = 0; i < e->nargs; i++) {
             Expr *fi = e->args[i]; Field *f = fi->fld; gen_expr(fi->a);
@@ -3466,6 +3569,28 @@ static void gen_stmt0(Stmt *s) {
     case S_CONT: drops_from(loop_dl[loop_sp - 1]); emit("jmp .L%d", loop_cont[loop_sp - 1]); break;
     case S_MATCH: {
         int Lend = newlbl(); gen_expr(s->e); emit("mov QWORD PTR [rbp-%d], rax", s->slot1); temps_drop(s);
+        if (s->e->ty->k == TY_DATA) {   /* compare the tag, then move the values into the bindings ('_' drops its value) */
+            EnumDef *ed = s->e->ty->ed;
+            for (int i = 0; i < s->n; i++) {
+                int Ln = newlbl(); Expr *p = s->pats[i];
+                scope_open();
+                if (p) {
+                    VarInfo *v = &ed->vi[p->ival];
+                    emit("mov rax, QWORD PTR [rbp-%d]", s->slot1); emit("cmp QWORD PTR [rax], %lld", p->ival); emit("jne .L%d", Ln);
+                    for (int j = 0; j < v->nf; j++) {
+                        Type *ft = v->ft[j]; Local *b = s->vlv[i][j];
+                        if (j) emit("mov rax, QWORD PTR [rbp-%d]", s->slot1);
+                        if (b) {
+                            if (is_agg(ft)) { emit("lea rsi, [rax+%d]", v->off[j]); emit("lea rdi, [rbp-%d]", b->off); gen_copy(ft->size); }
+                            else { char src[32]; snprintf(src, sizeof src, "[rax+%d]", v->off[j]); load(ft, src); store_var(b); xlive(b); }
+                            if (b->dflag) reg_local(b);
+                        } else if (has_drop(ft)) { emit("lea rdi, [rax+%d]", v->off[j]); call_drop(ft); }
+                    }
+                } else if (has_drop(s->e->ty)) { emit("mov rdi, QWORD PTR [rbp-%d]", s->slot1); call_drop(s->e->ty); }   /* '_' arm */
+                gen_stmt(s->list[i]); scope_close(); emit("jmp .L%d", Lend); place(Ln);
+            }
+            place(Lend); break;
+        }
         if (s->e->ty->k == TY_RESULT) {
             for (int i = 0; i < s->n; i++) {
                 int Ln = newlbl(); Expr *p = s->pats[i];
@@ -3685,6 +3810,18 @@ static void gen_program(FILE *o) {
             emit("jmp .L%d", Lx); place(Le);
             if (has_drop(t->err)) { emit("lea rdi, [rbx+8]"); call_drop(t->err); }
             place(Lx);
+        } else if (t->k == TY_DATA) {   /* the values of the variant in the tag */
+            int Lx = newlbl();
+            for (int v = 0; v < t->ed->nvi; v++) {
+                VarInfo *vi = &t->ed->vi[v]; int any = 0;
+                for (int j = 0; j < vi->nf; j++) if (has_drop(vi->ft[j])) any = 1;
+                if (!any) continue;
+                int Ln = newlbl();
+                emit("cmp QWORD PTR [rbx], %d", v); emit("jne .L%d", Ln);
+                for (int j = vi->nf - 1; j >= 0; j--) if (has_drop(vi->ft[j])) { emit("lea rdi, [rbx+%d]", vi->off[j]); call_drop(vi->ft[j]); }
+                emit("jmp .L%d", Lx); place(Ln);
+            }
+            place(Lx);
         }
         emit("pop r12"); emit("pop rbx"); emit("pop rbp"); emit("ret");
     }
@@ -3710,6 +3847,22 @@ static void gen_program(FILE *o) {
             if (has_drop(t->elem)) { if (t->elem->k == TY_STR) { emit("mov rax, QWORD PTR [rbx+8]"); str_retain("rax"); } else { emit("lea rdi, [rbx+8]"); call_copy(t->elem); } }
             emit("jmp .L%d", Lx); place(Le);
             if (has_drop(t->err)) { if (t->err->k == TY_STR) { emit("mov rax, QWORD PTR [rbx+8]"); str_retain("rax"); } else { emit("lea rdi, [rbx+8]"); call_copy(t->err); } }
+            place(Lx);
+        } else if (t->k == TY_DATA) {
+            int Lx = newlbl();
+            for (int v = 0; v < t->ed->nvi; v++) {
+                VarInfo *vi = &t->ed->vi[v]; int any = 0;
+                for (int j = 0; j < vi->nf; j++) if (has_drop(vi->ft[j])) any = 1;
+                if (!any) continue;
+                int Ln = newlbl();
+                emit("cmp QWORD PTR [rbx], %d", v); emit("jne .L%d", Ln);
+                for (int j = 0; j < vi->nf; j++) {
+                    if (!has_drop(vi->ft[j])) continue;
+                    if (vi->ft[j]->k == TY_STR) { emit("mov rax, QWORD PTR [rbx+%d]", vi->off[j]); str_retain("rax"); }
+                    else { emit("lea rdi, [rbx+%d]", vi->off[j]); call_copy(vi->ft[j]); }
+                }
+                emit("jmp .L%d", Lx); place(Ln);
+            }
             place(Lx);
         }
         emit("pop r12"); emit("pop rbx"); emit("pop rbp"); emit("ret");
@@ -3798,6 +3951,12 @@ static void d_expr(Expr *e) {
     case E_TOIFACE: printf("(toiface "); d_expr(e->a); printf(" vt%lld", e->ival); if (dump_typed && e->tmp) printf(" t%d", e->tmp); d_ty(e); printf(")"); break;
     case E_SIZEOF: printf("(sizeof %s)", tname(e->cast_ty)); break;
     case E_ENUMVAL: printf("(enumval %s.%s %lld", e->a->name, e->name, e->ival); d_ty(e); printf(")"); break;
+    case E_VARIANT:
+        printf("(variant %s.%s %lld", e->ty->ed->name, e->ty->ed->vn[e->ival], e->ival);
+        for (int i = 0; i < e->nargs; i++) { printf(" "); d_expr(e->args[i]); }
+        if (dump_typed && e->tmp) printf(" t%d", e->tmp);
+        if (dump_typed && e->dflag) printf(" f%d", e->dflag);
+        d_ty(e); printf(")"); break;
     case E_SLIT:
         printf("(slit %s", e->name);
         for (int i = 0; i < e->nargs; i++) { printf(" (init %s ", e->args[i]->name); d_expr(e->args[i]->a); printf(")"); }
@@ -3833,6 +3992,7 @@ static void d_stmt(Stmt *s) {
         for (int i = 0; i < s->n; i++) {
             printf(" (arm "); d_expr_opt(s->pats[i]);
             if (dump_typed && s->alv && s->alv[i]) printf(" @%d", s->alv[i]->off);
+            if (dump_typed && s->vlv && s->vlv[i]) for (int j = 0; j < MAXVF; j++) if (s->vlv[i][j]) printf(" @%d", s->vlv[i][j]->off);
             printf(" "); d_stmt(s->list[i]); printf(")");
         }
         printf(")"); break;

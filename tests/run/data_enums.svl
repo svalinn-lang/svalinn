@@ -1,0 +1,96 @@
+module DataEnums;
+allow Console;
+import std.vec;
+
+enum Shape { Circle(f64), Rect(i64, i64), Empty }
+
+fn area(s: Shape) -> f64 {
+    match s {
+        Shape.Circle(r) => { return 3.0 * r * r; }
+        Shape.Rect(w, h) => { return (w * h) as f64; }
+        Shape.Empty => { return 0.0; }
+    }
+}
+
+enum Token { Num(i64), Word(String), Pair(String, String), End }
+
+fn show(t: Token) -> String {
+    match t {
+        Token.Num(n) => { return "num " + n; }
+        Token.Word(w) => { return "word " + w; }
+        Token.Pair(a, _) => { return "pair starting " + a; }
+        _ => { return "end"; }
+    }
+}
+
+class Conn {
+    private:
+        let name: String;
+    public:
+        ctor(name: String) { this.name = name; println("open " + name); }
+        fn name() -> String { return this.name; }
+        dtor { println("close " + this.name); }
+}
+
+enum Slot { Free, Busy(Conn, i32) }
+
+fn use_slot(s: Slot) {
+    match s {
+        Slot.Busy(c, n) => { println("busy " + c.name() + " " + n); }
+        Slot.Free => { println("free"); }
+    }
+}
+
+struct Labeled { label: String; tok: Token; }
+
+fn parse(s: String) -> Result<Token, String> {
+    if s.is_empty() { return Err("empty"); }
+    match s.parse_int() { Ok(n) => { return Ok(Token.Num(n)); } Err(e) => { } }
+    return Ok(Token.Word(s));
+}
+
+fn first(ref v: Vec<Token>) -> Option<Token> {
+    if v.len() == 0 { return None; }
+    return Some(v.item(0));
+}
+
+fn main() -> i32 {
+    println(area(Shape.Circle(2.0)));
+    println(area(Shape.Rect(3, 4)));
+    println(area(Shape.Empty));
+
+    println(show(Token.Num(42)));
+    println(show(Token.Word("hi" + "!")));
+    println(show(Token.Pair("left", "right")));
+    println(show(Token.End));
+
+    // copies of an enum holding Strings share them
+    let t = Token.Word("shared");
+    let u = t;
+    println(show(t));
+    println(show(u));
+
+    // a destructor inside a variant runs exactly once
+    use_slot(Slot.Busy(Conn("db"), 7));
+    use_slot(Slot.Free);
+    {
+        let s = Slot.Busy(Conn("cache"), 1);
+        println("scope end");
+    }
+    match Slot.Busy(Conn("tmp"), 2) { Slot.Busy(_, n) => { println("ignored conn " + n); } _ => { } }
+
+    let l = Labeled { label: "x", tok: Token.Pair("a", "b") };
+    println(l.label + ": " + show(l.tok));
+
+    var v = Vec<Token>();
+    v.push(Token.Num(1));
+    v.push(Token.Word("two"));
+    v.push(Token.End);
+    for i in 0..v.len() { println(show(v.item(i))); }
+    match first(ref v) { Some(t0) => { println("first " + show(t0)); } None => { } }
+
+    match parse("12") { Ok(tk) => { println(show(tk)); } Err(e) => { println(e); } }
+    match parse("abc") { Ok(tk) => { println(show(tk)); } Err(e) => { println(e); } }
+    match parse("") { Ok(tk) => { println(show(tk)); } Err(e) => { println(e); } }
+    return 0;
+}

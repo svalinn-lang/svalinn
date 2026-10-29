@@ -1,0 +1,1 @@
+module A; enum Shape { Circle(f64), Rect(i64, i64), Empty } fn main() -> i32 { let a = Shape.Empty; let b = Shape.Empty; if a == b { return 1; } return 0; }

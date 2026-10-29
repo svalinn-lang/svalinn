@@ -172,7 +172,7 @@ unsafe fn consume(e: *Expr) {
         e.move = 1;
         return;
     }
-    if k == E_CALL || k == E_OK || k == E_ERR || k == E_TRY || k == E_AWAIT || k == E_SLIT { e.consumed = 1; return; }
+    if k == E_CALL || k == E_OK || k == E_ERR || k == E_TRY || k == E_AWAIT || k == E_SLIT || k == E_VARIANT { e.consumed = 1; return; }
     if k == E_UN && e.op == O_DEREF { return; }   // raw read through a pointer (unsafe): the programmer owns it
     dief(e.line, "cannot move out of this place: '%s' has a destructor (use 'ref', or a method that takes the value out)", tname(e.ty) as i64, 0, 0);
 }
@@ -1011,9 +1011,24 @@ unsafe fn check_expr(e: *Expr) -> *Type {
                 var i = 0;
                 while i < ed.nv {
                     if seq(ed.vn[i], e.name) {
-                        e.kind = E_ENUMVAL;
+                        if ed.data == 0 {
+                            e.kind = E_ENUMVAL;
+                            e.ival = i as i64;
+                            e.ty = ed.ty;
+                            return e.ty;
+                        }
+                        if ed.vnf[i] != 0 {
+                            var qn: [300]u8;
+                            snprintf(&qn[0], 300, "%s.%s", ed.name as i64, e.name as i64, 0);
+                            dief(e.line, "'%s' carries %d value(s): write %s(...)", &qn[0] as i64, ed.vnf[i] as i64, &qn[0] as i64);
+                        }
+                        e.kind = E_VARIANT;
                         e.ival = i as i64;
+                        e.nargs = 0;
+                        e.a = null;
                         e.ty = ed.ty;
+                        e.tmp = alloc_slot(ed.ty.size, 8);
+                        if has_drop(e.ty) { register_temp(e); }
                         return e.ty;
                     }
                     i += 1;
@@ -1060,6 +1075,39 @@ unsafe fn check_expr(e: *Expr) -> *Type {
             recv = new_expr(E_REF, e.line);
             recv.a = th;
             recv.ty = sd.ty;
+        } else if o.kind == E_VAR && lookup(o.name) == null && find_enum(o.name) != null {
+            // Enum.Variant(values)
+            let ed = find_enum(o.name);
+            var vi = -1;
+            var i = 0;
+            while i < ed.nv {
+                if seq(ed.vn[i], e.name) { vi = i; }
+                i += 1;
+            }
+            if vi < 0 { dief(e.line, "enum '%s' has no variant '%s'", ed.name as i64, e.name as i64, 0); }
+            if ed.data == 0 || ed.vnf[vi] == 0 { dief(e.line, "'%s.%s' carries no values: write it without parentheses", ed.name as i64, e.name as i64, 0); }
+            var qn: [300]u8;
+            snprintf(&qn[0], 300, "%s.%s", ed.name as i64, e.name as i64, 0);
+            let nf = ed.vnf[vi];
+            if e.nargs != nf { dief(e.line, "'%s' takes %d value(s), found %d", &qn[0] as i64, nf as i64, e.nargs as i64); }
+            var a = e.args;
+            var j = 0;
+            while a != null {
+                var ctx: [400]u8;
+                snprintf(&ctx[0], 400, "value %d of '%s'", (j + 1) as i64, &qn[0] as i64, 0);
+                check_expr(a);
+                expect_coerce(a, ed.vft[vi * MAXVF + j], &ctx[0] as String);
+                consume(a);
+                a = a.next;
+                j += 1;
+            }
+            e.kind = E_VARIANT;
+            e.ival = vi as i64;
+            e.a = null;
+            e.ty = ed.ty;
+            e.tmp = alloc_slot(ed.ty.size, 8);
+            if has_drop(e.ty) { register_temp(e); }
+            return e.ty;
         } else if o.kind == E_VAR && lookup(o.name) == null {
             sd = find_struct(o.name);
             if sd == null || sd.is_class == 0 { dief(o.line, "undefined variable '%s'", o.name as i64, 0, 0); }
@@ -1161,7 +1209,7 @@ unsafe fn check_expr(e: *Expr) -> *Type {
         return check_expr(e);
     }
     if k == E_TOIFACE { return e.ty; }
-    if k == E_OK || k == E_ERR { return e.ty; }
+    if k == E_OK || k == E_ERR || k == E_VARIANT { return e.ty; }
     if k == E_AWAIT {
         // wait for a task and take its result
         let t = check_expr(e.a);
@@ -1309,6 +1357,74 @@ unsafe fn check_cond(c: *Expr) {
     if t.kind != TY_BOOL { dief(c.line, "condition must be bool, found '%s'", tname(t) as i64, 0, 0); }
 }
 
+// match on an enum with data: Enum.Variant(a, b) binds the values, Enum.Variant matches a variant without values
+unsafe fn check_match_data(s: *Stmt, t: *Type, pre: *u8, acc: *u8, n0: i32, ref anyc: bool) {
+    let ed = t.ed;
+    s.slot1 = alloc_slot(8, 8);
+    var wild = false;
+    var ncov = 0;
+    let cov = zalloc((ed.nv + 1) as u64);
+    var arm = s.list;
+    while arm != null {
+        let p = arm.e;
+        if p == null {
+            wild = true;
+            set_moved(pre, n0);
+            check_scope_body(arm.body);
+            arm_end(arm.body, acc, n0, ref anyc);
+        }
+        else {
+            if !((p.kind == E_MCALL || p.kind == E_FIELD) && p.a.kind == E_VAR) {
+                dief(p.line, "match patterns on '%s' must be %s.Variant(names) or %s.Variant", ed.name as i64, ed.name as i64, ed.name as i64);
+            }
+            if !seq(p.a.name, ed.name) { dief(p.line, "pattern '%s.%s' does not belong to enum '%s'", p.a.name as i64, p.name as i64, ed.name as i64); }
+            var vi = -1;
+            var j = 0;
+            while j < ed.nv {
+                if seq(ed.vn[j], p.name) { vi = j; }
+                j += 1;
+            }
+            if vi < 0 { dief(p.line, "enum '%s' has no variant '%s'", ed.name as i64, p.name as i64, 0); }
+            let nf = ed.vnf[vi];
+            var nb = 0;
+            if p.kind == E_MCALL { nb = p.nargs; }
+            if nb != nf {
+                if nf == 0 { dief(p.line, "pattern '%s.%s' takes no bindings", ed.name as i64, p.name as i64, 0); }
+                var qn: [300]u8;
+                snprintf(&qn[0], 300, "%s.%s", ed.name as i64, p.name as i64, 0);
+                dief(p.line, "pattern '%s' needs %d binding(s), found %d", &qn[0] as i64, nf as i64, nb as i64);
+            }
+            var b = p.args;
+            if p.kind != E_MCALL { b = null; }
+            while b != null {
+                if b.kind != E_VAR { die(b.line, "a pattern binding must be a name or '_'"); }
+                b = b.next;
+            }
+            p.ival = vi as i64;
+            if cov[vi] == 0 { cov[vi] = 1; ncov += 1; }
+            set_moved(pre, n0);
+            let mark = nlocals;
+            let off = cur_off;
+            let base = scope_base;
+            scope_base = nlocals;
+            b = p.args;
+            if p.kind != E_MCALL { b = null; }
+            j = 0;
+            while b != null {
+                if !seq(b.name, lit("_")) { arm.vlv[j] = declare(b.name, ed.vft[vi * MAXVF + j], 0, 0, p.line); }
+                b = b.next;
+                j += 1;
+            }
+            check_scope_body(arm.body);
+            nlocals = mark;
+            cur_off = off;
+            scope_base = base;
+            arm_end(arm.body, acc, n0, ref anyc);
+        }
+        arm = arm.next;
+    }
+    if !wild && ncov < ed.nv { dief(s.line, "non-exhaustive match: not all variants of '%s' are covered (add '_ =>')", ed.name as i64, 0, 0); }
+}
 unsafe fn check_match_result(s: *Stmt, t: *Type, pre: *u8, acc: *u8, n0: i32, ref anyc: bool) {
     s.slot1 = alloc_slot(8, 8);
     var wild = false;
@@ -1608,6 +1724,11 @@ unsafe fn check_stmt0(s: *Stmt) {
         let pre = snap_moved();
         let acc = zalloc((n0 + 1) as u64);
         var anyc = false;
+        if t.kind == TY_DATA {
+            check_match_data(s, t, pre, acc, n0, ref anyc);
+            if anyc { set_moved(acc, n0); } else { set_moved(pre, n0); }
+            return;
+        }
         if t.kind == TY_RESULT {
             check_match_result(s, t, pre, acc, n0, ref anyc);
             if anyc { set_moved(acc, n0); } else { set_moved(pre, n0); }

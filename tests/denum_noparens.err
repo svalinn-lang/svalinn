@@ -1,0 +1,3 @@
+tests/denum_noparens.svl:1:93: error: 'Shape.Circle' carries 1 value(s): write Shape.Circle(...)
+    1 | module A; enum Shape { Circle(f64), Rect(i64, i64), Empty } fn main() -> i32 { let s = Shape.Circle; return 0; }
+      |                                                                                             ^

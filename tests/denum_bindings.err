@@ -1,0 +1,3 @@
+tests/denum_bindings.svl:1:100: error: pattern 'Shape.Rect' needs 2 binding(s), found 1
+    1 | module A; enum Shape { Circle(f64), Rect(i64, i64), Empty } fn f(s: Shape) -> i64 { match s { Shape.Rect(w) => { return w; } _ => { return 0; } } } fn main() -> i32 { return 0; }
+      |                                                                                                    ^

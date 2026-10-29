@@ -49,9 +49,10 @@ A complete version is `examples/wordcount.svl`.
 - modules, `import a.b;` (relative to the source file, then the compiler's `lib/`), include-once
 - `let` (immutable) / `var`, type inference, `const N = 4 * 16;` (compile-time integer constants)
 - `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `bool`, `char`, `String`; `as` casts
-- structs, struct literals `Point { x: 1, y: 2 }`, enums, fixed arrays `[N]T` (bounds-checked)
+- structs, struct literals `Point { x: 1, y: 2 }`, enums (also with data: `Circle(f64)`), fixed arrays `[N]T`
+  (bounds-checked)
 - `if`, `while`, `for i in a..b`, `for x in array / string / collection`, `break`, `continue`
-- `match` on integers, enums, `Result` and `Option` (exhaustiveness-checked)
+- `match` on integers, enums, `Result` and `Option`, binding the values they carry (exhaustiveness-checked)
 - functions with any number of parameters, `ref` parameters, struct/class returns
 - classes (constructors, destructors, visibility, static methods, single inheritance, `super`), interfaces
   (dynamic dispatch), generic structs/classes/functions with interface constraints (monomorphised)
@@ -172,6 +173,23 @@ Every negative test in `tests/*.svl` has its exact expected output in `tests/*.e
 - `match` must handle both `Some(name)` (or `Some(_)`) and `None`, or use `_ =>`
 - `expr?` on an Option returns `None` early; it works only in a function that returns an Option
 
+## Enums with data
+    enum Shape { Circle(f64), Rect(i64, i64), Empty }
+    fn area(s: Shape) -> f64 {
+        match s {
+            Shape.Circle(r) => { return 3.14159 * r * r; }
+            Shape.Rect(w, _) => { return w as f64; }   // '_' ignores (and drops) a value
+            Shape.Empty => { return 0.0; }
+        }
+    }
+    let s = Shape.Rect(3, 4);  let e = Shape.Empty;
+- a variant can carry up to 8 values of any type (Strings, classes with destructors, structs, other enums);
+  an enum with at least one such variant is a tagged value: an 8-byte tag plus room for its largest variant
+- build values with `Enum.Variant(values)` (or `Enum.Variant` when it has none); `match` arms are
+  `Enum.Variant(names)` and must cover every variant (or use `_ =>`)
+- they move and copy like structs: a value holding a destructor is moved, Strings inside are shared;
+  `==` is not defined for them. User-defined generic enums are not supported (`Option` and `Result` are built in)
+
 ## Interfaces and inheritance
     interface Shape { fn area() -> i64; fn name() -> String; }
     class Rect : Shape { ... public: fn area() -> i64 { ... } fn name() -> String { ... } }
@@ -233,7 +251,7 @@ dumps and every error message of the two compilers. Check by hand:
 `./svalinnc --dump-sema f.svl` vs `./selfhost/semac f.svl`.
 
 ## Tests (`make test`)
-examples; 96 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
+examples; 108 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
 output under `-O0`, `-O` and both compilers, each run under valgrind (no memory errors, no leaks); command line,
 stdin, runtime-error messages and the `--test` runner; the `protect Process` attack test; lexer/parser/checker/code
 generator identity between the compilers; both bootstraps; differential fuzzing of the optimizer; String fuzzing
@@ -247,7 +265,7 @@ This is **1.0.0-rc.1**: the compiler is release quality, the language is not fro
 1. **Freeze the language (rc.2)**: the P0 items, which may break today's code.
    - module namespaces: Java-style imports (`import std.fs.File;`, `import std.fs.*;`), items private unless
      `public` (today functions and types are global across modules)
-   - enums with payloads, `Option<T>`, destructuring `match`
+   - ~~enums with payloads, `Option<T>`, destructuring `match`~~ (done)
    - owning interface values (`Vec<Shape>`, interface fields and returns)
    - function values and closures (capture by copy or move)
    - generic methods

@@ -1,0 +1,27 @@
+12
+12
+0
+num 42
+word hi!
+pair starting left
+end
+word shared
+word shared
+open db
+busy db 7
+close db
+free
+open cache
+scope end
+close cache
+open tmp
+close tmp
+ignored conn 2
+x: pair starting a
+num 1
+word two
+end
+first num 1
+num 12
+word abc
+empty

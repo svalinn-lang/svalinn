@@ -289,6 +289,11 @@ unsafe fn oa_stmt(s: *Stmt) {
         while arm != null {
             let mark = nodecl;
             if arm.lv != null { oa_note(arm.lv); odeclare(arm.lv); }
+            var j = 0;
+            while j < MAXVF {
+                if arm.vlv[j] != null { oa_note(arm.vlv[j]); odeclare(arm.vlv[j]); }
+                j += 1;
+            }
             oa_stmt(arm.body);
             opos += 1;
             oscope_end(mark);
@@ -424,7 +429,7 @@ unsafe fn has_call(e: *Expr) -> bool {
         if optlvl != 0 && e.callee != null && e.callee.is_extern != 0 && strcmp(e.callee.name, "sqrt" as *u8) == 0 && e.nargs == 1 && e.ty.size == 8 && fbase < 7 { return has_call(e.args); }
     }
     let k = e.kind;
-    if k == E_CALL || k == E_AWAIT || k == E_TRY || k == E_OK || k == E_ERR || k == E_TOIFACE || k == E_MCALL { return true; }
+    if k == E_CALL || k == E_AWAIT || k == E_TRY || k == E_OK || k == E_ERR || k == E_TOIFACE || k == E_MCALL || k == E_VARIANT { return true; }
     if has_call(e.a) || has_call(e.b) { return true; }
     var p = e.args;
     while p != null { if has_call(p) { return true; } p = p.next; }
