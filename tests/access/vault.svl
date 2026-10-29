@@ -1,0 +1,4 @@
+module Vault;
+allowAccess Bank, Audit.Office;
+class Safe { public: ctor() { } fn peek() -> i64 { return 1; } }
+fn open_safe() -> Safe { return Safe(); }

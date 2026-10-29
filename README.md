@@ -100,6 +100,9 @@ A module lists what it needs; anything else is a compile error. `deny` always wi
 - `protect Process;` makes the program un-debuggable and its memory unreadable by other processes
   (`prctl(PR_SET_DUMPABLE, 0)`); `tests/security/` proves it with a real attacker process.
 - the capability set is embedded in the binary (`.svalinn.caps` section).
+- `allowAccess Bank, Audit.Office;` in a module limits who may call it: its functions, methods and
+  constructors can then only be called from that module itself and from the modules listed (by their
+  `module` name); any other call is a compile error. Types and fields are not restricted.
 
 ## Standard library (`lib/std`, written in Svalinn)
 | module | contents | capability |
@@ -251,7 +254,7 @@ dumps and every error message of the two compilers. Check by hand:
 `./svalinnc --dump-sema f.svl` vs `./selfhost/semac f.svl`.
 
 ## Tests (`make test`)
-examples; 108 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
+examples; 111 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
 output under `-O0`, `-O` and both compilers, each run under valgrind (no memory errors, no leaks); command line,
 stdin, runtime-error messages and the `--test` runner; the `protect Process` attack test; lexer/parser/checker/code
 generator identity between the compilers; both bootstraps; differential fuzzing of the optimizer; String fuzzing
@@ -269,7 +272,7 @@ This is **1.0.0-rc.1**: the compiler is release quality, the language is not fro
    - owning interface values (`Vec<Shape>`, interface fields and returns)
    - function values and closures (capture by copy or move)
    - generic methods
-   - `allowAccess`: a module lists the modules allowed to call it
+   - ~~`allowAccess`: a module lists the modules allowed to call it~~ (done)
    - fixed rules for `char` (a 32-bit Unicode scalar, `s.chars()`), `usize`/`isize` and integer overflow
      (wraps, plus `checked_*` and an opt-in `--overflow-checks`)
    - a normative language reference

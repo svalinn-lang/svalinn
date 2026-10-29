@@ -1,0 +1,3 @@
+tests/access_fn.svl:3:28: error: 'open_safe' is in module 'Vault', which allows access only from the modules listed in its 'allowAccess' (not from 'Thief')
+    3 | fn main() -> i32 { let s = open_safe(); return 0; }
+      |                            ^

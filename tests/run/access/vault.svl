@@ -1,0 +1,13 @@
+// Only Bank (and the vault itself) may call into this module.
+module Vault;
+allowAccess Bank, AccessTest;
+
+class Safe {
+    private:
+        var gold: i64;
+    public:
+        ctor(gold: i64) { this.gold = gold; }
+        fn take(n: i64) -> i64 { this.gold -= n; return this.gold; }
+}
+
+fn open_safe(gold: i64) -> Safe { return Safe(gold); }

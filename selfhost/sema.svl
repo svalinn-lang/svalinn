@@ -48,6 +48,25 @@ unsafe fn cap_ok(c: *u8) -> bool {
     while i < nallow { if cap_matches(allow_caps[i], c) { return true; } i += 1; }
     return false;
 }
+// module name of a file, or its path
+unsafe fn file_name_of(fi: i32) -> *u8 {
+    if file_mod[fi] != null { return file_mod[fi]; }
+    if fi < nfile_names { return file_names[fi]; }
+    return "<input>" as *u8;
+}
+// allowAccess: only the listed modules may call into a module (and the module itself)
+unsafe fn check_access(f: *Func, line: i32) {
+    let ff = f.line >> 26;
+    let cf = line >> 26;
+    if ff == cf || has_access[ff] == 0 || file_trusted[cf] != 0 { return; }
+    let cm = file_name_of(cf);
+    var i = 0;
+    while i < naccess {
+        if access_file[i] == ff && strcmp(access_name[i], cm) == 0 { return; }
+        i += 1;
+    }
+    dief(line, "'%s' is in module '%s', which allows access only from the modules listed in its 'allowAccess' (not from '%s')", f.name as i64, file_name_of(ff) as i64, cm as i64);
+}
 unsafe fn need_cap(c: *u8, what: *u8, line: i32) {
     if file_trusted[line >> 26] != 0 { return; }
     var i = 0;
@@ -742,6 +761,7 @@ unsafe fn check_call(e: *Expr) -> *Type {
         }
     }
     if f == null { dief(e.line, "call to undefined function '%s'", e.name as i64, 0, 0); }
+    check_access(f, e.line);
     if f.is_unsafe != 0 && in_unsafe == 0 {
         var kind: *u8 = lit("unsafe");
         if f.is_extern != 0 { kind = lit("extern"); }

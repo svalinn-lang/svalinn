@@ -23,6 +23,8 @@ static char **files; static int nfiles, cfiles;
 static int rt_fidx = -1;   /* file index of lib/rt/prelude.svl */
 static char file_trusted[32];   /* files of the runtime and the standard library: no capability checks inside
                                    * (their entry points declare `requires` instead) */
+static char *file_mod[32];   /* the name each file gives itself with `module X;` */
+static char **access_list[32]; static int naccess[32], caccess[32], has_access[32];   /* `allowAccess A, B;`: the modules that may call into the file */
 /* source positions: (file index << 26) | (column << 16) | line; column 0 = unknown (no caret is shown) */
 #define POS_FILE(p) ((p) >> 26)
 #define POS_COL(p) (((p) >> 16) & 1023)
@@ -898,7 +900,12 @@ static void parse_program(void) {
     while (cur()->k != TK_EOF) {
         int line = cur()->line, imp = POS_FILE(line) != 0;
         if (imp && (iskw("allow") || iskw("deny") || iskw("protect"))) die(line, "imported modules cannot declare capabilities or protection; the importing module decides");
-        if (acceptkw("module")) { char *mn = parse_dotted(); if (!imp) mod_name = mn; expectop(";"); }
+        if (acceptkw("module")) { char *mn = parse_dotted(); if (!imp) mod_name = mn; file_mod[POS_FILE(line)] = mn; expectop(";"); }
+        else if (acceptkw("allowAccess")) {   /* allowAccess A, B.C; */
+            int fi = POS_FILE(line); has_access[fi] = 1;
+            do { char *m = parse_dotted(); VPUSH(access_list[fi], naccess[fi], caccess[fi], m); } while (acceptop(","));
+            expectop(";");
+        }
         else if (acceptkw("import")) { parse_dotted(); expectop(";"); }
         else if (acceptkw("allow")) { char *c = parse_dotted(); expectop(";"); VPUSH(allow_caps, nallow, callow, c); }
         else if (acceptkw("deny")) { char *c = parse_dotted(); expectop(";"); VPUSH(deny_caps, ndeny, cdeny, c); }
@@ -962,6 +969,14 @@ static int cap_ok(const char *c) {
     for (int i = 0; i < ndeny; i++) if (cap_matches(deny_caps[i], c)) return 0;
     for (int i = 0; i < nallow; i++) if (cap_matches(allow_caps[i], c)) return 1;
     return 0;
+}
+static const char *file_name_of(int fi) { return file_mod[fi] ? file_mod[fi] : fi < nfiles ? files[fi] : g_path; }   /* module name, or the path */
+static void check_access(Func *f, int line) {   /* allowAccess: only the listed modules may call into a module (and the module itself) */
+    int ff = POS_FILE(f->line), cf = POS_FILE(line);
+    if (ff == cf || !has_access[ff] || file_trusted[cf]) return;
+    const char *cm = file_name_of(cf);
+    for (int i = 0; i < naccess[ff]; i++) if (!strcmp(access_list[ff][i], cm)) return;
+    die(line, "'%s' is in module '%s', which allows access only from the modules listed in its 'allowAccess' (not from '%s')", f->name, file_name_of(ff), cm);
 }
 static void need_cap(const char *c, const char *what, int line) {
     if (file_trusted[POS_FILE(line)]) return;
@@ -1335,6 +1350,7 @@ static Type *check_expr(Expr *e) {
         int pre = 0;
         if (!f) { Generic *gn = find_generic(e->name); if (gn && gn->kind == 2) { f = infer_generic(gn, e); e->name = f->name; pre = 1; } }
         if (!f) die(e->line, "call to undefined function '%s'", e->name);
+        check_access(f, e->line);
         if (f->is_unsafe && !in_unsafe) die(e->line, "call to %s function '%s' requires an unsafe block", f->is_extern ? "extern" : "unsafe", f->name);
         if (f->is_deprecated && !file_trusted[POS_FILE(e->line)] && !(cur_fn && cur_fn->is_deprecated)) warn(e->line, "'%s' is deprecated", f->name);
         for (int i = 0; i < f->nreq; i++) { char what[300]; snprintf(what, sizeof what, "calling '%s'", f->name); need_cap(f->req[i], what, e->line); }
