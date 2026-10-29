@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Random Aegis program generator for differential testing of the optimizer.
+"""Random Svalinn program generator for differential testing of the optimizer.
 Every generated program is deterministic and prints many values; it must print the same output
 when compiled with and without -O (and, with --c, the same as an equivalent C program where defined).
-usage: gen.py SEED > prog.ag"""
+usage: gen.py SEED > prog.svl"""
 import random, sys
 
 INT_TYPES = ['i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64']

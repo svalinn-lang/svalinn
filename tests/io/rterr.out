@@ -1,10 +1,10 @@
-before aegis: index out of bounds
+before svalinn: index out of bounds
 exit 101
-before aegis: integer division by zero (or overflow)
+before svalinn: integer division by zero (or overflow)
 exit 101
-before aegis: stack overflow (or invalid memory access)
+before svalinn: stack overflow (or invalid memory access)
 exit 101
-before aegis: index out of bounds
+before svalinn: index out of bounds
 exit 101
-before aegis: panic: gave up
+before svalinn: panic: gave up
 exit 101

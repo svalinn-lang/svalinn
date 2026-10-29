@@ -26,10 +26,10 @@ fn main() -> i32 {
     var none = Vec<String>();
     match run("no-such-program-xyz", ref none) { Ok(code) => { println("exit " + code); } Err(e) => { println("spawn failed"); } }
     match run("false", ref none) { Ok(code) => { println("false exits " + code); } Err(e) => { println("spawn failed"); } }
-    match set_env_var("AEGIS_TEST", "42") { Ok() => { } Err(e) => { println("setenv failed"); } }
-    match env_var("AEGIS_TEST") { Ok(v) => { println("AEGIS_TEST=" + v); } Err(e) => { println("unset"); } }
-    match remove_env_var("AEGIS_TEST") { Ok() => { } Err(e) => { println("unsetenv failed"); } }
-    match env_var("AEGIS_TEST") { Ok(v) => { println(v); } Err(e) => { println("AEGIS_TEST: " + io_error_text(e)); } }
+    match set_env_var("SVALINN_TEST", "42") { Ok() => { } Err(e) => { println("setenv failed"); } }
+    match env_var("SVALINN_TEST") { Ok(v) => { println("SVALINN_TEST=" + v); } Err(e) => { println("unset"); } }
+    match remove_env_var("SVALINN_TEST") { Ok() => { } Err(e) => { println("unsetenv failed"); } }
+    match env_var("SVALINN_TEST") { Ok(v) => { println(v); } Err(e) => { println("SVALINN_TEST: " + io_error_text(e)); } }
     match set_env_var("A=B", "1") { Ok() => { println("??"); } Err(e) => { println(io_error_text(e)); } }
     let t0 = monotonic_ns();
     sleep_ms(15);

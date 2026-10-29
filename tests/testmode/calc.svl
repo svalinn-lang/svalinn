@@ -1,4 +1,4 @@
-// `aegisc --test`: every @test function runs in its own process; a panic or runtime error fails only that test
+// `svalinnc --test`: every @test function runs in its own process; a panic or runtime error fails only that test
 module Calc;
 allow Console;
 

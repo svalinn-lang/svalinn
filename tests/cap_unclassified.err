@@ -1,3 +1,3 @@
-tests/cap_unclassified.ag:1:104: error: calling unclassified extern function 'mprotect' requires capability 'Unrestricted' (add 'allow Unrestricted;' to the module)
+tests/cap_unclassified.svl:1:104: error: calling unclassified extern function 'mprotect' requires capability 'Unrestricted' (add 'allow Unrestricted;' to the module)
     1 | module A; allow Native; extern fn mprotect(p: *u8, n: u64, f: i32) -> i32; fn main() -> i32 { unsafe { mprotect(null, 0, 7); } return 0; }
       |                                                                                                        ^

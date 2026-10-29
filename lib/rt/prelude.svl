@@ -1,4 +1,4 @@
-// The Aegis runtime prelude: part of every program. Code in this file is trusted by the compiler: it may call
+// The Svalinn runtime prelude: part of every program. Code in this file is trusted by the compiler: it may call
 // extern functions without the program's capabilities, `*u8 as String` is a raw reinterpretation here (elsewhere
 // it copies), and String parameters of these functions are borrowed (the caller keeps ownership).
 //
@@ -23,7 +23,7 @@ extern fn strtod(s: *u8, end: *u8) -> f64;
 fn panic(msg: String) {
     unsafe {
         fflush(null);
-        let m = "aegis: panic: ";
+        let m = "svalinn: panic: ";
         write(2, m as *u8, rt_str_len(m) as u64);
         write(2, msg as *u8, rt_str_len(msg) as u64);
         write(2, "\n" as *u8, 1);

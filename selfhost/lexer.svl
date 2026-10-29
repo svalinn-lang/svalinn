@@ -1,4 +1,4 @@
-// Token dump driver: prints the same output as `aegisc --dump-tokens`.
+// Token dump driver: prints the same output as `svalinnc --dump-tokens`.
 module LexerDriver;
 allow Console;
 allow Native;
@@ -10,7 +10,7 @@ import lex;
 import err;
 
 unsafe fn main(argc: i32, argv: **u8) -> i32 {
-    if argc < 2 { println("usage: lexer <file.ag>"); return 1; }
+    if argc < 2 { println("usage: lexer <file.svl>"); return 1; }
     add_file_name(argv[1]);
     var len: i32 = 0;
     let src = read_file(argv[1] as String, ref len);

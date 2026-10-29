@@ -1,3 +1,3 @@
-tests/async_yield_args.ag:1:30: error: yield_now takes no arguments
+tests/async_yield_args.svl:1:30: error: yield_now takes no arguments
     1 | module A; fn main() -> i32 { yield_now(1); return 0; }
       |                              ^

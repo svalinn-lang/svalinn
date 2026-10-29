@@ -1,3 +1,3 @@
-tests/nocap.ag:1:30: error: printing requires capability 'Console' (add 'allow Console;' to the module)
+tests/nocap.svl:1:30: error: printing requires capability 'Console' (add 'allow Console;' to the module)
     1 | module A; fn main() -> i32 { println("x"); return 0; }
       |                              ^

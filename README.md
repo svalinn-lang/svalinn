@@ -1,19 +1,23 @@
-# Aegis 1.0.0-rc.1
+# Svalinn 1.0.0-rc.1
 
-Aegis is a compiled, C-syntax systems language with ownership, reference-counted strings, classes, interfaces,
+Svalinn is a compiled, C-syntax systems language with ownership, reference-counted strings, classes, interfaces,
 generics, `Result`/`?`, async tasks and a **capability system**: a program states what it may touch
 (`allow File.Read;`, `allow Process.Spawn;` ...) and the compiler rejects every call that needs more.
 
-`aegisc` exists twice: in C (`src/aegisc.c`, one file) and in Aegis (`selfhost/`). Both emit byte-identical
+> **Formerly Aegis.** Svalinn is the shield that stands before the sun in Norse mythology. Up to 1.0.0-rc.1
+> the language was called Aegis: the compiler `aegisc` is now `svalinnc`, source files `.ag` are now `.svl`, and
+> runtime errors start with `svalinn:` instead of `aegis:`.
+
+`svalinnc` exists twice: in C (`src/svalinnc.c`, one file) and in Svalinn (`selfhost/`). Both emit byte-identical
 x86-64 assembly and the self-hosted compiler rebuilds itself to a fixed point. Linux x86-64; gcc is used to
 assemble and link.
 
-    make                                   # builds ./aegisc (needs gcc)
-    ./aegisc examples/hello.ag -o hello && ./hello
-    ./aegisc -O file.ag -o file            # optimized build
-    ./aegisc file.ag -S -o file.s          # assembly only
-    ./aegisc --test file.ag -o t && ./t   # run the file's @test functions
-    ./aegisc --version
+    make                                   # builds ./svalinnc (needs gcc)
+    ./svalinnc examples/hello.svl -o hello && ./hello
+    ./svalinnc -O file.svl -o file            # optimized build
+    ./svalinnc file.svl -S -o file.s          # assembly only
+    ./svalinnc --test file.svl -o t && ./t   # run the file's @test functions
+    ./svalinnc --version
     make test                              # the whole test suite (about a minute)
 
 ## A first program
@@ -35,11 +39,11 @@ assemble and link.
 
 Remove `allow File.Read;` and the compiler says:
 
-    wc.ag:7:19: error: calling 'File.read_to_string' requires capability 'File.Read' (add 'allow File.Read;' to the module)
+    wc.svl:7:19: error: calling 'File.read_to_string' requires capability 'File.Read' (add 'allow File.Read;' to the module)
         7 |         match File.read_to_string(args.item(i)) {
           |                   ^
 
-A complete version is `examples/wordcount.ag`.
+A complete version is `examples/wordcount.svl`.
 
 ## Language overview
 - modules, `import a.b;` (relative to the source file, then the compiler's `lib/`), include-once
@@ -58,7 +62,7 @@ A complete version is `examples/wordcount.ag`.
 - `print` / `println` of numbers, bools, chars and strings
 
 ## Strings
-    let name = "Aegis";
+    let name = "Svalinn";
     let s = "Hello, " + name + "! " + 1 + " " + 2.5 + " " + true;   // other types are converted
     println(s.len());               // bytes
     if s.starts_with("Hello") && s != "x" { println(s.slice(0, 5).to_upper()); }
@@ -72,7 +76,7 @@ A complete version is `examples/wordcount.ag`.
   to_upper to_lower trim replace(from, to) repeat(n) char_at(i) parse_int parse_float`
 - `p as String` copies a C string (unsafe); a String passed to an `extern fn` arrives as a NUL-terminated
   `const char *` (never null). `extern fn` cannot return String: return `*u8` and convert.
-- the runtime is ordinary Aegis code: `lib/rt/prelude.ag`
+- the runtime is ordinary Svalinn code: `lib/rt/prelude.svl`
 
 ## Capabilities
 A module lists what it needs; anything else is a compile error. `deny` always wins over `allow`, and
@@ -94,9 +98,9 @@ A module lists what it needs; anything else is a compile error. `deny` always wi
   its entry points are.
 - `protect Process;` makes the program un-debuggable and its memory unreadable by other processes
   (`prctl(PR_SET_DUMPABLE, 0)`); `tests/security/` proves it with a real attacker process.
-- the capability set is embedded in the binary (`.aegis.caps` section).
+- the capability set is embedded in the binary (`.svalinn.caps` section).
 
-## Standard library (`lib/std`, written in Aegis)
+## Standard library (`lib/std`, written in Svalinn)
 | module | contents | capability |
 |---|---|---|
 | `std.fs` | `File` (`open create append read_all read_line write write_line flush close`), `File.read_to_string`, `File.write_string`, `File.exists`, `File.remove` | `File.Read` / `File.Write` |
@@ -116,19 +120,19 @@ The command line arrives in `fn main(args: Vec<String>) -> i32` (`args.item(0)` 
     fn adds() { if 2 + 3 != 5 { panic("2 + 3 != 5"); } }
     @deprecated
     fn old_api() -> i32 { return 1; }    // every call site gets a warning
-`aegisc --test file.ag -o t` builds a runner instead of `main`: each `@test` function (no parameters, returns
+`svalinnc --test file.svl -o t` builds a runner instead of `main`: each `@test` function (no parameters, returns
 nothing) runs in its own process; a `panic`, failed bounds check or crash fails that test only, and the runner
 prints `test name ... ok/FAILED` and a summary, exit code 1 if anything failed.
 
 ## Runtime errors
 An index out of bounds, integer division by zero, stack overflow or `panic(msg)` flushes the program's output,
-prints one line (`aegis: index out of bounds`, `aegis: panic: msg`, ...) to stderr and exits with code 101.
+prints one line (`svalinn: index out of bounds`, `svalinn: panic: msg`, ...) to stderr and exits with code 101.
 Destructors do not run. Integer arithmetic wraps around (two's complement), it never traps.
 
 ## Diagnostics
 Errors show file, line and column, the source line and a caret. The checker reports one error per function
 and keeps going (up to 20), so one compile shows the errors of every function; syntax errors stop at the first.
-Every negative test in `tests/*.ag` has its exact expected output in `tests/*.err`.
+Every negative test in `tests/*.svl` has its exact expected output in `tests/*.err`.
 
 ## Classes
     class Player {
@@ -211,22 +215,47 @@ Benchmarks against C, Rust, Go, Java, Node and Python are in `bench/` (`bench/ru
 Node 2.61x), 4.4x faster than `-O0`.
 
 ## Self-hosting
-`selfhost/aegisc.ag` is the whole compiler in Aegis (lexer, parser, checker, optimizer, code generator,
+`selfhost/svalinnc.svl` is the whole compiler in Svalinn (lexer, parser, checker, optimizer, code generator,
 8 500 lines). The C compiler builds it (stage 1), stage 1 builds it again (stage 2): the assembly of C,
 stage 1 and stage 2 is identical, at `-O0` and at `-O`. `make test` also diffs the token, AST and typed-AST
 dumps and every error message of the two compilers. Check by hand:
-`./aegisc --dump-sema f.ag` vs `./selfhost/semac f.ag`.
+`./svalinnc --dump-sema f.svl` vs `./selfhost/semac f.svl`.
 
 ## Tests (`make test`)
 examples; 90 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
 output under `-O0`, `-O` and both compilers, each run under valgrind (no memory errors, no leaks); command line,
 stdin, runtime-error messages and the `--test` runner; the `protect Process` attack test; lexer/parser/checker/code
 generator identity between the compilers; both bootstraps; differential fuzzing of the optimizer; String fuzzing
-against a Python oracle (with valgrind).
+against a Python oracle (with valgrind). CI runs `make test` on every push and pull request
+(`.github/workflows/test.yml`).
 
-## Status and known limitations
-This is **1.0.0-rc.1**: the compiler is release quality, the language is not frozen yet. The review in
-[`RELEASE-1.0.0.md`](RELEASE-1.0.0.md) lists what must land before 1.0.0 - most importantly module namespaces
-(functions and types are currently global across modules), `Option<T>`/generic enums, storable interface values,
-closures, `HashMap`/sorting/formatting, `allowAccess`, and a language reference. Also: Linux x86-64 only, gcc is
-needed to assemble and link, strings are byte strings, no debug info.
+## Status and roadmap
+This is **1.0.0-rc.1**: the compiler is release quality, the language is not frozen yet. The release plan is
+[`docs/RELEASE-PLAN.md`](docs/RELEASE-PLAN.md). 1.0.0 ships in three phases:
+
+1. **Freeze the language (rc.2)**: the P0 items, which may break today's code.
+   - module namespaces: Java-style imports (`import std.fs.File;`, `import std.fs.*;`), items private unless
+     `public` (today functions and types are global across modules)
+   - enums with payloads, `Option<T>`, destructuring `match`
+   - owning interface values (`Vec<Shape>`, interface fields and returns)
+   - function values and closures (capture by copy or move)
+   - generic methods
+   - `allowAccess`: a module lists the modules allowed to call it
+   - fixed rules for `char` (a 32-bit Unicode scalar, `s.chars()`), `usize`/`isize` and integer overflow
+     (wraps, plus `checked_*` and an opt-in `--overflow-checks`)
+   - a normative language reference
+2. **Complete everything (rc.3)**: `HashMap`/`HashSet`/sort, string formatting and `StringBuilder`, paths and
+   random numbers; `check --json`; a VS Code extension with a language server; a formatter; debug info (`-g`);
+   parser error recovery and warnings; the documentation book; `make install`, packages and a `svalinn` tool.
+3. **Stabilize (1.0.0)**: bug fixes only, then release after two weeks without a breaking change.
+
+Known limitations today: Linux x86-64 only (Windows is the next platform, before macOS; until then use WSL2),
+gcc is needed to assemble and link, strings are byte strings, no debug info, one syntax error stops the compile.
+
+## Contributing
+Development happens on GitHub at `svalinn-lang/svalinn`. `main` is protected: work on a branch and open a pull
+request; it merges when the `test` check is green. Every compiler change is made in both `src/svalinnc.c` and
+`selfhost/`, and the two must stay byte-identical (see [`CLAUDE.md`](CLAUDE.md)).
+
+## License
+MIT, see [`LICENSE`](LICENSE).

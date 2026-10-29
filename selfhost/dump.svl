@@ -1,4 +1,4 @@
-// AST dump: identical output to `aegisc --dump-ast` / `--dump-sema`.
+// AST dump: identical output to `svalinnc --dump-ast` / `--dump-sema`.
 module Dump;
 
 import std.sys;

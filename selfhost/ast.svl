@@ -1,4 +1,4 @@
-// AST for the self-hosted compiler: a port of the node structs in aegisc.c.
+// AST for the self-hosted compiler: a port of the node structs in svalinnc.c.
 module Ast;
 
 import std.mem;

@@ -1,4 +1,4 @@
-// Parser for the self-hosted compiler: a port of the parser in aegisc.c.
+// Parser for the self-hosted compiler: a port of the parser in svalinnc.c.
 // Types are resolved while parsing (struct/enum names are pre-registered by prescan), like the C version.
 module Parse;
 
@@ -874,7 +874,7 @@ unsafe fn parse_fn_ex(cls: *StructDef, is_unsafe: i32, is_extern: i32, is_static
                 k += 1;
             }
             if same_sig { expectop(";"); return; }   // the same extern declared again (e.g. by two modules)
-            if rt_fidx >= 0 && (f.line >> 26) == rt_fidx { dief(g.line, "'%s' is a runtime function (lib/rt/prelude.ag); declare it with the same signature or use another name", f.name as i64, 0, 0); }
+            if rt_fidx >= 0 && (f.line >> 26) == rt_fidx { dief(g.line, "'%s' is a runtime function (lib/rt/prelude.svl); declare it with the same signature or use another name", f.name as i64, 0, 0); }
             dief(f.line, "function '%s' redefined", f.name as i64, 0, 0);
         }
         i += 1;
@@ -1315,17 +1315,17 @@ unsafe fn dir_of(path: *u8) -> *u8 {
     return dup_n(path, i);
 }
 
-var rt_fidx: i32 = -1;   // file index of lib/rt/prelude.ag: its code is trusted (no capability checks)
-// lib/rt/prelude.ag is part of every program (appended after the main module)
+var rt_fidx: i32 = -1;   // file index of lib/rt/prelude.svl: its code is trusted (no capability checks)
+// lib/rt/prelude.svl is part of every program (appended after the main module)
 unsafe fn load_prelude() {
     var path: [1200]u8;
-    snprintf(&path[0], 1200, "%s/lib/rt/prelude.ag", exe_dir as i64, 0, 0);
-    if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/../lib/rt/prelude.ag", exe_dir as i64, 0, 0); }
-    if !file_exists(&path[0]) { printf("aegisc: cannot find the runtime prelude (lib/rt/prelude.ag)\n", 0, 0, 0); exit(1); }
+    snprintf(&path[0], 1200, "%s/lib/rt/prelude.svl", exe_dir as i64, 0, 0);
+    if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/../lib/rt/prelude.svl", exe_dir as i64, 0, 0); }
+    if !file_exists(&path[0]) { printf("svalinnc: cannot find the runtime prelude (lib/rt/prelude.svl)\n", 0, 0, 0); exit(1); }
     let pc = dup_n(&path[0], strlen(&path[0]) as i32);
     loaded[nloaded] = pc;
     nloaded += 1;
-    add_file_name("lib/rt/prelude.ag" as *u8);
+    add_file_name("lib/rt/prelude.svl" as *u8);
     rt_fidx = nfile_names - 1;
     file_trusted[rt_fidx] = 1;
     var len: i32 = 0;
@@ -1340,7 +1340,7 @@ unsafe fn load_prelude() {
     ntoks = newn;
     ctoks = newn + 1;
 }
-// fn main(args: Vec<String>): a generated entry point (lib/rt/args.ag, not a real file) collects the command line
+// fn main(args: Vec<String>): a generated entry point (lib/rt/args.svl, not a real file) collects the command line
 unsafe fn tok_is(i: i32, k: i32, s: String) -> bool { return toks[i].kind == k && streq(toks[i].s, s); }
 unsafe fn load_main_args() {
     var depth = 0;
@@ -1362,13 +1362,13 @@ unsafe fn load_main_args() {
     var b: StrBuf;
     sb_init(ref b);
     sb_cat(ref b, "module rt.args;\nimport std.vec;\n");
-    sb_cat(ref b, "unsafe fn __aegis_main(argc: i32, argv: **u8) -> i32 {\n");
+    sb_cat(ref b, "unsafe fn __svalinn_main(argc: i32, argv: **u8) -> i32 {\n");
     sb_cat(ref b, "    var args = Vec<String>();\n");
     sb_cat(ref b, "    var i = 0;\n");
     sb_cat(ref b, "    while i < argc { args.push(*(argv + i) as String); i += 1; }\n");
     if isvoid { sb_cat(ref b, "    main(args);\n    return 0;\n"); } else { sb_cat(ref b, "    return main(args);\n"); }
     sb_cat(ref b, "}\n");
-    add_file_name("lib/rt/args.ag" as *u8);
+    add_file_name("lib/rt/args.svl" as *u8);
     file_trusted[nfile_names - 1] = 1;
     var cnt: i32 = 0;
     let nt = lex_to_array(b.data, b.len as i32, nfile_names - 1, ref cnt);
@@ -1380,7 +1380,7 @@ unsafe fn load_main_args() {
     ntoks = newn;
     ctoks = newn + 1;
 }
-// aegisc --test: a generated runner (lib/rt/tests.ag, not a real file) runs every @test function of the main file
+// svalinnc --test: a generated runner (lib/rt/tests.svl, not a real file) runs every @test function of the main file
 // in its own process, so a failing test (panic, runtime error) does not stop the others
 var test_mode: i32;
 unsafe fn load_test_runner() {
@@ -1402,23 +1402,23 @@ unsafe fn load_test_runner() {
     sb_init(ref b);
     var buf: [400]u8;
     sb_cat(ref b, "module rt.tests;\nextern fn fork() -> i32;\nextern fn waitpid(pid: i32, status: *i32, options: i32) -> i32;\n");
-    sb_cat(ref b, "extern fn _exit(code: i32);\nextern fn fflush(f: *u8) -> i32;\nfn __aegis_call_test(i: i32) {\n");
+    sb_cat(ref b, "extern fn _exit(code: i32);\nextern fn fflush(f: *u8) -> i32;\nfn __svalinn_call_test(i: i32) {\n");
     var k = 0;
     while k < n {
         snprintf(&buf[0], 400, "    if i == %d { %s(); }\n", k as i64, names[k] as i64, 0);
         sb_cat_c(ref b, &buf[0]);
         k += 1;
     }
-    sb_cat(ref b, "}\nfn __aegis_run_test(i: i32) -> bool {\n    var st: i32 = 0;\n    unsafe {\n        fflush(null);\n");
-    sb_cat(ref b, "        let pid = fork();\n        if pid == 0 { __aegis_call_test(i); fflush(null); _exit(0); }\n");
-    sb_cat(ref b, "        waitpid(pid, &st, 0);\n    }\n    return st == 0;\n}\nfn __aegis_tests() -> i32 {\n    var failed = 0;\n");
+    sb_cat(ref b, "}\nfn __svalinn_run_test(i: i32) -> bool {\n    var st: i32 = 0;\n    unsafe {\n        fflush(null);\n");
+    sb_cat(ref b, "        let pid = fork();\n        if pid == 0 { __svalinn_call_test(i); fflush(null); _exit(0); }\n");
+    sb_cat(ref b, "        waitpid(pid, &st, 0);\n    }\n    return st == 0;\n}\nfn __svalinn_tests() -> i32 {\n    var failed = 0;\n");
     var plural: *u8 = "s" as *u8;
     if n == 1 { plural = "" as *u8; }
     snprintf(&buf[0], 400, "    println(\"running %d test%s\");\n", n as i64, plural as i64, 0);
     sb_cat_c(ref b, &buf[0]);
     k = 0;
     while k < n {
-        snprintf(&buf[0], 400, "    if __aegis_run_test(%d) { println(\"test %s ... ok\"); }", k as i64, names[k] as i64, 0);
+        snprintf(&buf[0], 400, "    if __svalinn_run_test(%d) { println(\"test %s ... ok\"); }", k as i64, names[k] as i64, 0);
         sb_cat_c(ref b, &buf[0]);
         snprintf(&buf[0], 400, " else { println(\"test %s ... FAILED\"); failed += 1; }\n", names[k] as i64, 0, 0);
         sb_cat_c(ref b, &buf[0]);
@@ -1428,7 +1428,7 @@ unsafe fn load_test_runner() {
     sb_cat_c(ref b, &buf[0]);
     snprintf(&buf[0], 400, "    println(\"test result: FAILED. \" + (%d - failed) + \" passed, \" + failed + \" failed\");\n    return 1;\n}\n", n as i64, 0, 0);
     sb_cat_c(ref b, &buf[0]);
-    add_file_name("lib/rt/tests.ag" as *u8);
+    add_file_name("lib/rt/tests.svl" as *u8);
     file_trusted[nfile_names - 1] = 1;
     var cnt: i32 = 0;
     let nt = lex_to_array(b.data, b.len as i32, nfile_names - 1, ref cnt);
@@ -1462,10 +1462,10 @@ unsafe fn expand_imports() {
         if !(toks[j].kind == TK_OP && streq(toks[j].s, ";")) { die(line, "expected ';' after import"); }
         j += 1;
         var path: [1200]u8;
-        snprintf(&path[0], 1200, "%s/%s.ag", src_dir as i64, nm.data as i64, 0);
+        snprintf(&path[0], 1200, "%s/%s.svl", src_dir as i64, nm.data as i64, 0);
         var from_lib = false;
-        if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/lib/%s.ag", exe_dir as i64, nm.data as i64, 0); from_lib = true; }
-        if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/../lib/%s.ag", exe_dir as i64, nm.data as i64, 0); from_lib = true; }
+        if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/lib/%s.svl", exe_dir as i64, nm.data as i64, 0); from_lib = true; }
+        if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/../lib/%s.svl", exe_dir as i64, nm.data as i64, 0); from_lib = true; }
         if !file_exists(&path[0]) { dief(line, "cannot find module '%s'", nm.data as i64, 0, 0); }
         var dup = false;
         var k = 0;

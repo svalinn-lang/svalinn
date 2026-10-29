@@ -4,10 +4,10 @@
 cd "$(dirname "$0")/../.."
 if [ "$(id -u)" != 0 ] || ! command -v setpriv >/dev/null; then echo "skip security test (needs root + setpriv)"; exit 0; fi
 W=$(mktemp -d); chmod 755 "$W"; trap 'rm -rf "$W"' EXIT
-sed 's#//PROTECT##' tests/security/victim.ag > "$W/victim_open.ag"
-sed 's#//PROTECT#protect Process;#' tests/security/victim.ag > "$W/victim_prot.ag"
-for p in victim_open victim_prot; do ./aegisc "$W/$p.ag" -o "$W/$p" || exit 1; done
-./aegisc tests/security/attacker.ag -o "$W/attacker" || exit 1
+sed 's#//PROTECT##' tests/security/victim.svl > "$W/victim_open.svl"
+sed 's#//PROTECT#protect Process;#' tests/security/victim.svl > "$W/victim_prot.svl"
+for p in victim_open victim_prot; do ./svalinnc "$W/$p.svl" -o "$W/$p" || exit 1; done
+./svalinnc tests/security/attacker.svl -o "$W/attacker" || exit 1
 chmod 755 "$W"/victim_open "$W"/victim_prot "$W"/attacker
 user() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
 fail=0

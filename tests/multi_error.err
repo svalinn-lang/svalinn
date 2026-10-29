@@ -1,13 +1,13 @@
-tests/multi_error.ag:4:12: error: mismatched operand types 'i32' and 'bool'
+tests/multi_error.svl:4:12: error: mismatched operand types 'i32' and 'bool'
     4 | 	let y = x + true;
       | 	          ^
-tests/multi_error.ag:7:27: error: return: expected 'bool', found 'String'
+tests/multi_error.svl:7:27: error: return: expected 'bool', found 'String'
     7 | fn g() -> bool { return 1 + "a"; }
       |                           ^
-tests/multi_error.ag:8:25: error: the bytes of a String cannot be changed (strings are immutable); build a new String instead
+tests/multi_error.svl:8:25: error: the bytes of a String cannot be changed (strings are immutable); build a new String instead
     8 | fn h() { let s = "abc"; s[0] = 1; }
       |                         ^
-tests/multi_error.ag:9:28: error: undefined variable 'undefined_thing'
+tests/multi_error.svl:9:28: error: undefined variable 'undefined_thing'
     9 | fn main() -> i32 { println(undefined_thing); return 0; }
       |                            ^
 4 errors

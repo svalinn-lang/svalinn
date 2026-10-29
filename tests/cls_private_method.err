@@ -1,3 +1,3 @@
-tests/cls_private_method.ag:1:156: error: 'secret' is private in class 'P'
+tests/cls_private_method.svl:1:156: error: 'secret' is private in class 'P'
     1 | module A; class P { private: fn secret() -> i32 { return 1; } public: fn open() -> i32 { return this.secret(); } } fn main() -> i32 { let p = P(); return p.secret(); }
       |                                                                                                                                                            ^

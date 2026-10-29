@@ -1,4 +1,4 @@
-# ---- Aegis async runtime (stackful cooperative tasks, single thread) ----
+# ---- Svalinn async runtime (stackful cooperative tasks, single thread) ----
 # Included by the compiler when a program uses async/await/yield_now. Every task runs on its own
 # 256 KiB mmap'd stack with a guard page. Calling an async fn starts the task immediately; it runs
 # until it awaits something unfinished, calls yield_now(), or returns. `await` and dropping a Task
@@ -73,7 +73,7 @@ ag__rt_run_next:                        # give the CPU to the next ready task
 	mov eax, 1
 	mov edi, 2
 	lea rsi, [rip+.Lrt_dlmsg]
-	mov edx, 39
+	mov edx, OFFSET .Lrt_dlmsg_end - .Lrt_dlmsg
 	syscall
 	mov eax, 231
 	mov edi, 1
@@ -197,7 +197,7 @@ ag__rt_join:                            # rdi = task: wait until it has finished
 	mov eax, 1
 	mov edi, 2
 	lea rsi, [rip+.Lrt_twmsg]
-	mov edx, 38
+	mov edx, OFFSET .Lrt_twmsg_end - .Lrt_twmsg
 	syscall
 	mov eax, 231
 	mov edi, 1
@@ -262,7 +262,9 @@ ag__rt_main:
 	.zero 128
 	.section .rodata
 .Lrt_dlmsg:
-	.ascii "aegis: deadlock: all tasks are waiting\n"
+	.ascii "svalinn: deadlock: all tasks are waiting\n"
+.Lrt_dlmsg_end:
 .Lrt_twmsg:
-	.ascii "aegis: a task was awaited twice (bug)\n"
+	.ascii "svalinn: a task was awaited twice (bug)\n"
+.Lrt_twmsg_end:
 	.text

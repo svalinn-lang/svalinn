@@ -1,4 +1,4 @@
-# Aegis runtime: clear messages for runtime errors (appended to every program by the compiler).
+# Svalinn runtime: clear messages for runtime errors (appended to every program by the compiler).
 # Every runtime error flushes the program's buffered output, prints one line to stderr and exits with code 101:
 #   array or String index out of bounds (bounds checks jump to ag__rt_trap)
 #   integer division by zero / overflow (SIGFPE), stack overflow / invalid memory access (SIGSEGV, SIGBUS);
@@ -39,18 +39,18 @@ ag__rt_fault:
 	xor edi, edi
 	call fflush
 	lea rsi, [rip+.Lrt_segv]
-	mov edx, 49
+	mov edx, OFFSET .Lrt_segv_end - .Lrt_segv   # message lengths are computed by the assembler
 	cmp ebx, 8
 	jne .Lrt_say
 	lea rsi, [rip+.Lrt_fpe]
-	mov edx, 46
+	mov edx, OFFSET .Lrt_fpe_end - .Lrt_fpe
 	jmp .Lrt_say
 ag__rt_trap:
 	and rsp, -16
 	xor edi, edi
 	call fflush
 	lea rsi, [rip+.Lrt_oob]
-	mov edx, 27
+	mov edx, OFFSET .Lrt_oob_end - .Lrt_oob
 .Lrt_say:
 	mov edi, 2
 	mov eax, 1
@@ -59,11 +59,14 @@ ag__rt_trap:
 	call _exit
 	.section .rodata
 .Lrt_oob:
-	.ascii "aegis: index out of bounds\n"
+	.ascii "svalinn: index out of bounds\n"
+.Lrt_oob_end:
 .Lrt_fpe:
-	.ascii "aegis: integer division by zero (or overflow)\n"
+	.ascii "svalinn: integer division by zero (or overflow)\n"
+.Lrt_fpe_end:
 .Lrt_segv:
-	.ascii "aegis: stack overflow (or invalid memory access)\n"
+	.ascii "svalinn: stack overflow (or invalid memory access)\n"
+.Lrt_segv_end:
 	.bss
 	.balign 16
 ag__rt_altstack:

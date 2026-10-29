@@ -1,4 +1,4 @@
-// Semantic analysis for the self-hosted compiler: a port of the checker in aegisc.c,
+// Semantic analysis for the self-hosted compiler: a port of the checker in svalinnc.c,
 // including the capability checks (allow/deny, extern classification).
 module Sema;
 
@@ -508,7 +508,7 @@ unsafe fn root_mutable(e: *Expr) -> bool {
     return true;
 }
 
-// ---- strings: operators and methods become calls into the runtime prelude (lib/rt/prelude.ag) ----
+// ---- strings: operators and methods become calls into the runtime prelude (lib/rt/prelude.svl) ----
 
 unsafe fn rt_fn(n: *u8) -> *Func {
     var i = 0;

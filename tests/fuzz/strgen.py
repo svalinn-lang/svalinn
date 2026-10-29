@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Random String programs with a Python oracle: prints an Aegis program to stdout and its expected output to
+"""Random String programs with a Python oracle: prints an Svalinn program to stdout and its expected output to
 the file given as second argument. Exercises concatenation, slicing, methods, comparisons, copies through
 variables / struct fields / arrays / Vec / calls, so reference counting mistakes show up as wrong output
 or (under valgrind) as leaks and invalid accesses.
-usage: strgen.py SEED expected.txt > prog.ag"""
+usage: strgen.py SEED expected.txt > prog.svl"""
 import random, sys
 
 rnd = random.Random(int(sys.argv[1]))

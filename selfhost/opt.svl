@@ -1,4 +1,4 @@
-// Optimizer (-O) for the self-hosted compiler: a port of the optimizer in aegisc.c.
+// Optimizer (-O) for the self-hosted compiler: a port of the optimizer in svalinnc.c.
 // Works on the typed AST right before code generation: constant folding, inlining, register promotion with
 // shared registers for disjoint scopes, value ranges (bounds-check elision), loop unrolling, fill-loop and
 // SSE2 vectorization, direct instruction selection, and a peephole pass over each function body.

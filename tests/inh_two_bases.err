@@ -1,3 +1,3 @@
-tests/inh_two_bases.ag:1:48: error: class 'D' can only extend one class
+tests/inh_two_bases.svl:1:48: error: class 'D' can only extend one class
     1 | module A; class B { } class C { } class D : B, C { } fn main() -> i32 { return 0; }
       |                                                ^

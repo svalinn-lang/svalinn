@@ -1,3 +1,3 @@
-tests/safe_extern_user.ag:2:1: error: only the standard library can declare 'safe extern' functions
+tests/safe_extern_user.svl:2:1: error: only the standard library can declare 'safe extern' functions
     2 | safe extern fn abs(x: i32) -> i32;
       | ^

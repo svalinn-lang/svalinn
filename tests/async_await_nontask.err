@@ -1,3 +1,3 @@
-tests/async_await_nontask.ag:1:38: error: 'await' needs a Task (the result of calling an async fn), found 'integer literal'
+tests/async_await_nontask.svl:1:38: error: 'await' needs a Task (the result of calling an async fn), found 'integer literal'
     1 | module A; fn main() -> i32 { let x = await 5; return 0; }
       |                                      ^

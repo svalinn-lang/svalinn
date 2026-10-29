@@ -1,4 +1,4 @@
-// A tiny tokenizer written in Aegis: files, heap, linked list, argv.
+// A tiny tokenizer written in Svalinn: files, heap, linked list, argv.
 // This is the shape of code the self-hosted compiler will be made of.
 module Tokens;
 allow Console;

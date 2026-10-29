@@ -1,3 +1,3 @@
-tests/own_use_after_move.ag:1:116: error: use of moved value 'r'
+tests/own_use_after_move.svl:1:116: error: use of moved value 'r'
     1 | module A; class R { public: var x: i32; dtor { } } fn take(r: R) { } fn main() -> i32 { let r = R(); take(r); take(r); return 0; }
       |                                                                                                                    ^

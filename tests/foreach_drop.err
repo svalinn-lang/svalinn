@@ -1,3 +1,3 @@
-tests/foreach_drop.ag:7:5: error: cannot iterate by value over elements of type 'Vec<i32>' (it has a destructor); loop over the indices instead
+tests/foreach_drop.svl:7:5: error: cannot iterate by value over elements of type 'Vec<i32>' (it has a destructor); loop over the indices instead
     7 |     for v in w { println(v.len()); }
       |     ^

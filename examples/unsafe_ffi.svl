@@ -12,7 +12,7 @@ fn main() -> i32 {
     unsafe {
         poke(&x);
         putchar(72); putchar(105); putchar(10);
-        println(strlen("aegis" as *u8));
+        println(strlen("svalinn" as *u8));
     }
     println(x);
     return 0;
