@@ -1,0 +1,3 @@
+tests/opt_uninferred.svl:1:38: error: cannot infer the Option type of 'None'; use it where an Option is expected
+    1 | module A; fn main() -> i32 { let x = None; return 0; }
+      |                                      ^

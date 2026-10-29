@@ -1,0 +1,1 @@
+module A; fn g() -> Option<i32> { return Some(1); } fn f() -> Result<i32, String> { let v = g()?; return Ok(v); } fn main() -> i32 { return 0; }

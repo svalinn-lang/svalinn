@@ -265,6 +265,14 @@ unsafe fn parse_type() -> *Type {
         need_complete(re, line);
         return mk_result(rt, re);
     }
+    if streq(n, "Option") {
+        expectop("<");
+        let ot = parse_type();
+        expect_gt();
+        if ot.kind == TY_VOID { die(line, "Option needs a value type, not 'void'"); }
+        need_complete(ot, line);
+        return mk_option(ot);
+    }
     if streq(n, "bool") { return ty_bool; }
     if streq(n, "char") { return ty_char; }
     if streq(n, "String") { return ty_str; }

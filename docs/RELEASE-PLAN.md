@@ -40,7 +40,7 @@ for 1.x. Every compiler change is made twice (C and self-hosted) and must keep t
 | # | Item | Priority | Area | Why it matters | Size | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Module namespaces: Java-style imports, qualified names, `public` vs private items | P0 | Language | Names are global today, so any new std function can break user code | L | Not started: `import std.fs.File;` and top-level `public` are rejected |
-| 2 | Enums with payloads, `Option<T>`, destructuring `match` | P0 | Language | "Absent" is faked with `Result` and `NotFound`; the std API shape depends on it | M | Not started: enums are plain integers, no `Option` |
+| 2 | Enums with payloads, `Option<T>`, destructuring `match` | P0 | Language | "Absent" is faked with `Result` and `NotFound`; the std API shape depends on it | M | In progress: `Option<T>` with `Some`/`None`, `match` and `?` done; enums with payloads and destructuring `match` next |
 | 3 | Owning interface values (`Vec<Shape>`, interface fields and returns) | P0 | Language | Mixed collections are the core OOP and game case; impossible today | M | Not started: interface types are parameter-only |
 | 4 | Function values and closures | P0 | Language | Sort, callbacks and iterators need them; adding them later means a second API style | L | Not started: no `fn` types, no closure syntax |
 | 5 | Generic methods (`fn map<U>(...)` in a class) | P0 | Language | Collection APIs depend on them | M | Not started: methods take no type parameters |

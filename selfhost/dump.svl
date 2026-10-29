@@ -121,7 +121,10 @@ unsafe fn d_expr(e: *Expr) {
         ps(")");
     }
     else if k == E_OK || k == E_ERR {
-        if k == E_OK { ps("(ok"); } else { ps("(err"); }
+        if e.ty != null && e.ty.opt != 0 {
+            if k == E_OK { ps("(some"); } else { ps("(none"); }
+        }
+        else if k == E_OK { ps("(ok"); } else { ps("(err"); }
         if e.a != null { ps(" "); d_expr(e.a); }
         if dump_typed != 0 && e.tmp != 0 { printf(" t%d", e.tmp as i64, 0, 0); }
         if dump_typed != 0 && e.dflag != 0 { printf(" f%d", e.dflag as i64, 0, 0); }

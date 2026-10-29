@@ -1,0 +1,1 @@
+module A; fn f() -> Option<i32> { return Ok(1); } fn main() -> i32 { return 0; }

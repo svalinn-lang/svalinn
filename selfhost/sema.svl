@@ -252,8 +252,8 @@ unsafe fn retype(e: *Expr, t: *Type) {
 }
 unsafe fn coerce_to(e: *Expr, t: *Type) -> bool {
     if e.ty.kind == TY_RESPEND {
-        // Ok(..) / Err(..) take their Result type from the context
-        if t.kind != TY_RESULT { return false; }
+        // Ok(..) / Err(..) / Some(..) / None take their type from the context
+        if t.kind != TY_RESULT || t.opt != e.ty.opt { return false; }
         var pt = t.elem;
         if e.kind == E_ERR { pt = t.err; }
         if e.a != null { if !coerce_to(e.a, pt) { return false; } }
@@ -302,6 +302,11 @@ unsafe fn coerce_to(e: *Expr, t: *Type) -> bool {
 unsafe fn finalize(e: *Expr) {
     if e.ty != null && e.ty.kind == TY_ILIT { retype(e, ty_i32); }
     if e.ty != null && e.ty.kind == TY_FLIT { retype(e, ty_f64); }
+    if e.ty != null && e.ty.kind == TY_RESPEND && e.ty.opt != 0 {
+        var w: *u8 = lit("Some(...)");
+        if e.kind == E_ERR { w = lit("None"); }
+        dief(e.line, "cannot infer the Option type of '%s'; use it where an Option is expected", w as i64, 0, 0);
+    }
     if e.ty != null && e.ty.kind == TY_RESPEND {
         var w: *u8 = lit("Ok");
         if e.kind == E_ERR { w = lit("Err"); }
@@ -711,6 +716,22 @@ unsafe fn check_call(e: *Expr) -> *Type {
         e.ty = rp;
         return rp;
     }
+    if f == null && seq(e.name, lit("Some")) {
+        // Some(x): an Option holding x, typed by its context
+        if e.nargs != 1 { die(e.line, "'Some' takes exactly one argument"); }
+        e.a = e.args;
+        let pt = check_expr(e.a);
+        if pt.kind == TY_VOID { die(e.line, "'Some' needs a value"); }
+        e.kind = E_OK;
+        let rp = zalloc(sizeof(Type)) as *Type;
+        rp.kind = TY_RESPEND;
+        rp.elem = pt;
+        rp.opt = 1;
+        rp.size = 8;
+        rp.align = 8;
+        e.ty = rp;
+        return rp;
+    }
     var pre = 0;
     if f == null {
         let gn = find_generic(e.name);
@@ -847,6 +868,19 @@ unsafe fn check_expr(e: *Expr) -> *Type {
     }
     if k == E_VAR {
         let l = lookup(e.name);
+        if l == null && seq(e.name, lit("None")) {
+            // None: an Option without a value, typed by its context
+            e.kind = E_ERR;
+            let rp = zalloc(sizeof(Type)) as *Type;
+            rp.kind = TY_RESPEND;
+            rp.elem = ty_void;
+            rp.n = 1;
+            rp.opt = 1;
+            rp.size = 8;
+            rp.align = 8;
+            e.ty = rp;
+            return rp;
+        }
         if l == null { dief(e.line, "undefined variable '%s'", e.name as i64, 0, 0); }
         if l.is_global != 0 && has_ptr(l.ty) && in_unsafe == 0 { dief(e.line, "pointer global '%s' can only be used in unsafe code", l.name as i64, 0, 0); }
         if l.moved != 0 && assign_target == 0 { dief(e.line, "use of moved value '%s'", e.name as i64, 0, 0); }
@@ -1143,8 +1177,9 @@ unsafe fn check_expr(e: *Expr) -> *Type {
     }
     if k == E_TRY {
         let t = check_expr(e.a);
-        if t.kind != TY_RESULT { dief(e.line, "'?' needs a Result, found '%s'", tname(t) as i64, 0, 0); }
-        if cur_fn == null || cur_fn.ret.kind != TY_RESULT { die(e.line, "'?' can only be used in a function that returns a Result"); }
+        if t.kind != TY_RESULT { dief(e.line, "'?' needs a Result or an Option, found '%s'", tname(t) as i64, 0, 0); }
+        if t.opt != 0 && (cur_fn == null || cur_fn.ret.kind != TY_RESULT || cur_fn.ret.opt == 0) { die(e.line, "'?' on an Option can only be used in a function that returns an Option"); }
+        if t.opt == 0 && (cur_fn == null || cur_fn.ret.kind != TY_RESULT || cur_fn.ret.opt != 0) { die(e.line, "'?' can only be used in a function that returns a Result"); }
         if !same(t.err, cur_fn.ret.err) {
             dief(e.line, "'?' cannot convert error type '%s' into '%s'", tname(t.err) as i64, tname(cur_fn.ret.err) as i64, 0);
         }
@@ -1288,11 +1323,16 @@ unsafe fn check_match_result(s: *Stmt, t: *Type, pre: *u8, acc: *u8, n0: i32, re
             arm_end(arm.body, acc, n0, ref anyc);
         }
         else {
-            if !(p.kind == E_CALL && (seq(p.name, lit("Ok")) || seq(p.name, lit("Err"))) && p.nargs <= 1 && (p.nargs == 0 || p.args.kind == E_VAR)) {
+            if t.opt != 0 {
+                if !((p.kind == E_CALL && seq(p.name, lit("Some")) && p.nargs == 1 && p.args.kind == E_VAR) || (p.kind == E_VAR && seq(p.name, lit("None")))) {
+                    die(p.line, "match patterns on an Option must be Some(name) or None");
+                }
+            }
+            else if !(p.kind == E_CALL && (seq(p.name, lit("Ok")) || seq(p.name, lit("Err"))) && p.nargs <= 1 && (p.nargs == 0 || p.args.kind == E_VAR)) {
                 die(p.line, "match patterns on a Result must be Ok(name) or Err(name)");
             }
             var er = 0;
-            if p.name[0] == 'E' { er = 1; }
+            if p.name[0] == 'E' || p.name[0] == 'N' { er = 1; }
             var pt = t.elem;
             if er != 0 { pt = t.err; }
             var bad = false;
@@ -1318,7 +1358,10 @@ unsafe fn check_match_result(s: *Stmt, t: *Type, pre: *u8, acc: *u8, n0: i32, re
         if p == null { wild = true; }
         arm = arm.next;
     }
-    if !wild && !(cov0 && cov1) { die(s.line, "non-exhaustive match on Result: handle both Ok and Err (or add '_ =>')"); }
+    if !wild && !(cov0 && cov1) {
+        if t.opt != 0 { die(s.line, "non-exhaustive match on Option: handle both Some and None (or add '_ =>')"); }
+        die(s.line, "non-exhaustive match on Result: handle both Ok and Err (or add '_ =>')");
+    }
 }
 
 // for x in c { body }  with c a collection class that has len() and item(i64):

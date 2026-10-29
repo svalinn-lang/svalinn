@@ -151,7 +151,7 @@ typedef enum { TY_VOID, TY_BOOL, TY_INT, TY_STR, TY_PTR, TY_STRUCT, TY_ARRAY, TY
 typedef struct Type Type; typedef struct StructDef StructDef; typedef struct EnumDef EnumDef;
 typedef struct Expr Expr; typedef struct Generic Generic; typedef struct Iface Iface; typedef struct Func Func;
 typedef struct { char *name; Type *ty; int off; int is_mut, vis; Expr *init; StructDef *owner; } Field;   /* vis: 0 public 1 private 2 protected 3 internal */
-struct Type { TyKind k; int size, align, sign, is_char; Type *elem; long long n; StructDef *sd; EnumDef *ed; Type *err; Iface *ifc; };
+struct Type { TyKind k; int size, align, sign, is_char; Type *elem; long long n; StructDef *sd; EnumDef *ed; Type *err; Iface *ifc; int opt; };   /* opt: Option<T> (a Result<T, void> spelled Some/None) */
 struct StructDef { char *name; Field *f; int nf, cf; int done; int is_class; Type *ty; Generic *gen; Type **targs; StructDef *base; Iface **ifs; int nifs, cifs, line; Func *dtor; };
 struct Iface { char *name; Type *ty; Func **m; int nm, cm; };   /* interface: methods are abstract Funcs; values are {object*, vtable*} */
 static Iface **ifaces; static int nifaces, cifaces;
@@ -198,6 +198,7 @@ static Type *mk_result(Type *t, Type *e) {
     Type *r = xalloc(sizeof *r); int pl = t->size > e->size ? t->size : e->size;
     r->k = TY_RESULT; r->elem = t; r->err = e; r->align = 8; r->size = 8 + (pl + 7) / 8 * 8; return r;   /* tag (0 Ok, 1 Err) + payload */
 }
+static Type *mk_option(Type *t) { Type *r = mk_result(t, &ty_void); r->opt = 1; return r; }   /* tag 0 Some, 1 None */
 static int is_agg(Type *t) { return t->k == TY_STRUCT || t->k == TY_ARRAY || t->k == TY_RESULT || t->k == TY_IFACE || t->k == TY_TASK; }
 static Type *mk_task(Type *e) { Type *t = xalloc(sizeof *t); t->k = TY_TASK; t->elem = e; t->size = t->align = 8; return t; }   /* handle of a running async call */
 static const char *IFACE_MSG = "interface type '%s' can only be used as a function parameter (it borrows the object)";
@@ -219,7 +220,7 @@ static int same(Type *a, Type *b) {
     case TY_ARRAY: return a->n == b->n && same(a->elem, b->elem);
     case TY_STRUCT: return a->sd == b->sd;
     case TY_ENUM: return a->ed == b->ed;
-    case TY_RESULT: return same(a->elem, b->elem) && same(a->err, b->err);
+    case TY_RESULT: return a->opt == b->opt && same(a->elem, b->elem) && same(a->err, b->err);
     case TY_IFACE: return a->ifc == b->ifc;
     case TY_TASK: return same(a->elem, b->elem);
     default: return 1;
@@ -236,8 +237,12 @@ static char *tname(Type *t) {
     case TY_PTR: sprintf(b, "*%.120s", tname(t->elem)); break;
     case TY_ARRAY: sprintf(b, "[%lld]%.100s", t->n, tname(t->elem)); break;
     case TY_STRUCT: sprintf(b, "%.150s", t->sd->name); break; case TY_ENUM: sprintf(b, "%.150s", t->ed->name); break;
-    case TY_RESULT: { char *a = tname(t->elem), *c = tname(t->err); sprintf(b, "Result<%.70s, %.70s>", a, c); break; }
-    case TY_RESPEND: sprintf(b, "%s(%.140s)", t->n ? "Err" : "Ok", tname(t->elem)); break;
+    case TY_RESULT:
+        if (t->opt) { sprintf(b, "Option<%.140s>", tname(t->elem)); break; }
+        { char *a = tname(t->elem), *c = tname(t->err); sprintf(b, "Result<%.70s, %.70s>", a, c); break; }
+    case TY_RESPEND:
+        if (t->opt && t->n) { strcpy(b, "None"); break; }
+        sprintf(b, "%s(%.140s)", t->opt ? "Some" : t->n ? "Err" : "Ok", tname(t->elem)); break;
     case TY_PARAM: strcpy(b, "type parameter"); break;
     case TY_IFACE: sprintf(b, "%.150s", t->ifc->name); break;
     case TY_TASK: sprintf(b, "Task<%.140s>", tname(t->elem)); break;
@@ -435,6 +440,11 @@ static Type *parse_type(void) {
         expectop("<"); Type *rt = parse_type(); expectop(","); Type *re = parse_type();
         expect_gt();
         need_complete(rt, line); need_complete(re, line); return mk_result(rt, re);
+    }
+    if (!strcmp(n, "Option")) {
+        expectop("<"); Type *ot = parse_type(); expect_gt();
+        if (ot->k == TY_VOID) die(line, "Option needs a value type, not 'void'");
+        need_complete(ot, line); return mk_option(ot);
     }
     if (!strcmp(n, "bool")) return &ty_bool;
     if (!strcmp(n, "char")) return &ty_char;
@@ -1020,8 +1030,8 @@ static void retype(Expr *e, Type *t) {   /* give an integer/float literal expres
 }
 static int alloc_slot(int size, int align); static int get_vtable(StructDef *sd, Iface *ifc);
 static int coerce_to(Expr *e, Type *t) {
-    if (e->ty->k == TY_RESPEND) {   /* Ok(..) / Err(..) take their Result type from the context */
-        if (t->k != TY_RESULT) return 0;
+    if (e->ty->k == TY_RESPEND) {   /* Ok(..) / Err(..) / Some(..) / None take their type from the context */
+        if (t->k != TY_RESULT || t->opt != e->ty->opt) return 0;
         Type *pt = e->k == E_ERR ? t->err : t->elem;
         if (e->a) { if (!coerce_to(e->a, pt)) return 0; } else if (pt->k != TY_VOID) return 0;
         e->ty = t; e->tmp = alloc_slot(t->size, 8);
@@ -1044,6 +1054,7 @@ static int coerce_to(Expr *e, Type *t) {
 static void finalize(Expr *e) {
     if (e->ty && e->ty->k == TY_ILIT) retype(e, &ty_i32);
     if (e->ty && e->ty->k == TY_FLIT) retype(e, &ty_f64);
+    if (e->ty && e->ty->k == TY_RESPEND && e->ty->opt) die(e->line, "cannot infer the Option type of '%s'; use it where an Option is expected", e->k == E_ERR ? "None" : "Some(...)");
     if (e->ty && e->ty->k == TY_RESPEND) die(e->line, "cannot infer the Result type of '%s(...)'; use it where a Result is expected", e->k == E_ERR ? "Err" : "Ok");
 }
 static void to_flit(Expr *e) {   /* an integer literal expression used with a float literal becomes a float literal */
@@ -1182,6 +1193,11 @@ static Type *check_expr(Expr *e) {
     }
     case E_VAR: {
         Local *l = lookup(e->name);
+        if (!l && !strcmp(e->name, "None")) {   /* None: an Option without a value, typed by its context */
+            e->k = E_ERR;
+            Type *rp = xalloc(sizeof *rp); rp->k = TY_RESPEND; rp->elem = &ty_void; rp->n = 1; rp->opt = 1; rp->size = rp->align = 8;
+            return e->ty = rp;
+        }
         if (!l) die(e->line, "undefined variable '%s'", e->name);
         if (l->is_global && has_ptr(l->ty) && !in_unsafe) die(e->line, "pointer global '%s' can only be used in unsafe code", l->name);
         if (l->moved && !assign_target) die(e->line, "use of moved value '%s'", e->name);
@@ -1268,6 +1284,14 @@ static Type *check_expr(Expr *e) {
             if (e->nargs == 1) { e->a = e->args[0]; pt = check_expr(e->a); }
             e->k = er ? E_ERR : E_OK;
             Type *rp = xalloc(sizeof *rp); rp->k = TY_RESPEND; rp->elem = pt; rp->n = er; rp->size = rp->align = 8;
+            return e->ty = rp;
+        }
+        if (!f && !strcmp(e->name, "Some")) {   /* Some(x): an Option holding x, typed by its context */
+            if (e->nargs != 1) die(e->line, "'Some' takes exactly one argument");
+            e->a = e->args[0]; Type *pt = check_expr(e->a);
+            if (pt->k == TY_VOID) die(e->line, "'Some' needs a value");
+            e->k = E_OK;
+            Type *rp = xalloc(sizeof *rp); rp->k = TY_RESPEND; rp->elem = pt; rp->opt = 1; rp->size = rp->align = 8;
             return e->ty = rp;
         }
         int pre = 0;
@@ -1446,8 +1470,9 @@ static Type *check_expr(Expr *e) {
     }
     case E_TRY: {
         Type *t = check_expr(e->a);
-        if (t->k != TY_RESULT) die(e->line, "'?' needs a Result, found '%s'", tname(t));
-        if (!cur_fn || cur_fn->ret->k != TY_RESULT) die(e->line, "'?' can only be used in a function that returns a Result");
+        if (t->k != TY_RESULT) die(e->line, "'?' needs a Result or an Option, found '%s'", tname(t));
+        if (t->opt && (!cur_fn || cur_fn->ret->k != TY_RESULT || !cur_fn->ret->opt)) die(e->line, "'?' on an Option can only be used in a function that returns an Option");
+        if (!t->opt && (!cur_fn || cur_fn->ret->k != TY_RESULT || cur_fn->ret->opt)) die(e->line, "'?' can only be used in a function that returns a Result");
         if (!same(t->err, cur_fn->ret->err)) die(e->line, "'?' cannot convert error type '%s' into '%s'", tname(t->err), tname(cur_fn->ret->err));
         consume(e->a);
         e->ty = t->elem; if (has_drop(e->ty)) register_temp(e);
@@ -1642,9 +1667,12 @@ static void check_stmt0(Stmt *s) {
                 Expr *p = s->pats[i];
                 if (!p) wild = 1;
                 else {
-                    if (!(p->k == E_CALL && (!strcmp(p->name, "Ok") || !strcmp(p->name, "Err")) && p->nargs <= 1 && (p->nargs == 0 || p->args[0]->k == E_VAR)))
+                    if (t->opt) {
+                        if (!((p->k == E_CALL && !strcmp(p->name, "Some") && p->nargs == 1 && p->args[0]->k == E_VAR) || (p->k == E_VAR && !strcmp(p->name, "None"))))
+                            die(p->line, "match patterns on an Option must be Some(name) or None");
+                    } else if (!(p->k == E_CALL && (!strcmp(p->name, "Ok") || !strcmp(p->name, "Err")) && p->nargs <= 1 && (p->nargs == 0 || p->args[0]->k == E_VAR)))
                         die(p->line, "match patterns on a Result must be Ok(name) or Err(name)");
-                    int er = p->name[0] == 'E'; Type *pt = er ? t->err : t->elem;
+                    int er = p->name[0] == 'E' || p->name[0] == 'N'; Type *pt = er ? t->err : t->elem;
                     if (pt->k == TY_VOID ? p->nargs != 0 : p->nargs != 1) die(p->line, "pattern '%s' needs %s", p->name, pt->k == TY_VOID ? "no binding" : "exactly one binding");
                     cov[er] = 1;
                     ARM_BEGIN();
@@ -1657,7 +1685,7 @@ static void check_stmt0(Stmt *s) {
                 }
                 ARM_BEGIN(); check_scope_body(s->list[i]); ARM_END(s->list[i]);
             }
-            if (!wild && !(cov[0] && cov[1])) die(s->line, "non-exhaustive match on Result: handle both Ok and Err (or add '_ =>')");
+            if (!wild && !(cov[0] && cov[1])) die(s->line, t->opt ? "non-exhaustive match on Option: handle both Some and None (or add '_ =>')" : "non-exhaustive match on Result: handle both Ok and Err (or add '_ =>')");
             set_moved(anyc ? acc : pre, n0);
             break;
         }
@@ -3443,7 +3471,7 @@ static void gen_stmt0(Stmt *s) {
                 int Ln = newlbl(); Expr *p = s->pats[i];
                 scope_open();
                 if (p) {
-                    int er = p->name[0] == 'E'; Type *pt = er ? s->e->ty->err : s->e->ty->elem;
+                    int er = p->name[0] == 'E' || p->name[0] == 'N'; Type *pt = er ? s->e->ty->err : s->e->ty->elem;   /* Err / None: tag 1 */
                     emit("mov rax, QWORD PTR [rbp-%d]", s->slot1); emit("cmp QWORD PTR [rax], %d", er); emit("jne .L%d", Ln);
                     Local *b = s->alv[i];
                     if (b) {
@@ -3760,7 +3788,8 @@ static void d_expr(Expr *e) {
     case E_REF: printf("(ref "); d_expr(e->a); d_ty(e); printf(")"); break;
     case E_MCALL: printf("(mcall "); d_expr(e->a); printf(" %s", e->name); for (int i = 0; i < e->nargs; i++) { printf(" "); d_expr(e->args[i]); } printf(")"); break;
     case E_OK: case E_ERR:
-        printf(e->k == E_OK ? "(ok" : "(err"); if (e->a) { printf(" "); d_expr(e->a); }
+        if (e->ty && e->ty->opt) printf(e->k == E_OK ? "(some" : "(none"); else printf(e->k == E_OK ? "(ok" : "(err");
+        if (e->a) { printf(" "); d_expr(e->a); }
         if (dump_typed && e->tmp) printf(" t%d", e->tmp);
         if (dump_typed && e->dflag) printf(" f%d", e->dflag);
         d_ty(e); printf(")"); break;

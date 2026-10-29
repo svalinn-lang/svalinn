@@ -1028,7 +1028,7 @@ unsafe fn gen_stmt0(s: *Stmt) {
                 scope_open();
                 if p != null {
                     var er = 0;
-                    if p.name[0] == 'E' { er = 1; }
+                    if p.name[0] == 'E' || p.name[0] == 'N' { er = 1; }   // Err / None: tag 1
                     var pt = s.e.ty.elem;
                     if er != 0 { pt = s.e.ty.err; }
                     emit1("mov rax, QWORD PTR [rbp-%d]", s.slot1 as i64);

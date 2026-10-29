@@ -1,0 +1,63 @@
+module OptionTest;
+allow Console;
+import std.vec;
+
+fn find(ref v: Vec<i32>, x: i32) -> Option<i64> {
+    for i in 0..v.len() { if v.item(i) == x { return Some(i); } }
+    return None;
+}
+
+fn first_word(s: String) -> Option<String> {
+    let i = s.find(" ");
+    if i < 0 { if s.is_empty() { return None; } return Some(s); }
+    return Some(s.slice(0, i));
+}
+
+fn plus_one(o: Option<i32>) -> Option<i32> {
+    let v = o?;   // None returns None
+    return Some(v + 1);
+}
+
+fn describe(o: Option<i32>) -> String {
+    match o { Some(v) => { return "some " + v; } None => { return "none"; } }
+}
+
+class Res {
+    private:
+        let name: String;
+    public:
+        ctor(name: String) { this.name = name; println("open " + name); }
+        fn name() -> String { return this.name; }
+        dtor { println("close " + this.name); }
+}
+
+fn maybe_res(b: bool) -> Option<Res> {
+    if b { return Some(Res("db")); }
+    return None;
+}
+
+struct Holder<T> { value: Option<T>; }
+
+fn main() -> i32 {
+    var v = Vec<i32>();
+    v.push(5); v.push(7); v.push(9);
+    match find(ref v, 7) { Some(i) => { println("found at " + i); } None => { println("missing"); } }
+    match find(ref v, 8) { Some(i) => { println("found at " + i); } None => { println("missing"); } }
+
+    match first_word("hello world") { Some(w) => { println(w); } None => { println("empty"); } }
+    match first_word("") { Some(w) => { println(w); } None => { println("empty"); } }
+
+    println(describe(plus_one(Some(41))));
+    println(describe(plus_one(None)));
+
+    let a: Option<i32> = None;
+    match a { Some(_) => { println("?"); } _ => { println("wildcard none"); } }
+
+    match maybe_res(true) { Some(r) => { println("using " + r.name()); } None => { } }
+    match maybe_res(true) { Some(_) => { println("ignored"); } None => { } }
+    match maybe_res(false) { Some(r) => { println(r.name()); } None => { println("no res"); } }
+
+    let h = Holder<String> { value: Some("kept") };
+    match h.value { Some(s) => { println(s); } None => { } }
+    return 0;
+}
