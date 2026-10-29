@@ -1,0 +1,1 @@
+module A; interface S { fn area() -> i64; } fn main() -> i32 { let s: S; return 0; }

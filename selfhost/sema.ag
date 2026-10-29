@@ -1,0 +1,1776 @@
+// Semantic analysis for the self-hosted compiler: a port of the checker in aegisc.c,
+// including the capability checks (allow/deny, extern classification).
+module Sema;
+
+import std.sys;
+import std.mem;
+import err;
+import types;
+import ast;
+import parse;
+import dump;
+
+var locals: [4096]*Local;
+var nlocals: i32;
+var scope_base: i32;
+var cur_fn: *Func;
+var in_unsafe: i32;
+var cur_off: i32;
+var max_off: i32;
+var loop_depth: i32;
+
+unsafe fn seq(a: *u8, b: *u8) -> bool { return strcmp(a, b) == 0; }
+unsafe fn lit(s: String) -> *u8 { return s as *u8; }
+unsafe fn cat2(a: *u8, b: *u8) -> *u8 {
+    var sb: StrBuf;
+    sb_init(ref sb);
+    sb_cat_c(ref sb, a);
+    sb_cat_c(ref sb, b);
+    return sb.data;
+}
+
+// ---- capabilities ----
+
+unsafe fn cap_matches(rule: *u8, c: *u8) -> bool {
+    if seq(rule, c) { return true; }
+    let n = strlen(rule) as i32;
+    var i = 0;
+    while i < n {
+        if c[i] != rule[i] { return false; }
+        i += 1;
+    }
+    return c[n] == '.';
+}
+unsafe fn cap_ok(c: *u8) -> bool {
+    var i = 0;
+    while i < ndeny { if cap_matches(deny_caps[i], c) { return false; } i += 1; }
+    i = 0;
+    while i < nallow { if cap_matches(allow_caps[i], c) { return true; } i += 1; }
+    return false;
+}
+unsafe fn need_cap(c: *u8, what: *u8, line: i32) {
+    if file_trusted[line >> 26] != 0 { return; }
+    var i = 0;
+    while i < ndeny {
+        if cap_matches(deny_caps[i], c) {
+            dief(line, "%s requires capability '%s', which this module explicitly denies", what as i64, c as i64, 0);
+        }
+        i += 1;
+    }
+    if !cap_ok(c) { dief(line, "%s requires capability '%s' (add 'allow %s;' to the module)", what as i64, c as i64, c as i64); }
+}
+
+// Extern classification: harmless helpers need only Native, dangerous ones map to a capability,
+// anything unlisted needs 'Unrestricted' (deny by default).
+unsafe fn is_safe_extern(f: *u8) -> bool {
+    let n = f;
+    return strcmp(n as *u8, "malloc" as *u8) == 0 || strcmp(n as *u8, "calloc" as *u8) == 0 || strcmp(n as *u8, "realloc" as *u8) == 0 || strcmp(n as *u8, "free" as *u8) == 0
+        || strcmp(n as *u8, "memcpy" as *u8) == 0 || strcmp(n as *u8, "memmove" as *u8) == 0 || strcmp(n as *u8, "memset" as *u8) == 0 || strcmp(n as *u8, "memcmp" as *u8) == 0
+        || strcmp(n as *u8, "strlen" as *u8) == 0 || strcmp(n as *u8, "strcmp" as *u8) == 0 || strcmp(n as *u8, "strncmp" as *u8) == 0 || strcmp(n as *u8, "strchr" as *u8) == 0
+        || strcmp(n as *u8, "strcpy" as *u8) == 0 || strcmp(n as *u8, "abort" as *u8) == 0 || strcmp(n as *u8, "exit" as *u8) == 0 || strcmp(n as *u8, "printf" as *u8) == 0
+        || strcmp(n as *u8, "sprintf" as *u8) == 0 || strcmp(n as *u8, "snprintf" as *u8) == 0 || strcmp(n as *u8, "puts" as *u8) == 0 || strcmp(n as *u8, "putchar" as *u8) == 0
+        || strcmp(n as *u8, "fflush" as *u8) == 0 || strcmp(n as *u8, "fclose" as *u8) == 0 || strcmp(n as *u8, "fseek" as *u8) == 0 || strcmp(n as *u8, "ftell" as *u8) == 0
+        || strcmp(n as *u8, "getpid" as *u8) == 0 || strcmp(n as *u8, "sleep" as *u8) == 0 || strcmp(n as *u8, "usleep" as *u8) == 0 || strcmp(n as *u8, "abs" as *u8) == 0
+        || strcmp(n as *u8, "atoi" as *u8) == 0 || strcmp(n as *u8, "rand" as *u8) == 0 || strcmp(n as *u8, "srand" as *u8) == 0 || strcmp(n as *u8, "time" as *u8) == 0
+        || strcmp(n as *u8, "clock" as *u8) == 0 || strcmp(n as *u8, "fprintf" as *u8) == 0 || strcmp(n as *u8, "waitpid" as *u8) == 0 || strcmp(n as *u8, "__errno_location" as *u8) == 0
+        || strcmp(n as *u8, "sqrt" as *u8) == 0 || strcmp(n as *u8, "sin" as *u8) == 0 || strcmp(n as *u8, "cos" as *u8) == 0 || strcmp(n as *u8, "tan" as *u8) == 0
+        || strcmp(n as *u8, "atan" as *u8) == 0 || strcmp(n as *u8, "atan2" as *u8) == 0 || strcmp(n as *u8, "pow" as *u8) == 0 || strcmp(n as *u8, "exp" as *u8) == 0
+        || strcmp(n as *u8, "log" as *u8) == 0 || strcmp(n as *u8, "log10" as *u8) == 0 || strcmp(n as *u8, "floor" as *u8) == 0 || strcmp(n as *u8, "ceil" as *u8) == 0
+        || strcmp(n as *u8, "fabs" as *u8) == 0 || strcmp(n as *u8, "fmod" as *u8) == 0 || strcmp(n as *u8, "round" as *u8) == 0 || strcmp(n as *u8, "strtod" as *u8) == 0
+        || strcmp(n as *u8, "strtof" as *u8) == 0 || strcmp(n as *u8, "strstr" as *u8) == 0 || strcmp(n as *u8, "sscanf" as *u8) == 0 || strcmp(n as *u8, "strfromd" as *u8) == 0
+        || strcmp(n as *u8, "strfromf" as *u8) == 0 || strcmp(n as *u8, "open_memstream" as *u8) == 0
+        || strcmp(n as *u8, "dprintf" as *u8) == 0 || strcmp(n as *u8, "setjmp" as *u8) == 0 || strcmp(n as *u8, "longjmp" as *u8) == 0;
+}
+unsafe fn cap_of_extern(f: *u8) -> *u8 {
+    let n = f;
+    if strcmp(n as *u8, "ptrace" as *u8) == 0 { return lit("Process.Debug"); }
+    if strcmp(n as *u8, "process_vm_readv" as *u8) == 0 { return lit("Process.MemoryRead"); }
+    if strcmp(n as *u8, "process_vm_writev" as *u8) == 0 { return lit("Process.MemoryWrite"); }
+    if strcmp(n as *u8, "fopen" as *u8) == 0 || strcmp(n as *u8, "fread" as *u8) == 0 || strcmp(n as *u8, "open" as *u8) == 0 || strcmp(n as *u8, "fgets" as *u8) == 0 { return lit("File.Read"); }
+    if strcmp(n as *u8, "fwrite" as *u8) == 0 || strcmp(n as *u8, "remove" as *u8) == 0 || strcmp(n as *u8, "unlink" as *u8) == 0 || strcmp(n as *u8, "rename" as *u8) == 0 || strcmp(n as *u8, "mkdir" as *u8) == 0 { return lit("File.Write"); }
+    if strcmp(n as *u8, "socket" as *u8) == 0 || strcmp(n as *u8, "connect" as *u8) == 0 || strcmp(n as *u8, "bind" as *u8) == 0 || strcmp(n as *u8, "listen" as *u8) == 0
+        || strcmp(n as *u8, "accept" as *u8) == 0 || strcmp(n as *u8, "send" as *u8) == 0 || strcmp(n as *u8, "recv" as *u8) == 0 { return lit("Network"); }
+    if strcmp(n as *u8, "fork" as *u8) == 0 || strcmp(n as *u8, "execve" as *u8) == 0 || strcmp(n as *u8, "execvp" as *u8) == 0 || strcmp(n as *u8, "system" as *u8) == 0 || strcmp(n as *u8, "posix_spawn" as *u8) == 0 { return lit("Process.Spawn"); }
+    if strcmp(n as *u8, "kill" as *u8) == 0 { return lit("Process.Signal"); }
+    if strcmp(n as *u8, "dlopen" as *u8) == 0 { return lit("Process.Inject"); }
+    if strcmp(n as *u8, "dlsym" as *u8) == 0 || strcmp(n as *u8, "syscall" as *u8) == 0 { return lit("Unrestricted"); }
+    return null;
+}
+// capability needed by an extern; known = 0 when the function is not classified at all
+unsafe fn extern_cap(f: *u8, ref known: i32) -> *u8 {
+    known = 1;
+    if is_safe_extern(f) { return null; }
+    let c = cap_of_extern(f);
+    if c != null { return c; }
+    known = 0;
+    return lit("Unrestricted");
+}
+
+// ---- scopes ----
+
+unsafe fn lookup(n: *u8) -> *Local {
+    var i = nlocals - 1;
+    while i >= 0 {
+        if seq(locals[i].name, n) { return locals[i]; }
+        i -= 1;
+    }
+    i = 0;
+    while i < nglobals {
+        if seq(globals[i].name, n) { return globals[i]; }
+        i += 1;
+    }
+    return null;
+}
+unsafe fn alloc_slot(size: i32, align: i32) -> i32 {
+    cur_off = (cur_off + size + align - 1) / align * align;
+    if cur_off > max_off { max_off = cur_off; }
+    return cur_off;
+}
+unsafe fn declare(n: *u8, t: *Type, is_mut: i32, is_ref: i32, line: i32) -> *Local {
+    var i = scope_base;
+    while i < nlocals {
+        if seq(locals[i].name, n) { dief(line, "'%s' already declared in this scope", n as i64, 0, 0); }
+        i += 1;
+    }
+    let l = zalloc(sizeof(Local)) as *Local;
+    l.name = n;
+    l.ty = t;
+    l.is_mut = is_mut;
+    l.is_ref = is_ref;
+    if is_ref != 0 { l.off = alloc_slot(8, 8); } else { l.off = alloc_slot(t.size, t.align); }
+    l.loop = loop_depth;
+    if is_ref == 0 && has_drop(t) { l.dflag = alloc_slot(8, 8); }
+    if nlocals >= 4096 { die(line, "too many local variables"); }
+    locals[nlocals] = l;
+    nlocals += 1;
+    return l;
+}
+// ---- ownership: values with destructors are moved, never copied ----
+
+var cur_stmt: *Stmt;
+var assign_target: i32;
+var ctor_set: [256]u8;
+var uses_async: i32;
+
+// e's value is taken over by a new owner
+unsafe fn consume(e: *Expr) {
+    if e.ty == null || !has_drop(e.ty) { return; }
+    let k = e.kind;
+    if !move_only(e.ty) {
+        // reference-counted values: reading a place copies it, a fresh value is handed over
+        if k == E_VAR || k == E_FIELD || k == E_INDEX { e.copy = 1; return; }
+        if k == E_UN && e.op == O_DEREF { e.copy = 1; return; }
+        if k == E_CAST { consume(e.a); return; }   // String -> String, or a raw pointer inside the runtime
+        if k == E_STR { return; }   // literals are immortal
+        if k != E_UN { e.consumed = 1; return; }
+    }
+    if k == E_VAR {
+        if e.lv.is_global != 0 { dief(e.line, "cannot move out of global '%s'", e.name as i64, 0, 0); }
+        if e.lv.is_ref != 0 { dief(e.line, "cannot move out of '%s' (it is borrowed with 'ref')", e.name as i64, 0, 0); }
+        if e.lv.loop < loop_depth { dief(e.line, "cannot move '%s' inside a loop (it is declared outside the loop)", e.name as i64, 0, 0); }
+        e.lv.moved = 1;
+        e.move = 1;
+        return;
+    }
+    if k == E_CALL || k == E_OK || k == E_ERR || k == E_TRY || k == E_AWAIT || k == E_SLIT { e.consumed = 1; return; }
+    if k == E_UN && e.op == O_DEREF { return; }   // raw read through a pointer (unsafe): the programmer owns it
+    dief(e.line, "cannot move out of this place: '%s' has a destructor (use 'ref', or a method that takes the value out)", tname(e.ty) as i64, 0, 0);
+}
+
+// a temporary that is dropped at the end of its statement unless consumed
+unsafe fn register_temp(e: *Expr) {
+    if cur_stmt == null { die(e.line, "this expression creates a temporary with a destructor; assign it to a variable first"); }
+    e.tnext = cur_stmt.temps;
+    cur_stmt.temps = e;
+}
+
+unsafe fn close_temps(s: *Stmt) {
+    var prev: *Expr = null;
+    var t = s.temps;
+    while t != null {
+        let nx = t.tnext;
+        if t.consumed != 0 {
+            if prev == null { s.temps = nx; } else { prev.tnext = nx; }
+        } else {
+            if t.kind == E_TRY { die(t.line, "the value of '?' must be used here (it has a destructor)"); }
+            if t.dflag == 0 { t.dflag = alloc_slot(8, 8); }
+            prev = t;
+        }
+        t = nx;
+    }
+}
+
+unsafe fn snap_moved() -> *u8 {
+    let m = zalloc((nlocals + 1) as u64);
+    var i = 0;
+    while i < nlocals { m[i] = locals[i].moved as u8; i += 1; }
+    return m;
+}
+unsafe fn set_moved(m: *u8, n: i32) {
+    var i = 0;
+    while i < n { locals[i].moved = m[i] as i32; i += 1; }
+}
+unsafe fn arm_end(b: *Stmt, acc: *u8, n0: i32, ref anyc: bool) {
+    if !always_ret(b) {
+        anyc = true;
+        var q = 0;
+        while q < n0 { acc[q] = acc[q] | (locals[q].moved as u8); q += 1; }
+    }
+}
+
+unsafe fn require_safe_type(t: *Type, line: i32) {
+    if has_ptr(t) && in_unsafe == 0 { die(line, "pointer types are only allowed in unsafe code"); }
+}
+
+// ---- literal typing ----
+
+unsafe fn range_check(e: *Expr, t: *Type) {
+    let v = e.ival;
+    if t.size == 8 {
+        if t.sign == 0 && e.neg != 0 && v != 0 { dief(e.line, "negative literal for unsigned type '%s'", tname(t) as i64, 0, 0); }
+        return;
+    }
+    var one: i64 = 1;
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    if t.sign != 0 {
+        hi = (one << ((t.size * 8 - 1) as i64)) - 1;
+        lo = 0 - hi - 1;
+    } else {
+        lo = 0;
+        hi = (one << ((t.size * 8) as i64)) - 1;
+    }
+    if v < lo || v > hi { dief(e.line, "literal %lld out of range for '%s'", v, tname(t) as i64, 0); }
+}
+// give an integer/float literal expression its final type
+unsafe fn retype(e: *Expr, t: *Type) {
+    if e.ty.kind != TY_ILIT && e.ty.kind != TY_FLIT { return; }
+    if e.kind == E_INT { if is_int(t) { range_check(e, t); } }
+    else if e.kind == E_BIN { retype(e.a, t); retype(e.b, t); }
+    else if e.kind == E_UN { retype(e.a, t); }
+    e.ty = t;
+}
+unsafe fn coerce_to(e: *Expr, t: *Type) -> bool {
+    if e.ty.kind == TY_RESPEND {
+        // Ok(..) / Err(..) take their Result type from the context
+        if t.kind != TY_RESULT { return false; }
+        var pt = t.elem;
+        if e.kind == E_ERR { pt = t.err; }
+        if e.a != null { if !coerce_to(e.a, pt) { return false; } }
+        else if pt.kind != TY_VOID { return false; }
+        e.ty = t;
+        e.tmp = alloc_slot(t.size, 8);
+        if e.a != null { consume(e.a); }
+        if has_drop(t) { register_temp(e); }
+        return true;
+    }
+    if e.ty.kind == TY_NULL {
+        if t.kind == TY_PTR || t.kind == TY_STR { e.ty = t; return true; }
+        return false;
+    }
+    if e.ty.kind == TY_ILIT {
+        if t.kind != TY_INT && t.kind != TY_FLOAT { return false; }
+        retype(e, t);
+        return true;
+    }
+    if e.ty.kind == TY_FLIT {
+        if t.kind != TY_FLOAT { return false; }
+        retype(e, t);
+        return true;
+    }
+    // upcast: copies the base part
+    if t.kind == TY_STRUCT && e.ty.kind == TY_STRUCT && e.ty.sd != t.sd && is_sub(e.ty.sd, t.sd) { return !has_drop(e.ty); }
+    if t.kind == TY_IFACE && e.ty.kind == TY_STRUCT && e.ty.sd.is_class != 0 && implements(e.ty.sd, t.ifc) {
+        // borrow: {address of the object, vtable}
+        let vt = get_vtable(e.ty.sd, t.ifc);
+        let inn = zalloc(sizeof(Expr)) as *Expr;
+        memcpy(inn as *u8, e as *u8, sizeof(Expr));
+        let nx = e.next;
+        memset(e as *u8, 0, sizeof(Expr));
+        inn.next = null;
+        e.next = nx;
+        e.kind = E_TOIFACE;
+        e.line = inn.line;
+        e.a = inn;
+        e.ty = t;
+        e.ival = vt as i64;
+        e.tmp = alloc_slot(16, 8);
+        return true;
+    }
+    return same(e.ty, t);
+}
+unsafe fn finalize(e: *Expr) {
+    if e.ty != null && e.ty.kind == TY_ILIT { retype(e, ty_i32); }
+    if e.ty != null && e.ty.kind == TY_FLIT { retype(e, ty_f64); }
+    if e.ty != null && e.ty.kind == TY_RESPEND {
+        var w: *u8 = lit("Ok");
+        if e.kind == E_ERR { w = lit("Err"); }
+        dief(e.line, "cannot infer the Result type of '%s(...)'; use it where a Result is expected", w as i64, 0, 0);
+    }
+}
+// an integer literal expression used with a float literal becomes a float literal
+unsafe fn to_flit(e: *Expr) {
+    if e.ty.kind != TY_ILIT { return; }
+    if e.kind == E_BIN { to_flit(e.a); to_flit(e.b); } else if e.kind == E_UN { to_flit(e.a); }
+    e.ty = ty_flit;
+}
+unsafe fn unify(a: *Expr, b: *Expr) {
+    if a.ty.kind == TY_ILIT && is_int(b.ty) { retype(a, b.ty); }
+    else if b.ty.kind == TY_ILIT && is_int(a.ty) { retype(b, a.ty); }
+    else if (a.ty.kind == TY_ILIT || a.ty.kind == TY_FLIT) && is_float(b.ty) { retype(a, b.ty); }
+    else if (b.ty.kind == TY_ILIT || b.ty.kind == TY_FLIT) && is_float(a.ty) { retype(b, a.ty); }
+    else if a.ty.kind == TY_ILIT && b.ty.kind == TY_FLIT { to_flit(a); }
+    else if b.ty.kind == TY_ILIT && a.ty.kind == TY_FLIT { to_flit(b); }
+}
+unsafe fn expect_coerce(e: *Expr, t: *Type, ctx: String) {
+    if !coerce_to(e, t) { dief(e.line, "%s: expected '%s', found '%s'", ctx as i64, tname(t) as i64, tname(e.ty) as i64); }
+}
+
+// ---- classes: access rules, method lookup, interface tables ----
+
+// private: same class; protected: same class or a subclass
+unsafe fn can_access(vis: i32, owner: *StructDef) -> bool {
+    if vis == 1 { return cur_fn != null && cur_fn.cls == owner; }
+    if vis == 2 { return cur_fn != null && cur_fn.cls != null && is_sub(cur_fn.cls, owner); }
+    return true;
+}
+
+unsafe fn after_dot(s: *u8) -> *u8 {
+    var i = strlen(s) as i32;
+    while i > 0 && s[i - 1] != '.' { i -= 1; }
+    return s + i;
+}
+
+// instance method, searching base classes
+unsafe fn find_method(sd: *StructDef, m: *u8) -> *Func {
+    var c = sd;
+    while c != null {
+        var fb: StrBuf;
+        sb_init(ref fb);
+        sb_cat_c(ref fb, c.name);
+        sb_cat(ref fb, ".");
+        sb_cat_c(ref fb, m);
+        var i = 0;
+        while i < nfuncs {
+            if seq(funcs[i].name, fb.data) && funcs[i].is_ctor == 0 && funcs[i].is_static == 0 && funcs[i].is_dtor == 0 { return funcs[i]; }
+            i += 1;
+        }
+        c = c.base;
+    }
+    return null;
+}
+
+unsafe fn check_impl(sd: *StructDef, ifc: *Iface, line: i32) {
+    var j = 0;
+    while j < ifc.nm {
+        let im = ifc.m[j];
+        let mn = after_dot(im.name);
+        let cm = find_method(sd, mn);
+        if cm == null { dief(line, "class '%s' does not implement '%s' from interface '%s'", sd.name as i64, mn as i64, ifc.name as i64); }
+        var ok = cm.nparams == im.nparams && same(cm.ret, im.ret);
+        var k = 1;
+        while ok && k < im.nparams {
+            ok = same(cm.pty[k], im.pty[k]) && cm.pref[k] == im.pref[k];
+            k += 1;
+        }
+        if !ok { dief(line, "'%s' does not match the signature of '%s'", cm.name as i64, im.name as i64, 0); }
+        if cm.vis != 0 { dief(line, "'%s' must be public to implement interface '%s'", cm.name as i64, ifc.name as i64, 0); }
+        j += 1;
+    }
+}
+
+var vt_sd: [512]*StructDef;
+var vt_if: [512]*Iface;
+var nvts: i32;
+
+unsafe fn get_vtable(sd: *StructDef, ifc: *Iface) -> i32 {
+    var i = 0;
+    while i < nvts {
+        if vt_sd[i] == sd && vt_if[i] == ifc { return i; }
+        i += 1;
+    }
+    check_impl(sd, ifc, sd.line);
+    if nvts >= 512 { die(sd.line, "too many interface tables"); }
+    vt_sd[nvts] = sd;
+    vt_if[nvts] = ifc;
+    nvts += 1;
+    return nvts - 1;
+}
+
+// ---- generics: bind type parameters by matching parameter types against argument types ----
+
+unsafe fn infer_unify(pat: *Type, act: *Type, bound: **Type, lit_ok: i32) {
+    if pat.kind == TY_PARAM {
+        if act.kind == TY_ILIT || act.kind == TY_NULL || act.kind == TY_FLIT {
+            if lit_ok != 0 && bound[pat.n] == null && act.kind == TY_ILIT { bound[pat.n] = ty_i32; }
+            if lit_ok != 0 && bound[pat.n] == null && act.kind == TY_FLIT { bound[pat.n] = ty_f64; }
+            return;
+        }
+        if bound[pat.n] == null { bound[pat.n] = act; }
+        return;
+    }
+    if pat.kind != act.kind { return; }
+    if pat.kind == TY_STRUCT {
+        if pat.sd.gen != null && pat.sd.gen == act.sd.gen {
+            var i = 0;
+            while i < pat.sd.gen.np { infer_unify(pat.sd.targs[i], act.sd.targs[i], bound, lit_ok); i += 1; }
+        }
+        return;
+    }
+    if pat.kind == TY_PTR || pat.kind == TY_ARRAY { infer_unify(pat.elem, act.elem, bound, lit_ok); }
+    else if pat.kind == TY_RESULT {
+        infer_unify(pat.elem, act.elem, bound, lit_ok);
+        infer_unify(pat.err, act.err, bound, lit_ok);
+    }
+}
+
+unsafe fn infer_generic(g: *Generic, e: *Expr) -> *Func {
+    var ph: [8]*Type;
+    var bound: [8]*Type;
+    var i = 0;
+    while i < g.np {
+        ph[i] = zalloc(sizeof(Type)) as *Type;
+        ph[i].kind = TY_PARAM;
+        ph[i].n = i as i64;
+        ph[i].size = 8;
+        ph[i].align = 8;
+        i += 1;
+    }
+    var ps: PState;
+    ps_save(ref ps);
+    ps_bind(g, &ph[0]);
+    tp = g.start;
+    expect_id();
+    skip_type_params();
+    expectop("(");
+    var pt: [16]*Type;
+    var np = 0;
+    if !isop(")") {
+        var more = true;
+        while more {
+            if np >= 16 { die(g.line, "too many parameters"); }
+            acceptkw("ref");
+            expect_id();
+            expectop(":");
+            pt[np] = parse_type();
+            np += 1;
+            more = acceptop(",");
+        }
+    }
+    ps_restore(ref ps);
+    if np != e.nargs { dief(e.line, "'%s' expects %d argument(s), got %d", g.name as i64, np as i64, e.nargs as i64); }
+    var a = e.args;
+    while a != null {
+        if a.kind == E_REF { check_expr(a.a); } else { check_expr(a); }
+        a = a.next;
+    }
+    var pass = 0;
+    while pass < 2 {
+        i = 0;
+        a = e.args;
+        while i < np {
+            var act = a.ty;
+            if a.kind == E_REF { act = a.a.ty; }
+            infer_unify(pt[i], act, &bound[0], pass);
+            a = a.next;
+            i += 1;
+        }
+        pass += 1;
+    }
+    i = 0;
+    while i < g.np {
+        if bound[i] == null { dief(e.line, "cannot infer type parameter '%s' of '%s'; call it as %s<...>(...)", g.pn[i] as i64, g.name as i64, g.name as i64); }
+        i += 1;
+    }
+    return instantiate_fn(g, &bound[0], e.line);
+}
+
+unsafe fn is_lvalue(e: *Expr) -> bool {
+    if e.kind == E_INDEX && e.a.ty != null && e.a.ty.kind == TY_STR { return false; }   // strings are immutable
+    return e.kind == E_VAR || e.kind == E_INDEX || e.kind == E_FIELD || (e.kind == E_UN && e.op == O_DEREF);
+}
+unsafe fn root_mutable(e: *Expr) -> bool {
+    if e.kind == E_VAR { return e.lv.is_mut != 0; }
+    if e.kind == E_INDEX {
+        if e.a.ty.kind == TY_ARRAY { return root_mutable(e.a); }
+        return e.a.ty.kind == TY_PTR;
+    }
+    if e.kind == E_FIELD {
+        // 'let' fields can only be assigned inside the constructor, through 'this'
+        if e.fld != null && e.fld.is_mut == 0 {
+            var in_ctor = false;
+            if cur_fn != null && cur_fn.is_ctor != 0 && e.a.kind == E_VAR && seq(e.a.name, lit("this")) { in_ctor = true; }
+            if !in_ctor { return false; }
+        }
+        if e.a.ty.kind == TY_PTR { return true; }
+        return root_mutable(e.a);
+    }
+    return true;
+}
+
+// ---- strings: operators and methods become calls into the runtime prelude (lib/rt/prelude.ag) ----
+
+unsafe fn rt_fn(n: *u8) -> *Func {
+    var i = 0;
+    while i < nfuncs {
+        if seq(funcs[i].name, n) { return funcs[i]; }
+        i += 1;
+    }
+    dief(0, "internal error: runtime function '%s' missing", n as i64, 0, 0);
+    return null;
+}
+// call of a runtime function on checked arguments
+unsafe fn rt_call_into(c0: *Expr, n: *u8, a: *Expr, b: *Expr, line: i32) -> *Expr {
+    let f = rt_fn(n);
+    var c = c0;
+    if c == null { c = new_expr(E_CALL, line); }
+    c.kind = E_CALL;
+    c.name = f.name;
+    c.callee = f;
+    c.a = null;
+    c.b = null;
+    c.op = 0;
+    c.builtin = 0;
+    c.recv = 0;
+    c.cty = null;
+    c.lv = null;
+    c.tmp = 0;
+    c.dflag = 0;
+    c.args = a;
+    a.next = b;
+    c.nargs = 1;
+    if b != null { b.next = null; c.nargs = 2; }
+    c.ty = f.ret;
+    if has_drop(c.ty) {
+        c.tmp = alloc_slot(8, 8);
+        register_temp(c);
+    }
+    return c;
+}
+unsafe fn rt_call(n: *u8, a: *Expr, b: *Expr, line: i32) -> *Expr { return rt_call_into(null, n, a, b, line); }
+unsafe fn mk_cast(x: *Expr, t: *Type) -> *Expr {
+    if same(x.ty, t) { return x; }
+    let c = new_expr(E_CAST, x.line);
+    c.a = x;
+    c.cty = t;
+    c.ty = t;
+    return c;
+}
+// runtime function that turns px into a String (null: it is one already)
+unsafe fn str_conv(ref px: *Expr) -> *u8 {
+    let x = px;
+    let t = x.ty;
+    if t.kind == TY_NULL { x.ty = ty_str; return null; }
+    if t.kind == TY_STR { return null; }
+    if t.kind == TY_ILIT { retype(x, ty_i64); return lit("rt_str_from_i64"); }
+    if t.kind == TY_FLIT { retype(x, ty_f64); return lit("rt_str_from_f64"); }
+    if t.kind == TY_BOOL { return lit("rt_str_from_bool"); }
+    if t.kind == TY_INT && t.is_char != 0 { px = mk_cast(x, ty_u8); return lit("rt_str_from_char"); }
+    if t.kind == TY_INT && t.sign == 0 { px = mk_cast(x, ty_u64); return lit("rt_str_from_u64"); }
+    if t.kind == TY_INT || t.kind == TY_ENUM { px = mk_cast(x, ty_i64); return lit("rt_str_from_i64"); }
+    if is_float(t) { px = mk_cast(x, ty_f64); return lit("rt_str_from_f64"); }
+    dief(x.line, "cannot convert a value of type '%s' to a String", tname(t) as i64, 0, 0);
+    return null;
+}
+unsafe fn to_str(x0: *Expr) -> *Expr {
+    var x = x0;
+    let fnm = str_conv(ref x);
+    if fnm != null { return rt_call(fnm, x, null, x.line); }
+    return x;
+}
+
+// ---- expressions ----
+
+unsafe fn check_call(e: *Expr) -> *Type {
+    if strcmp(e.name, "print" as *u8) == 0 || strcmp(e.name, "println" as *u8) == 0 {
+        need_cap(lit("Console"), lit("printing"), e.line);
+        if e.nargs != 1 { dief(e.line, "%s takes exactly one argument", e.name as i64, 0, 0); }
+        check_expr(e.args);
+        finalize(e.args);
+        let t = e.args.ty;
+        if !(t.kind == TY_STR || t.kind == TY_BOOL || t.kind == TY_INT || t.kind == TY_FLOAT) { dief(e.line, "cannot print a value of type '%s'", tname(t) as i64, 0, 0); }
+        if e.name[5] != 0 { e.builtin = 2; } else { e.builtin = 1; }
+        e.ty = ty_void;
+        return e.ty;
+    }
+    var f: *Func = null;
+    var i = 0;
+    while i < nfuncs {
+        if seq(funcs[i].name, e.name) { f = funcs[i]; }
+        i += 1;
+    }
+    if f == null && seq(e.name, lit("str")) {
+        // str(x): text of a number, bool, char or String
+        if e.nargs != 1 { die(e.line, "str takes exactly one argument"); }
+        check_expr(e.args);
+        finalize(e.args);
+        var x = e.args;
+        let fnm = str_conv(ref x);
+        if fnm != null { return rt_call_into(e, fnm, x, null, e.line).ty; }
+        // already a String
+        e.kind = E_CAST;
+        e.a = x;
+        e.cty = ty_str;
+        e.nargs = 0;
+        e.args = null;
+        e.ty = ty_str;
+        return e.ty;
+    }
+    if f == null && seq(e.name, lit("take")) {
+        // take(p): move the value out of *p without copying (unsafe, for containers)
+        if in_unsafe == 0 { die(e.line, "take() requires an unsafe block"); }
+        if e.nargs != 1 { die(e.line, "take takes exactly one argument"); }
+        let tpt = check_expr(e.args);
+        if tpt.kind != TY_PTR { dief(e.line, "take needs a pointer, found '%s'", tname(tpt) as i64, 0, 0); }
+        e.builtin = 7;
+        e.ty = tpt.elem;
+        return e.ty;
+    }
+    if f == null && seq(e.name, lit("destroy")) {
+        // destroy(p): run the destructor of *p (unsafe, for containers)
+        if in_unsafe == 0 { die(e.line, "destroy() requires an unsafe block"); }
+        if e.nargs != 1 { die(e.line, "destroy takes exactly one argument"); }
+        let dpt = check_expr(e.args);
+        if dpt.kind != TY_PTR { dief(e.line, "destroy needs a pointer, found '%s'", tname(dpt) as i64, 0, 0); }
+        e.builtin = 5;
+        e.ty = ty_void;
+        return e.ty;
+    }
+    if f == null && seq(e.name, lit("yield_now")) {
+        // let other tasks run
+        if e.nargs != 0 { die(e.line, "yield_now takes no arguments"); }
+        uses_async = 1;
+        e.builtin = 6;
+        e.ty = ty_void;
+        return e.ty;
+    }
+    if f == null && seq(e.name, lit("super")) {
+        // super(args): run the base class constructor on 'this'
+        if cur_fn == null || cur_fn.is_ctor == 0 || cur_fn.cls.base == null { die(e.line, "'super(...)' can only be called in the constructor of a class that extends another class"); }
+        let b = cur_fn.cls.base;
+        var cb0: StrBuf;
+        sb_init(ref cb0);
+        sb_cat_c(ref cb0, b.name);
+        sb_cat(ref cb0, ".ctor");
+        i = 0;
+        while i < nfuncs {
+            if seq(funcs[i].name, cb0.data) { f = funcs[i]; }
+            i += 1;
+        }
+        let th = new_expr(E_VAR, e.line);
+        th.name = lit("this");
+        check_expr(th);
+        let r = new_expr(E_REF, e.line);
+        r.a = th;
+        r.ty = b.ty;
+        r.next = e.args;
+        e.args = r;
+        e.nargs += 1;
+        e.recv = 1;
+        e.name = f.name;
+    }
+    var ctor = 0;
+    if f == null {
+        // Person(args) constructs a class value
+        let csd = find_struct(e.name);
+        if csd != null && csd.is_class != 0 {
+            var cb: StrBuf;
+            sb_init(ref cb);
+            sb_cat_c(ref cb, csd.name);
+            sb_cat(ref cb, ".ctor");
+            i = 0;
+            while i < nfuncs {
+                if seq(funcs[i].name, cb.data) { f = funcs[i]; }
+                i += 1;
+            }
+            ctor = 1;
+        }
+    }
+    if f == null && (seq(e.name, lit("Ok")) || seq(e.name, lit("Err"))) {
+        var er = 0;
+        if e.name[0] == 'E' { er = 1; }
+        var bad = false;
+        if er != 0 { bad = e.nargs != 1; } else { bad = e.nargs > 1; }
+        if bad {
+            var w: *u8 = lit("at most one");
+            if er != 0 { w = lit("exactly one"); }
+            dief(e.line, "'%s' takes %s argument", e.name as i64, w as i64, 0);
+        }
+        var pt = ty_void;
+        if e.nargs == 1 {
+            e.a = e.args;
+            pt = check_expr(e.a);
+        }
+        if er != 0 { e.kind = E_ERR; } else { e.kind = E_OK; }
+        let rp = zalloc(sizeof(Type)) as *Type;
+        rp.kind = TY_RESPEND;
+        rp.elem = pt;
+        rp.n = er as i64;
+        rp.size = 8;
+        rp.align = 8;
+        e.ty = rp;
+        return rp;
+    }
+    var pre = 0;
+    if f == null {
+        let gn = find_generic(e.name);
+        if gn != null && gn.kind == 2 {
+            f = infer_generic(gn, e);
+            e.name = f.name;
+            pre = 1;
+        }
+    }
+    if f == null { dief(e.line, "call to undefined function '%s'", e.name as i64, 0, 0); }
+    if f.is_unsafe != 0 && in_unsafe == 0 {
+        var kind: *u8 = lit("unsafe");
+        if f.is_extern != 0 { kind = lit("extern"); }
+        dief(e.line, "call to %s function '%s' requires an unsafe block", kind as i64, f.name as i64, 0);
+    }
+    if f.is_deprecated != 0 && file_trusted[e.line >> 26] == 0 && !(cur_fn != null && cur_fn.is_deprecated != 0) { warnf(e.line, "'%s' is deprecated", f.name as i64, 0, 0); }
+    var ri = 0;
+    while ri < f.nreq {
+        var rwhat: [300]u8;
+        snprintf(&rwhat[0], 300, "calling '%s'", f.name as i64, 0, 0);
+        need_cap(f.req[ri], &rwhat[0], e.line);
+        ri += 1;
+    }
+    if f.is_extern != 0 {
+        var what: [200]u8;
+        var known: i32 = 0;
+        let c = extern_cap(f.name, ref known);
+        if f.is_unsafe != 0 { need_cap(lit("Native"), lit("calling an extern function"), e.line); }
+        if known != 0 { snprintf(&what[0], 200, "calling '%s'", f.name as i64, 0, 0); }
+        else { snprintf(&what[0], 200, "calling unclassified extern function '%s'", f.name as i64, 0, 0); }
+        if c != null { need_cap(c, &what[0], e.line); }
+        if seq(f.name, lit("fopen")) {
+            // write modes also need File.Write; a mode that is not a literal counts as write
+            var m: *Expr = null;
+            if e.nargs > 1 { m = nth_arg(e, 1); }
+            var w = true;
+            if m != null && m.kind == E_STR {
+                w = false;
+                var k = 0;
+                while k < m.slen {
+                    let ch = m.sval[k];
+                    if ch == 'w' || ch == 'a' || ch == '+' || ch == 0 { w = true; }
+                    k += 1;
+                }
+            }
+            if w { need_cap(lit("File.Write"), lit("calling 'fopen' with a write mode (or a mode that is not a literal)"), e.line); }
+        }
+    }
+    if e.nargs + ctor != f.nparams {
+        var nm = f.name;
+        if ctor != 0 { nm = e.name; }
+        var adj = 0;
+        if ctor != 0 || e.recv != 0 { adj = 1; }
+        dief(e.line, "'%s' expects %d argument(s), got %d", nm as i64, (f.nparams - adj) as i64, (e.nargs - e.recv) as i64);
+    }
+    i = 0;
+    var a = e.args;
+    var aprev: *Expr = null;
+    while i < e.nargs {
+        let pi = i + ctor;
+        let an = i + 1 - e.recv;
+        if e.recv != 0 && i == 0 { aprev = a; a = a.next; i += 1; continue; }   // method receiver: already checked
+        if f.pref[pi] != 0 {
+            if a.kind != E_REF { dief(a.line, "argument %d of '%s' must be passed as 'ref'", an as i64, f.name as i64, 0); }
+            var t = a.a.ty;
+            if pre == 0 { t = check_expr(a.a); }
+            if !is_lvalue(a.a) { die(a.line, "'ref' needs an assignable place"); }
+            if !root_mutable(a.a) { die(a.line, "cannot pass immutable value by 'ref'; declare it with 'var'"); }
+            if !same(t, f.pty[pi]) && !(t.kind == TY_STRUCT && f.pty[pi].kind == TY_STRUCT && is_sub(t.sd, f.pty[pi].sd)) {
+                dief(a.line, "argument %d of '%s': expected '%s', found '%s'", an as i64, f.name as i64, tname(f.pty[pi]) as i64);
+            }
+            a.ty = t;
+        } else {
+            if a.kind == E_REF { dief(a.line, "parameter %d of '%s' is not a 'ref' parameter", an as i64, f.name as i64, 0); }
+            if pre == 0 { check_expr(a); }
+            expect_coerce(a, f.pty[pi], "argument");
+            if f.is_extern == 0 && f.borrow == 0 { consume(a); }   // extern and runtime functions only borrow
+            if f.is_extern != 0 && f.pty[pi].kind == TY_STR && a.kind != E_STR {
+                // C gets "" for an empty (null) String
+                let w = new_expr(E_CALL, a.line);
+                w.name = lit("cstr");
+                w.builtin = 9;
+                w.ty = ty_str;
+                w.args = a;
+                w.nargs = 1;
+                w.next = a.next;
+                a.next = null;
+                if aprev == null { e.args = w; } else { aprev.next = w; }
+                a = w;
+            }
+        }
+        aprev = a;
+        a = a.next;
+        i += 1;
+    }
+    e.callee = f;
+    if ctor != 0 {
+        e.builtin = 3;
+        e.tmp = alloc_slot(f.cls.ty.size, 8);
+        e.ty = f.cls.ty;
+        if has_drop(e.ty) { register_temp(e); }
+        return e.ty;
+    }
+    if f.is_async != 0 {
+        uses_async = 1;
+        e.ty = mk_task(f.ret);
+        e.tmp = alloc_slot(8, 8);
+        register_temp(e);
+        return e.ty;
+    }
+    if f.is_extern != 0 && f.ret.kind == TY_STR { dief(e.line, "extern function '%s' cannot return String; declare it to return *u8 and convert with 'as String'", f.name as i64, 0, 0); }
+    if is_agg(f.ret) { e.tmp = alloc_slot(f.ret.size, f.ret.align); }
+    else if has_drop(f.ret) { e.tmp = alloc_slot(8, 8); }
+    e.ty = f.ret;
+    if has_drop(e.ty) { register_temp(e); }
+    return e.ty;
+}
+
+unsafe fn check_expr(e: *Expr) -> *Type {
+    let k = e.kind;
+    if k == E_INT { if e.ty == null { e.ty = ty_ilit; } return e.ty; }
+    if k == E_FLOAT { if e.ty == null { e.ty = ty_flit; } return e.ty; }
+    if k == E_BOOL { e.ty = ty_bool; return e.ty; }
+    if k == E_STR { e.ty = ty_str; return e.ty; }
+    if k == E_ENUMVAL { return e.ty; }
+    if k == E_SIZEOF {
+        let t = e.cty;
+        need_complete(t, e.line);
+        if t.kind == TY_VOID { die(e.line, "sizeof(void)"); }
+        e.kind = E_INT;
+        e.ival = t.size as i64;
+        e.ty = ty_u64;
+        return e.ty;
+    }
+    if k == E_VAR {
+        let l = lookup(e.name);
+        if l == null { dief(e.line, "undefined variable '%s'", e.name as i64, 0, 0); }
+        if l.is_global != 0 && has_ptr(l.ty) && in_unsafe == 0 { dief(e.line, "pointer global '%s' can only be used in unsafe code", l.name as i64, 0, 0); }
+        if l.moved != 0 && assign_target == 0 { dief(e.line, "use of moved value '%s'", e.name as i64, 0, 0); }
+        if l.is_const != 0 {
+            // a constant is its literal
+            let ln = e.line;
+            let nx = e.next;
+            memcpy(e as *u8, l.init as *u8, sizeof(Expr));
+            e.line = ln;
+            e.next = nx;
+            return e.ty;
+        }
+        e.lv = l;
+        e.ty = l.ty;
+        return e.ty;
+    }
+    if k == E_SLIT {
+        // struct literal: every field exactly once
+        let sd = find_struct(e.name);
+        let set = zalloc((sd.nf + 1) as u64);
+        var fi = e.args;
+        while fi != null {
+            var j = 0;
+            while j < sd.nf && !seq(sd.f[j].name, fi.name) { j += 1; }
+            if j == sd.nf { dief(fi.line, "struct '%s' has no field '%s'", sd.name as i64, fi.name as i64, 0); }
+            if set[j] != 0 { dief(fi.line, "field '%s' is given twice", fi.name as i64, 0, 0); }
+            set[j] = 1;
+            fi.fld = &sd.f[j];
+            fi.ty = fi.fld.ty;
+            var ctx: [200]u8;
+            snprintf(&ctx[0], 200, "field '%s'", fi.name as i64, 0, 0);
+            check_expr(fi.a);
+            expect_coerce(fi.a, fi.ty, &ctx[0] as String);
+            consume(fi.a);
+            fi = fi.next;
+        }
+        var j2 = 0;
+        while j2 < sd.nf {
+            if set[j2] == 0 { dief(e.line, "missing field '%s' in '%s' literal", sd.f[j2].name as i64, sd.name as i64, 0); }
+            j2 += 1;
+        }
+        e.ty = sd.ty;
+        e.tmp = alloc_slot(sd.ty.size, sd.ty.align);
+        if has_drop(e.ty) { register_temp(e); }
+        return e.ty;
+    }
+    if k == E_FINIT { return e.ty; }
+    if k == E_REF { die(e.line, "'ref' is only allowed on call arguments"); return null; }
+    if k == E_CALL { return check_call(e); }
+    if k == E_UN {
+        let t = check_expr(e.a);
+        let op = e.op;
+        if op == O_NEG {
+            if !(t.kind == TY_ILIT || t.kind == TY_FLIT || is_float(t) || (is_int(t) && t.sign != 0)) { dief(e.line, "cannot negate '%s'", tname(t) as i64, 0, 0); }
+            e.ty = t;
+            return t;
+        }
+        if op == O_NOT {
+            if t.kind != TY_BOOL { dief(e.line, "'!' needs bool, found '%s'", tname(t) as i64, 0, 0); }
+            e.ty = ty_bool;
+            return e.ty;
+        }
+        if op == O_BNOT {
+            if !is_int(t) && t.kind != TY_ILIT { die(e.line, "'~' needs an integer"); }
+            e.ty = t;
+            return t;
+        }
+        if op == O_DEREF {
+            if in_unsafe == 0 { die(e.line, "pointer dereference requires an unsafe block"); }
+            if t.kind != TY_PTR { dief(e.line, "cannot dereference '%s'", tname(t) as i64, 0, 0); }
+            e.ty = t.elem;
+            return e.ty;
+        }
+        if in_unsafe == 0 { die(e.line, "taking an address requires an unsafe block"); }
+        if !is_lvalue(e.a) { die(e.line, "'&' needs an assignable place"); }
+        e.ty = mk_ptr(t);
+        return e.ty;
+    }
+    if k == E_CAST {
+        check_expr(e.a);
+        finalize(e.a);
+        let from = e.a.ty;
+        let to = e.cty;
+        let fi = is_int(from) || from.kind == TY_BOOL || from.kind == TY_ENUM;
+        let ti = is_int(to);
+        if fi && ti {
+        } else if (is_int(from) || is_float(from)) && (is_int(to) || is_float(to)) {
+            // numeric conversions
+        } else if (from.kind == TY_PTR && (ti || to.kind == TY_PTR || to.kind == TY_STR)) || (is_int(from) && to.kind == TY_PTR) || (from.kind == TY_STR && (to.kind == TY_PTR || ti)) {
+            if in_unsafe == 0 { die(e.line, "pointer casts require an unsafe block"); }
+        } else if from.kind == TY_STR && to.kind == TY_STR {
+        } else if to.kind == TY_STR && (fi || is_float(from)) {
+            dief(e.line, "cannot convert '%s' to String with 'as'; use str(x) or \"\" + x", tname(from) as i64, 0, 0);
+        } else {
+            dief(e.line, "invalid cast from '%s' to '%s'", tname(from) as i64, tname(to) as i64, 0);
+        }
+        if to.kind == TY_STR && from.kind != TY_STR {
+            if from.kind != TY_PTR { die(e.line, "only a pointer can be converted to String with 'as'; use str() for numbers"); }
+            // copies the C string
+            if rt_fidx < 0 || (e.line >> 26) != rt_fidx { return rt_call_into(e, lit("rt_str_from_c"), e.a, null, e.line).ty; }
+        }
+        e.ty = to;
+        return to;
+    }
+    if k == E_INDEX {
+        let bt = check_expr(e.a);
+        let it = check_expr(e.b);
+        if it.kind == TY_ILIT { retype(e.b, ty_u64); }
+        else if !is_int(it) { die(e.line, "index must be an integer"); }
+        if bt.kind == TY_ARRAY { e.ty = bt.elem; return e.ty; }
+        if bt.kind == TY_PTR {
+            if in_unsafe == 0 { die(e.line, "pointer indexing requires an unsafe block"); }
+            e.ty = bt.elem;
+            return e.ty;
+        }
+        if bt.kind == TY_STR {
+            // bounds-checked byte
+            e.ty = ty_u8;
+            return e.ty;
+        }
+        dief(e.line, "cannot index '%s'", tname(bt) as i64, 0, 0);
+        return null;
+    }
+    if k == E_FIELD {
+        if e.a.kind == E_VAR && lookup(e.a.name) == null {
+            let ed = find_enum(e.a.name);
+            if ed != null {
+                var i = 0;
+                while i < ed.nv {
+                    if seq(ed.vn[i], e.name) {
+                        e.kind = E_ENUMVAL;
+                        e.ival = i as i64;
+                        e.ty = ed.ty;
+                        return e.ty;
+                    }
+                    i += 1;
+                }
+                dief(e.line, "enum '%s' has no variant '%s'", ed.name as i64, e.name as i64, 0);
+            }
+        }
+        var bt = check_expr(e.a);
+        if bt.kind == TY_PTR {
+            if in_unsafe == 0 { die(e.line, "field access through a pointer requires an unsafe block"); }
+            bt = bt.elem;
+        }
+        if bt.kind != TY_STRUCT { dief(e.line, "'%s' has no fields", tname(bt) as i64, 0, 0); }
+        var i = 0;
+        while i < bt.sd.nf {
+            if seq(bt.sd.f[i].name, e.name) {
+                e.fld = &bt.sd.f[i];
+                if !can_access(e.fld.vis, e.fld.owner) {
+                    dief(e.line, "'%s' is %s in class '%s'", e.name as i64, vis_name(e.fld.vis) as i64, e.fld.owner.name as i64);
+                }
+                e.ty = e.fld.ty;
+                return e.ty;
+            }
+            i += 1;
+        }
+        dief(e.line, "struct '%s' has no field '%s'", bt.sd.name as i64, e.name as i64, 0);
+        return null;
+    }
+    if k == E_MCALL {
+        var o = e.a;
+        var sd: *StructDef = null;
+        var stat = 0;
+        var recv: *Expr = null;
+        var ifc: *Iface = null;
+        if o.kind == E_VAR && seq(o.name, lit("super")) && lookup(lit("super")) == null {
+            // super.method(): the base class version
+            if cur_fn == null || cur_fn.cls == null || cur_fn.cls.base == null || lookup(lit("this")) == null {
+                die(e.line, "'super' is only available in methods of a class that extends another class");
+            }
+            sd = cur_fn.cls.base;
+            let th = new_expr(E_VAR, e.line);
+            th.name = lit("this");
+            check_expr(th);
+            recv = new_expr(E_REF, e.line);
+            recv.a = th;
+            recv.ty = sd.ty;
+        } else if o.kind == E_VAR && lookup(o.name) == null {
+            sd = find_struct(o.name);
+            if sd == null || sd.is_class == 0 { dief(o.line, "undefined variable '%s'", o.name as i64, 0, 0); }
+            stat = 1;
+        } else {
+            let ot = check_expr(o);
+            var ct = ot;
+            if ct.kind == TY_IFACE {
+                ifc = ct.ifc;
+                recv = o;
+            } else if ct.kind == TY_STR {
+                // s.len() is built in; s.name(args) calls the runtime's str_name(s, args)
+                o.next = e.args;
+                e.args = o;
+                e.nargs += 1;
+                e.a = null;
+                if seq(e.name, lit("len")) {
+                    if e.nargs != 1 { die(e.line, "len takes no arguments"); }
+                    e.kind = E_CALL;
+                    e.builtin = 8;
+                    e.ty = ty_i64;
+                    return e.ty;
+                }
+                let fnm = cat2(lit("str_"), e.name);
+                var sf: *Func = null;
+                var si = 0;
+                while si < nfuncs {
+                    if seq(funcs[si].name, fnm) { sf = funcs[si]; }
+                    si += 1;
+                }
+                if sf == null || sf.borrow == 0 || sf.nparams < 1 || sf.pty[0].kind != TY_STR { dief(e.line, "'String' has no method '%s'", e.name as i64, 0, 0); }
+                e.kind = E_CALL;
+                e.name = sf.name;
+                e.recv = 1;
+                return check_expr(e);
+            } else {
+                if ct.kind == TY_PTR {
+                    if in_unsafe == 0 { die(e.line, "method call through a pointer requires an unsafe block"); }
+                    ct = ct.elem;
+                    let d = new_expr(E_UN, e.line);
+                    d.op = O_DEREF;
+                    d.a = o;
+                    d.ty = ct;
+                    o = d;
+                }
+                if ct.kind != TY_STRUCT || ct.sd.is_class == 0 { dief(e.line, "'%s' has no methods", tname(ot) as i64, 0, 0); }
+                sd = ct.sd;
+                recv = new_expr(E_REF, e.line);
+                recv.a = o;
+                recv.ty = ct;
+            }
+        }
+        var f: *Func = null;
+        var full: *u8 = null;
+        if ifc != null {
+            var fb: StrBuf;
+            sb_init(ref fb);
+            sb_cat_c(ref fb, ifc.name);
+            sb_cat(ref fb, ".");
+            sb_cat_c(ref fb, e.name);
+            full = fb.data;
+            var i = 0;
+            while i < nfuncs {
+                if seq(funcs[i].name, full) && funcs[i].ifc == ifc { f = funcs[i]; }
+                i += 1;
+            }
+            if f == null { dief(e.line, "interface '%s' has no method '%s'", ifc.name as i64, e.name as i64, 0); }
+        } else {
+            var c = sd;
+            while c != null && f == null {
+                var fb: StrBuf;
+                sb_init(ref fb);
+                sb_cat_c(ref fb, c.name);
+                sb_cat(ref fb, ".");
+                sb_cat_c(ref fb, e.name);
+                full = fb.data;
+                var i = 0;
+                while i < nfuncs {
+                    if seq(funcs[i].name, full) && funcs[i].is_ctor == 0 && funcs[i].is_dtor == 0 { f = funcs[i]; }
+                    i += 1;
+                }
+                c = c.base;
+            }
+            if f == null { dief(e.line, "class '%s' has no method '%s'", sd.name as i64, e.name as i64, 0); }
+            if stat != 0 && f.is_static == 0 { dief(e.line, "'%s' is an instance method; call it on an object", full as i64, 0, 0); }
+            if stat == 0 && f.is_static != 0 { dief(e.line, "'%s' is a static method; call it as %s(...)", full as i64, full as i64, 0); }
+            if !can_access(f.vis, f.cls) {
+                dief(e.line, "'%s' is %s in class '%s'", e.name as i64, vis_name(f.vis) as i64, f.cls.name as i64);
+            }
+        }
+        if recv != null {
+            recv.next = e.args;
+            e.args = recv;
+            e.nargs += 1;
+            e.recv = 1;
+        }
+        e.kind = E_CALL;
+        e.name = full;
+        return check_expr(e);
+    }
+    if k == E_TOIFACE { return e.ty; }
+    if k == E_OK || k == E_ERR { return e.ty; }
+    if k == E_AWAIT {
+        // wait for a task and take its result
+        let t = check_expr(e.a);
+        if t.kind != TY_TASK { dief(e.line, "'await' needs a Task (the result of calling an async fn), found '%s'", tname(t) as i64, 0, 0); }
+        consume(e.a);
+        uses_async = 1;
+        e.ty = t.elem;
+        var sz = t.elem.size;
+        if sz < 8 { sz = 8; }
+        e.tmp = alloc_slot(sz, 8);
+        if has_drop(e.ty) { register_temp(e); }
+        return e.ty;
+    }
+    if k == E_TRY {
+        let t = check_expr(e.a);
+        if t.kind != TY_RESULT { dief(e.line, "'?' needs a Result, found '%s'", tname(t) as i64, 0, 0); }
+        if cur_fn == null || cur_fn.ret.kind != TY_RESULT { die(e.line, "'?' can only be used in a function that returns a Result"); }
+        if !same(t.err, cur_fn.ret.err) {
+            dief(e.line, "'?' cannot convert error type '%s' into '%s'", tname(t.err) as i64, tname(cur_fn.ret.err) as i64, 0);
+        }
+        consume(e.a);
+        e.ty = t.elem;
+        if has_drop(e.ty) { register_temp(e); }
+        return e.ty;
+    }
+    if k == E_BIN {
+        let op = e.op;
+        var lt = check_expr(e.a);
+        var rt = check_expr(e.b);
+        if op == O_LAND || op == O_LOR {
+            if lt.kind != TY_BOOL || rt.kind != TY_BOOL { die(e.line, "'&&' / '||' need bool operands"); }
+            e.ty = ty_bool;
+            return e.ty;
+        }
+        if op == O_ADD && (lt.kind == TY_STR || rt.kind == TY_STR) {
+            // concatenation; the other side is converted
+            let sa = to_str(e.a);
+            let sb = to_str(e.b);
+            return rt_call_into(e, lit("rt_str_concat"), sa, sb, e.line).ty;
+        }
+        if lt.kind == TY_PTR && (op == O_ADD || op == O_SUB) {
+            if in_unsafe == 0 { die(e.line, "pointer arithmetic requires an unsafe block"); }
+            if rt.kind == TY_ILIT { retype(e.b, ty_u64); }
+            else if !is_int(rt) { die(e.line, "pointer offset must be an integer"); }
+            e.ty = lt;
+            return lt;
+        }
+        if op == O_SHL || op == O_SHR {
+            if !(is_int(lt) || lt.kind == TY_ILIT) || !(is_int(rt) || rt.kind == TY_ILIT) { die(e.line, "shifts need integer operands"); }
+            if lt.kind == TY_ILIT && is_int(rt) { retype(e.a, rt); }
+            else if rt.kind == TY_ILIT && is_int(lt) { retype(e.b, lt); }
+            e.ty = e.a.ty;
+            return e.ty;
+        }
+        if lt.kind == TY_NULL && (rt.kind == TY_PTR || rt.kind == TY_STR) { e.a.ty = rt; }
+        else if rt.kind == TY_NULL && (lt.kind == TY_PTR || lt.kind == TY_STR) { e.b.ty = lt; }
+        unify(e.a, e.b);
+        lt = e.a.ty;
+        rt = e.b.ty;
+        if !same(lt, rt) { dief(e.line, "mismatched operand types '%s' and '%s'", tname(lt) as i64, tname(rt) as i64, 0); }
+        if (op == O_DIV || op == O_MOD) && e.b.kind == E_INT && e.b.ival == 0 && !is_float(lt) && lt.kind != TY_FLIT { die(e.line, "division by zero"); }
+        if op >= O_EQ && op <= O_GE && lt.kind == TY_STR {
+            // compare the contents: rt_str_cmp(a, b) <op> 0
+            let c = rt_call(lit("rt_str_cmp"), e.a, e.b, e.line);
+            let z = new_expr(E_INT, e.line);
+            z.ty = ty_i32;
+            e.a = c;
+            e.b = z;
+            e.ty = ty_bool;
+            return e.ty;
+        }
+        if op >= O_EQ && op <= O_GE {
+            if lt.kind == TY_ILIT {
+                retype(e.a, ty_i32);
+                retype(e.b, ty_i32);
+                lt = ty_i32;
+            }
+            if lt.kind == TY_FLIT {
+                retype(e.a, ty_f64);
+                retype(e.b, ty_f64);
+                lt = ty_f64;
+            }
+            if is_float(lt) {
+                e.ty = ty_bool;
+                return e.ty;
+            }
+            let eq = op == O_EQ || op == O_NE;
+            if !(is_int(lt) || lt.kind == TY_PTR || (eq && (lt.kind == TY_BOOL || lt.kind == TY_ENUM || lt.kind == TY_STR))) {
+                dief(e.line, "cannot compare '%s' values with this operator", tname(lt) as i64, 0, 0);
+            }
+            e.ty = ty_bool;
+            return e.ty;
+        }
+        if is_float(lt) || lt.kind == TY_FLIT {
+            if op > O_DIV { dief(e.line, "'%s' is not supported for floating point", opname(op) as i64, 0, 0); }
+            e.ty = lt;
+            return lt;
+        }
+        if !(is_int(lt) || lt.kind == TY_ILIT) { dief(e.line, "arithmetic needs integer operands, found '%s'", tname(lt) as i64, 0, 0); }
+        e.ty = lt;
+        return lt;
+    }
+    return null;
+}
+
+// ---- statements ----
+
+unsafe fn always_ret(s: *Stmt) -> bool {
+    let k = s.kind;
+    if k == S_RET { return true; }
+    if k == S_BLOCK {
+        var c = s.list;
+        while c != null { if always_ret(c) { return true; } c = c.next; }
+        return false;
+    }
+    if k == S_IF { return s.els != null && always_ret(s.body) && always_ret(s.els); }
+    if k == S_MATCH {
+        var c = s.list;
+        while c != null { if !always_ret(c.body) { return false; } c = c.next; }
+        return true;
+    }
+    return false;
+}
+
+unsafe fn check_scope_body(b: *Stmt) {
+    let mark = nlocals;
+    let off = cur_off;
+    let base = scope_base;
+    scope_base = nlocals;
+    if b.kind == S_BLOCK {
+        let u = b.unsafe_blk;
+        in_unsafe += u;
+        var c = b.list;
+        while c != null { check_stmt(c); c = c.next; }
+        in_unsafe -= u;
+    } else { check_stmt(b); }
+    nlocals = mark;
+    cur_off = off;
+    scope_base = base;
+}
+
+unsafe fn check_cond(c: *Expr) {
+    let t = check_expr(c);
+    if t.kind != TY_BOOL { dief(c.line, "condition must be bool, found '%s'", tname(t) as i64, 0, 0); }
+}
+
+unsafe fn check_match_result(s: *Stmt, t: *Type, pre: *u8, acc: *u8, n0: i32, ref anyc: bool) {
+    s.slot1 = alloc_slot(8, 8);
+    var wild = false;
+    var cov0 = false;
+    var cov1 = false;
+    var arm = s.list;
+    while arm != null {
+        let p = arm.e;
+        if p == null {
+            set_moved(pre, n0);
+            check_scope_body(arm.body);
+            arm_end(arm.body, acc, n0, ref anyc);
+        }
+        else {
+            if !(p.kind == E_CALL && (seq(p.name, lit("Ok")) || seq(p.name, lit("Err"))) && p.nargs <= 1 && (p.nargs == 0 || p.args.kind == E_VAR)) {
+                die(p.line, "match patterns on a Result must be Ok(name) or Err(name)");
+            }
+            var er = 0;
+            if p.name[0] == 'E' { er = 1; }
+            var pt = t.elem;
+            if er != 0 { pt = t.err; }
+            var bad = false;
+            if pt.kind == TY_VOID { bad = p.nargs != 0; } else { bad = p.nargs != 1; }
+            if bad {
+                var w: *u8 = lit("exactly one binding");
+                if pt.kind == TY_VOID { w = lit("no binding"); }
+                dief(p.line, "pattern '%s' needs %s", p.name as i64, w as i64, 0);
+            }
+            if er != 0 { cov1 = true; } else { cov0 = true; }
+            set_moved(pre, n0);
+            let mark = nlocals;
+            let off = cur_off;
+            let base = scope_base;
+            scope_base = nlocals;
+            if p.nargs == 1 && !seq(p.args.name, lit("_")) { arm.lv = declare(p.args.name, pt, 0, 0, p.line); }
+            check_scope_body(arm.body);
+            nlocals = mark;
+            cur_off = off;
+            scope_base = base;
+            arm_end(arm.body, acc, n0, ref anyc);
+        }
+        if p == null { wild = true; }
+        arm = arm.next;
+    }
+    if !wild && !(cov0 && cov1) { die(s.line, "non-exhaustive match on Result: handle both Ok and Err (or add '_ =>')"); }
+}
+
+// for x in c { body }  with c a collection class that has len() and item(i64):
+//   for __idx in 0..c.len() { let x = c.item(__idx); body }   (the length is read once; item() checks bounds)
+unsafe fn clone_raw(e: *Expr) -> *Expr {
+    if e == null { return null; }
+    let c = zalloc(sizeof(Expr)) as *Expr;
+    memcpy(c as *u8, e as *u8, sizeof(Expr));
+    c.next = null;
+    c.a = clone_raw(e.a);
+    c.b = clone_raw(e.b);
+    c.args = null;
+    var last: *Expr = null;
+    var p = e.args;
+    while p != null {
+        let q = clone_raw(p);
+        if last == null { c.args = q; } else { last.next = q; }
+        last = q;
+        p = p.next;
+    }
+    return c;
+}
+unsafe fn simple_place(e0: *Expr) -> bool {
+    var e = e0;
+    if e.kind == E_STR { return true; }
+    while e.kind == E_FIELD { e = e.a; }
+    return e.kind == E_VAR;
+}
+unsafe fn desugar_foreach(s: *Stmt) {
+    if !simple_place(s.e) { return; }
+    let t = check_expr(clone_raw(s.e));
+    if t.kind == TY_STR || (t.kind == TY_ARRAY && (is_agg(t.elem) || has_drop(t.elem))) {
+        // for c in s / for x in arr: by index
+        if t.kind == TY_ARRAY && move_only(t.elem) { dief(s.line, "cannot iterate by value over elements of type '%s' (it has a destructor); loop over the indices instead", tname(t.elem) as i64, 0, 0); }
+        let line = s.line;
+        let zero = new_expr(E_INT, line);
+        zero.ty = ty_ilit;
+        var n: *Expr = null;
+        if t.kind == TY_STR {
+            n = new_expr(E_MCALL, line);
+            n.a = clone_raw(s.e);
+            n.name = lit("len");
+        } else {
+            n = new_expr(E_INT, line);
+            n.ival = t.n;
+            n.ty = ty_i64;
+        }
+        let iv = new_expr(E_VAR, line);
+        iv.name = lit("__idx");
+        let item = new_expr(E_INDEX, line);
+        item.a = clone_raw(s.e);
+        item.b = iv;
+        let lt = new_stmt(S_LET, line);
+        lt.name = s.name;
+        lt.e = item;
+        let blk = new_stmt(S_BLOCK, line);
+        add_child(blk, lt);
+        s.body.next = null;
+        add_child(blk, s.body);
+        s.is_range = 1;
+        s.name = lit("__idx");
+        s.e = zero;
+        s.e2 = n;
+        s.body = blk;
+        return;
+    }
+    if t.kind != TY_STRUCT || t.sd.is_class == 0 { return; }
+    var has_len = false;
+    var has_item = false;
+    var et: *Type = null;
+    var c = t.sd;
+    while c != null {
+        let nl = cat2(c.name, lit(".len"));
+        let ni = cat2(c.name, lit(".item"));
+        var i = 0;
+        while i < nfuncs {
+            if seq(funcs[i].name, nl) { has_len = true; }
+            if seq(funcs[i].name, ni) && !has_item { has_item = true; et = funcs[i].ret; }
+            i += 1;
+        }
+        c = c.base;
+    }
+    if !has_len || !has_item { dief(s.line, "cannot iterate over '%s': it needs methods len() and item(i: i64)", tname(t) as i64, 0, 0); }
+    if move_only(et) { dief(s.line, "cannot iterate by value over elements of type '%s' (it has a destructor); loop over the indices instead", tname(et) as i64, 0, 0); }
+    let line = s.line;
+    let zero = new_expr(E_INT, line);
+    zero.ty = ty_ilit;
+    let len = new_expr(E_MCALL, line);
+    len.a = clone_raw(s.e);
+    len.name = lit("len");
+    let iv = new_expr(E_VAR, line);
+    iv.name = lit("__idx");
+    let item = new_expr(E_MCALL, line);
+    item.a = clone_raw(s.e);
+    item.name = lit("item");
+    add_arg(item, iv);
+    let lt = new_stmt(S_LET, line);
+    lt.name = s.name;
+    lt.e = item;
+    let blk = new_stmt(S_BLOCK, line);
+    add_child(blk, lt);
+    s.body.next = null;
+    add_child(blk, s.body);
+    s.is_range = 1;
+    s.name = lit("__idx");
+    s.e = zero;
+    s.e2 = len;
+    s.body = blk;
+}
+unsafe fn check_stmt(s: *Stmt) {
+    let prev = cur_stmt;
+    cur_stmt = s;
+    check_stmt0(s);
+    cur_stmt = s;
+    close_temps(s);
+    cur_stmt = prev;
+}
+
+unsafe fn check_stmt0(s: *Stmt) {
+    let k = s.kind;
+    if k == S_BLOCK { check_scope_body(s); }
+    else if k == S_LET {
+        var t = s.dty;
+        if s.e != null {
+            check_expr(s.e);
+            if t != null { expect_coerce(s.e, t, "initializer"); }
+            else { finalize(s.e); t = s.e.ty; }
+        }
+        if t.kind == TY_VOID { die(s.line, "cannot declare a variable of type void"); }
+        if t.kind == TY_NULL { die(s.line, "cannot infer a type from 'null'; add a type annotation"); }
+        if has_iface(t) { dief(s.line, IFACE_MSG, tname(t) as i64, 0, 0); }
+        need_complete(t, s.line);
+        require_safe_type(t, s.line);
+        s.dty = t;
+        if s.e != null { consume(s.e); }
+        s.lv = declare(s.name, t, s.is_mut, 0, s.line);
+    }
+    else if k == S_ASSIGN {
+        if s.e.kind == E_VAR {
+            let cl = lookup(s.e.name);
+            if cl != null && cl.is_const != 0 { dief(s.line, "cannot assign to constant '%s'", cl.name as i64, 0, 0); }
+            assign_target = 1;
+        }
+        let lt = check_expr(s.e);
+        assign_target = 0;
+        if s.e.kind == E_INDEX && s.e.a.ty.kind == TY_STR { die(s.line, "the bytes of a String cannot be changed (strings are immutable); build a new String instead"); }
+        if !is_lvalue(s.e) { die(s.line, "left side of assignment is not assignable"); }
+        if !root_mutable(s.e) { die(s.line, "cannot assign to immutable value; declare it with 'var'"); }
+        check_expr(s.e2);
+        expect_coerce(s.e2, lt, "assignment");
+        consume(s.e2);
+        if s.e.kind == E_VAR { s.e.lv.moved = 0; }   // assigning revives a moved variable
+        if cur_fn.is_ctor != 0 && s.e.kind == E_FIELD && s.e.a.kind == E_VAR && seq(s.e.a.name, lit("this")) && has_drop(lt) && s.e.fld.init == null {
+            var top = false;
+            var c = cur_fn.body.list;
+            while c != null { if c == s { top = true; } c = c.next; }
+            var fi = 0;
+            while &cur_fn.cls.f[fi] != s.e.fld { fi += 1; }
+            if top && fi < 256 && ctor_set[fi] == 0 { s.init_store = 1; }
+            if fi < 256 { ctor_set[fi] = 1; }
+        }
+    }
+    else if k == S_EXPR { check_expr(s.e); finalize(s.e); }
+    else if k == S_IF {
+        check_cond(s.e);
+        close_temps(s);
+        let n0 = nlocals;
+        let pre = snap_moved();
+        check_scope_body(s.body);
+        let a1 = snap_moved();
+        let r1 = always_ret(s.body);
+        set_moved(pre, n0);
+        if s.els != null { check_scope_body(s.els); }
+        let a2 = snap_moved();
+        let r2 = s.els != null && always_ret(s.els);
+        // moved on any path that continues
+        var i = 0;
+        while i < n0 {
+            if r1 && !r2 { locals[i].moved = a2[i] as i32; }
+            else if r2 && !r1 { locals[i].moved = a1[i] as i32; }
+            else { locals[i].moved = (a1[i] | a2[i]) as i32; }
+            i += 1;
+        }
+    }
+    else if k == S_WHILE {
+        check_cond(s.e);
+        close_temps(s);
+        loop_depth += 1;
+        check_scope_body(s.body);
+        loop_depth -= 1;
+    }
+    else if k == S_FOR {
+        if s.is_range == 0 { desugar_foreach(s); }
+        let mark = nlocals;
+        let off = cur_off;
+        let base = scope_base;
+        scope_base = nlocals;
+        var vt: *Type;
+        if s.is_range != 0 {
+            check_expr(s.e);
+            check_expr(s.e2);
+            unify(s.e, s.e2);
+            if s.e.ty.kind == TY_ILIT { retype(s.e, ty_i32); retype(s.e2, ty_i32); }
+            if !is_int(s.e.ty) || !same(s.e.ty, s.e2.ty) { die(s.line, "range bounds must be integers of the same type"); }
+            vt = s.e.ty;
+            s.slot1 = alloc_slot(8, 8);
+        } else {
+            let at = check_expr(s.e);
+            if at.kind != TY_ARRAY { dief(s.line, "cannot iterate over a value of type '%s' (use a range a..b, an array, a String or a class with len() and item(i: i64))", tname(at) as i64, 0, 0); }
+            if is_agg(at.elem) { dief(s.line, "to iterate over elements of type '%s', store the array in a variable first", tname(at.elem) as i64, 0, 0); }
+            vt = at.elem;
+            s.slot1 = alloc_slot(8, 8);
+        }
+        s.lv = declare(s.name, vt, 0, 0, s.line);
+        loop_depth += 1;
+        check_scope_body(s.body);
+        loop_depth -= 1;
+        nlocals = mark;
+        cur_off = off;
+        scope_base = base;
+    }
+    else if k == S_RET {
+        if s.e != null {
+            if cur_fn.ret.kind == TY_VOID { die(s.line, "void function cannot return a value"); }
+            check_expr(s.e);
+            expect_coerce(s.e, cur_fn.ret, "return");
+            consume(s.e);
+        } else if cur_fn.ret.kind != TY_VOID { die(s.line, "missing return value"); }
+    }
+    else if k == S_BRK || k == S_CONT {
+        if loop_depth == 0 {
+            var w: *u8 = lit("continue");
+            if k == S_BRK { w = lit("break"); }
+            dief(s.line, "'%s' outside of a loop", w as i64, 0, 0);
+        }
+    }
+    else if k == S_MATCH {
+        check_expr(s.e);
+        finalize(s.e);
+        let t = s.e.ty;
+        consume(s.e);
+        close_temps(s);
+        let n0 = nlocals;
+        let pre = snap_moved();
+        let acc = zalloc((n0 + 1) as u64);
+        var anyc = false;
+        if t.kind == TY_RESULT {
+            check_match_result(s, t, pre, acc, n0, ref anyc);
+            if anyc { set_moved(acc, n0); } else { set_moved(pre, n0); }
+            return;
+        }
+        if !(is_int(t) || t.kind == TY_BOOL || t.kind == TY_ENUM) { dief(s.line, "cannot match on '%s'", tname(t) as i64, 0, 0); }
+        s.slot1 = alloc_slot(8, 8);
+        var wild = false;
+        var ncov = 0;
+        var csz: u64 = 3;
+        if t.kind == TY_ENUM { csz = (t.ed.nv + 1) as u64; }
+        let cov = zalloc(csz);
+        var arm = s.list;
+        while arm != null {
+            let p = arm.e;
+            if p == null { wild = true; }
+            else {
+                check_expr(p);
+                if !(p.kind == E_INT || p.kind == E_BOOL || p.kind == E_ENUMVAL) { die(p.line, "match patterns must be constants"); }
+                expect_coerce(p, t, "pattern");
+                if t.kind == TY_ENUM || t.kind == TY_BOOL {
+                    let idx = p.ival as i32;
+                    if cov[idx] == 0 { cov[idx] = 1; ncov += 1; }
+                }
+            }
+            set_moved(pre, n0);
+            check_scope_body(arm.body);
+            arm_end(arm.body, acc, n0, ref anyc);
+            arm = arm.next;
+        }
+        if anyc { set_moved(acc, n0); } else { set_moved(pre, n0); }
+        if !wild {
+            if t.kind == TY_ENUM && ncov < t.ed.nv { dief(s.line, "non-exhaustive match: not all variants of '%s' are covered (add '_ =>')", t.ed.name as i64, 0, 0); }
+            if t.kind == TY_BOOL && ncov < 2 { die(s.line, "non-exhaustive match on bool"); }
+            if is_int(t) { die(s.line, "non-exhaustive match: integer match needs a '_ =>' arm"); }
+        }
+    }
+}
+
+// false: an error was reported (die() jumped back here)
+unsafe fn try_check_func(f: *Func) -> bool {
+    err_recover = 1;
+    if setjmp(&err_jb[0]) != 0 {
+        err_recover = 0;
+        return false;
+    }
+    check_func(f);
+    err_recover = 0;
+    return true;
+}
+unsafe fn check_func(f: *Func) {
+    if f.is_extern != 0 || f.ifc != null { return; }
+    cur_fn = f;
+    nlocals = 0;
+    scope_base = 0;
+    cur_off = 0;
+    max_off = 0;
+    loop_depth = 0;
+    in_unsafe = f.is_unsafe;
+    var ci = 0;
+    while ci < 256 { ctor_set[ci] = 0; ci += 1; }
+    var i = 0;
+    while i < f.nparams {
+        need_complete(f.pty[i], f.line);
+        require_safe_type(f.pty[i], f.line);
+        if f.pref[i] != 0 { f.plocal[i] = declare(f.pname[i], f.pty[i], 1, 1, f.line); }
+        else {
+            f.plocal[i] = declare(f.pname[i], f.pty[i], 0, 0, f.line);
+            if is_agg(f.pty[i]) { f.plocal[i].tmp = alloc_slot(8, 8); }
+            if f.borrow != 0 { f.plocal[i].dflag = 0; }
+        }
+        i += 1;
+    }
+    require_safe_type(f.ret, f.line);
+    if is_agg(f.ret) { f.retslot = alloc_slot(8, 8); }
+    if f.is_ctor != 0 {
+        var fi = 0;
+        while fi < f.cls.nf {
+            let fl = &f.cls.f[fi];
+            if fl.init != null {
+                var dummy: Stmt;
+                cur_stmt = &dummy;
+                check_expr(fl.init);
+                expect_coerce(fl.init, fl.ty, "field initializer");
+                consume(fl.init);
+                var tt = dummy.temps;
+                while tt != null {
+                    if tt.consumed == 0 { die(tt.line, "this expression creates a temporary with a destructor; assign it to a variable first"); }
+                    tt = tt.tnext;
+                }
+                cur_stmt = null;
+            }
+            fi += 1;
+        }
+    }
+    check_scope_body(f.body);
+    if f.ret.kind != TY_VOID && !always_ret(f.body) { dief(f.line, "function '%s' may finish without returning a value", f.name as i64, 0, 0); }
+    f.frame = (max_off + 15) / 16 * 16;
+}
+
+unsafe fn sema() {
+    var i = 0;
+    while i < nallow {
+        var j = 0;
+        while j < ndeny {
+            if seq(allow_caps[i], deny_caps[j]) { dief(1, "capability '%s' is both allowed and denied", allow_caps[i] as i64, 0, 0); }
+            j += 1;
+        }
+        i += 1;
+    }
+    var m: *Func = null;
+    i = 0;
+    while i < nfuncs {
+        if seq(funcs[i].name, lit("main")) { m = funcs[i]; }
+        i += 1;
+    }
+    if m == null && test_mode == 0 { die(1, "no 'main' function"); }
+    if m != null && m.is_async != 0 { die(m.line, "main cannot be async"); }
+    var ti = 0;
+    while ti < nfuncs {
+        if funcs[ti].is_test != 0 && (funcs[ti].nparams != 0 || funcs[ti].ret.kind != TY_VOID) { die(funcs[ti].line, "a @test function takes no parameters and returns nothing (fail with panic())"); }
+        ti += 1;
+    }
+    var ai = 0;
+    while ai < nfuncs {
+        let af = funcs[ai];
+        if af.is_async != 0 {
+            if af.nparams > 5 { die(af.line, "async functions can take at most 5 parameters"); }
+            var j = 0;
+            while j < af.nparams {
+                if af.pref[j] != 0 || has_iface(af.pty[j]) { die(af.line, "async functions cannot take 'ref' or interface parameters (the task may outlive the caller)"); }
+                j += 1;
+            }
+        }
+        ai += 1;
+    }
+    if m != null && !(m.ret.kind == TY_VOID || (is_int(m.ret) && m.ret.size == 4 && m.ret.sign != 0)) { die(m.line, "main must return i32"); }
+    if m != null && m.nparams != 0 {
+        var ok = m.nparams == 1 && m.pref[0] == 0 && seq(tname(m.pty[0]), lit("Vec<String>"));
+        if m.nparams == 2 && m.is_unsafe != 0 && same(m.pty[0], ty_i32) && m.pty[1].kind == TY_PTR && m.pty[1].elem.kind == TY_PTR && same(m.pty[1].elem.elem, ty_u8) { ok = true; }
+        if !ok { die(m.line, "main must be 'fn main() -> i32', 'fn main(args: Vec<String>) -> i32' or 'unsafe fn main(argc: i32, argv: **u8) -> i32'"); }
+    }
+    i = 0;
+    while i < nglobals {
+        let g = globals[i];
+        var j = 0;
+        while j < i {
+            if seq(globals[j].name, g.name) { dief(g.line, "global '%s' redefined", g.name as i64, 0, 0); }
+            j += 1;
+        }
+        if g.init != null {
+            let x = g.init;
+            check_expr(x);
+            if !(x.kind == E_INT || x.kind == E_FLOAT || x.kind == E_BOOL || x.kind == E_STR || x.kind == E_ENUMVAL) { die(g.line, "global initializers must be literals"); }
+            if g.ty != null {
+                if g.is_const != 0 { expect_coerce(x, g.ty, "constant"); } else { expect_coerce(x, g.ty, "global initializer"); }
+            }
+            else {
+                if g.is_const == 0 { finalize(x); }
+                g.ty = x.ty;
+            }
+        }
+        need_complete(g.ty, g.line);
+        if g.ty.kind == TY_VOID { die(g.line, "global cannot be void"); }
+        if has_iface(g.ty) { dief(g.line, IFACE_MSG, tname(g.ty) as i64, 0, 0); }
+        i += 1;
+    }
+    i = 0;
+    while i < nfuncs {
+        if funcs[i].is_extern != 0 {
+            if is_agg(funcs[i].ret) { die(funcs[i].line, "extern functions cannot return aggregates"); }
+            var j = 0;
+            while j < funcs[i].nparams {
+                if is_agg(funcs[i].pty[j]) { die(funcs[i].line, "extern functions cannot take aggregates by value"); }
+                j += 1;
+            }
+            var gp = 0;
+            var fp = 0;
+            var fl = is_float(funcs[i].ret);
+            j = 0;
+            while j < funcs[i].nparams {
+                if is_float(funcs[i].pty[j]) { fp += 1; fl = true; } else { gp += 1; }
+                j += 1;
+            }
+            if fl && (gp > 6 || fp > 8) { die(funcs[i].line, "extern functions with floating-point values can take at most 6 integer and 8 floating-point arguments"); }
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < nfuncs {
+        // an error ends the check of its function only: the others are still checked
+        if !try_check_func(funcs[i]) {
+            assign_target = 0;
+            cur_stmt = null;
+            if nerrors >= 20 { dprintf(2, "too many errors; stopping\n", 0, 0, 0); exit(1); }
+        }
+        i += 1;
+    }
+    if nerrors != 0 {
+        if nerrors > 1 { dprintf(2, "%d errors\n", nerrors as i64, 0, 0); }
+        exit(1);
+    }
+    i = 0;
+    while i < nstructs {
+        var k = 0;
+        while k < structs[i].nifs { check_impl(structs[i], structs[i].ifs[k], structs[i].line); k += 1; }
+        i += 1;
+    }
+}

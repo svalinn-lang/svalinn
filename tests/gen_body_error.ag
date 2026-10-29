@@ -1,0 +1,1 @@
+module A; fn bad<T>(a: T) -> T { return a + a; } fn main() -> i32 { let s = bad(true); return 0; }

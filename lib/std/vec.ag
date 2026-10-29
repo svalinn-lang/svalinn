@@ -1,0 +1,76 @@
+// std.vec - growable array. No capability is needed.
+// A Vec owns its buffer and its elements: they are destroyed automatically when the Vec goes out of scope.
+// Vecs are moved, never copied (pass them with `ref` to borrow). get() and item() return a copy of the element
+// (for Strings that only counts one more owner); pop() moves the last element out.
+module std.vec;
+
+import std.mem;
+
+enum IndexError { OutOfBounds, Empty }
+
+class Vec<T> {
+    private:
+        var data: *T;
+        var count: i64;
+        var cap: i64;
+
+    public:
+        fn len() -> i64 { return this.count; }
+
+        fn push(item: T) {
+            unsafe {
+                if this.count == this.cap {
+                    var nc = this.cap * 2;
+                    if nc < 4 { nc = 4; }
+                    this.data = realloc(this.data as *u8, (nc as u64) * sizeof(T)) as *T;
+                    this.cap = nc;
+                }
+                *(this.data + this.count) = item;
+            }
+            this.count += 1;
+        }
+
+        fn get(i: i64) -> Result<T, IndexError> {
+            if i < 0 || i >= this.count { return Err(IndexError.OutOfBounds); }
+            unsafe { return Ok(*(this.data + i)); }
+        }
+
+        // the element at i (a copy); stops the program with a panic when i is out of range.
+        // `for x in v` uses len() and item().
+        fn item(i: i64) -> T {
+            if i < 0 || i >= this.count { panic("Vec index out of bounds"); }
+            unsafe { return *(this.data + i); }
+        }
+
+        fn set(i: i64, item: T) -> Result<void, IndexError> {
+            if i < 0 || i >= this.count { return Err(IndexError.OutOfBounds); }
+            unsafe {
+                destroy(this.data + i);
+                *(this.data + i) = item;
+            }
+            return Ok();
+        }
+
+        fn pop() -> Result<T, IndexError> {
+            if this.count == 0 { return Err(IndexError.Empty); }
+            this.count -= 1;
+            unsafe { return Ok(take(this.data + this.count)); }
+        }
+
+        fn clear() {
+            unsafe {
+                var i: i64 = 0;
+                while i < this.count { destroy(this.data + i); i += 1; }
+            }
+            this.count = 0;
+        }
+
+        fn free() {
+            this.clear();
+            unsafe { free(this.data as *u8); }
+            this.data = null;
+            this.cap = 0;
+        }
+
+        dtor { this.free(); }
+}

@@ -1,0 +1,85 @@
+// std.mem - raw allocation helpers and a growable byte buffer (unsafe functions, for low-level code).
+module std.mem;
+
+extern fn malloc(n: u64) -> *u8;
+extern fn realloc(p: *u8, n: u64) -> *u8;
+extern fn free(p: *u8);
+extern fn memcpy(d: *u8, s: *u8, n: u64) -> *u8;
+extern fn memset(d: *u8, c: i32, n: u64) -> *u8;
+extern fn abort();
+extern fn strlen(s: *u8) -> u64;
+extern fn strcmp(a: *u8, b: *u8) -> i32;
+
+unsafe fn alloc(n: u64) -> *u8 {
+    let p = malloc(n);
+    if p == null { abort(); }
+    return p;
+}
+
+struct Slice { ptr: *u8; len: i64; }
+
+unsafe fn slice(p: *u8, n: i64) -> Slice {
+    var s: Slice;
+    s.ptr = p;
+    s.len = n;
+    return s;
+}
+
+struct StrBuf { data: *u8; len: i64; cap: i64; }
+
+unsafe fn sb_init(ref b: StrBuf) {
+    b.data = null;
+    b.len = 0;
+    b.cap = 0;
+}
+
+unsafe fn sb_push(ref b: StrBuf, c: u8) {
+    if b.len + 1 >= b.cap {
+        var nc = b.cap * 2;
+        if nc < 16 { nc = 16; }
+        b.data = realloc(b.data, nc as u64);
+        if b.data == null { abort(); }
+        b.cap = nc;
+    }
+    b.data[b.len] = c;
+    b.len += 1;
+    b.data[b.len] = 0;
+}
+
+unsafe fn sb_free(ref b: StrBuf) {
+    free(b.data);
+    b.data = null;
+    b.len = 0;
+    b.cap = 0;
+}
+
+unsafe fn sb_puts(ref b: StrBuf, s: *u8, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        sb_push(ref b, s[i]);
+        i += 1;
+    }
+}
+
+unsafe fn sb_cat(ref b: StrBuf, s: String) {
+    sb_puts(ref b, s as *u8, s.len());
+}
+
+// append a C string
+unsafe fn sb_cat_c(ref b: StrBuf, s: *u8) {
+    sb_puts(ref b, s, strlen(s) as i64);
+}
+
+unsafe fn zalloc(size: u64) -> *u8 {
+    let p = alloc(size);
+    memset(p, 0, size);
+    return p;
+}
+
+// NUL-terminated copy of n bytes
+unsafe fn dup_n(p: *u8, n: i32) -> *u8 {
+    let d = alloc(n as u64 + 1);
+    memcpy(d, p, n as u64);
+    d[n] = 0;
+    return d;
+}

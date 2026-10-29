@@ -1,0 +1,42 @@
+module Literals;
+allow Console;
+
+const N = 4;
+const SIZE: i64 = N * 2 + 1;
+const SCALE: f64 = 1.5;
+const NAME = "lit";
+const ON = true;
+const NEG = -7;
+
+struct Vec2 { x: f64; y: f64; }
+struct Rect { min: Vec2; max: Vec2; tag: i32; }
+struct Pair<A, B> { first: A; second: B; }
+
+fn area(r: Rect) -> f64 { return (r.max.x - r.min.x) * (r.max.y - r.min.y); }
+fn mid(a: Vec2, b: Vec2) -> Vec2 { return Vec2 { x: (a.x + b.x) / 2.0, y: (a.y + b.y) / 2.0 }; }
+
+fn main() -> i32 {
+    var grid: [SIZE]i32;
+    for i in 0..SIZE { grid[i] = (i * N) as i32; }
+    println(grid[SIZE - 1]);
+    let x = 3.0;
+    let p = Vec2 { x, y: x * SCALE };
+    println(p.x + p.y);
+    let r = Rect { tag: 7, min: Vec2 { x: 0.0, y: 0.0 }, max: Vec2 { x: 4.0, y: 2.5, }, };
+    println(area(r));
+    println(r.tag);
+    let m = mid(r.min, r.max);
+    println(m.x);
+    println(Vec2 { x: 1.0, y: 2.0 }.y);
+    let q = Pair<i32, String> { first: N, second: NAME };
+    println(q.first);
+    println(q.second);
+    if ON { println(NEG); }
+    let big: i64 = N;
+    println(big + SIZE);
+    const LOCAL = 10;
+    var v = r;
+    v.max = Vec2 { x: 10.0, y: 10.0 };
+    if v.max.x > p.x { println(area(v) + (LOCAL as f64)); }
+    return 0;
+}

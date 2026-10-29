@@ -1,0 +1,112 @@
+// std.process - running other programs (needs `allow Process.Spawn;`) and ending this one.
+// The program is looked up in PATH; arguments are passed as they are (no shell is involved).
+module std.process;
+
+import std.error;
+import std.vec;
+
+extern fn fork() -> i32;
+extern fn execvp(file: *u8, argv: **u8) -> i32;
+extern fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+extern fn pipe(fds: *i32) -> i32;
+extern fn dup2(old: i32, new: i32) -> i32;
+extern fn close(fd: i32) -> i32;
+extern fn read(fd: i32, buf: *u8, n: u64) -> i64;
+extern fn _exit(code: i32);
+extern fn exit(code: i32);
+extern fn fflush(f: *u8) -> i32;
+extern fn getpid() -> i32;
+extern fn malloc(n: u64) -> *u8;
+extern fn realloc(p: *u8, n: u64) -> *u8;
+extern fn free(p: *u8);
+
+// result of run_output(): exit status and everything the program wrote to standard output
+struct Output { status: i32; stdout: String; }
+
+// NUL-terminated argument vector {cmd, args..., null}; the Strings must outlive it
+unsafe fn rt_argv(cmd: String, ref args: Vec<String>) -> **u8 {
+    let n = args.len();
+    let v = malloc(((n + 2) * 8) as u64) as **u8;
+    *v = cmd as *u8;
+    var i: i64 = 0;
+    while i < n {
+        let a = args.item(i);   // a copy: args keeps the bytes alive
+        if a.len() == 0 { *(v + i + 1) = "" as *u8; } else { *(v + i + 1) = a as *u8; }
+        i += 1;
+    }
+    *(v + n + 1) = null;
+    return v;
+}
+
+// exit code of a finished child (128 + signal number when it was killed)
+fn rt_wait(pid: i32) -> i32 {
+    var st: i32 = 0;
+    unsafe { waitpid(pid, &st, 0); }
+    if (st & 127) == 0 { return (st >> 8) & 255; }
+    return 128 + (st & 127);
+}
+
+// runs cmd with args and waits for it; the result is its exit code (127: the program was not found)
+fn run(cmd: String, ref args: Vec<String>) -> Result<i32, IOError> requires Process.Spawn {
+    if cmd.len() == 0 { return Err(IOError.InvalidInput); }
+    unsafe {
+        let argv = rt_argv(cmd, ref args);
+        fflush(null);
+        let pid = fork();
+        if pid < 0 { free(argv as *u8); return Err(last_io_error()); }
+        if pid == 0 {
+            execvp(cmd as *u8, argv);
+            _exit(127);
+        }
+        free(argv as *u8);
+        return Ok(rt_wait(pid));
+    }
+}
+
+// runs cmd with args, collecting its standard output
+fn run_output(cmd: String, ref args: Vec<String>) -> Result<Output, IOError> requires Process.Spawn {
+    if cmd.len() == 0 { return Err(IOError.InvalidInput); }
+    unsafe {
+        var fds: [2]i32;
+        if pipe(&fds[0]) != 0 { return Err(last_io_error()); }
+        let argv = rt_argv(cmd, ref args);
+        fflush(null);
+        let pid = fork();
+        if pid < 0 { free(argv as *u8); close(fds[0]); close(fds[1]); return Err(last_io_error()); }
+        if pid == 0 {
+            dup2(fds[1], 1);
+            close(fds[0]);
+            close(fds[1]);
+            execvp(cmd as *u8, argv);
+            _exit(127);
+        }
+        free(argv as *u8);
+        close(fds[1]);
+        var cap: i64 = 4096;
+        var n: i64 = 0;
+        var buf = malloc(cap as u64);
+        while true {
+            if n == cap {
+                cap = cap * 2;
+                buf = realloc(buf, cap as u64);
+            }
+            let got = read(fds[0], buf + n, (cap - n) as u64);
+            if got <= 0 { break; }
+            n += got;
+        }
+        close(fds[0]);
+        let text = rt_str_from_buf(buf, n);
+        free(buf);
+        return Ok(Output { status: rt_wait(pid), stdout: text });
+    }
+}
+
+// ends the program now with the given exit code (output is flushed; destructors do not run)
+fn exit_process(code: i32) {
+    unsafe {
+        fflush(null);
+        exit(code);
+    }
+}
+
+fn process_id() -> i64 { unsafe { return getpid() as i64; } }

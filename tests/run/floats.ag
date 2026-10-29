@@ -1,0 +1,72 @@
+module Floats;
+allow Console;
+allow Native;
+
+import std.math;
+
+struct Vec3 { x: f64; y: f64; z: f64; }
+
+fn len(v: Vec3) -> f64 { return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+fn area(r: f64) -> f64 { return PI * r * r; }
+fn half(x: f32) -> f32 { return x / 2.0; }
+fn safeDiv(a: f64, b: f64) -> Result<f64, String> {
+    if b == 0.0 { return Err("div by zero"); }
+    return Ok(a / b);
+}
+fn avg<T>(a: T, b: T) -> T { return (a + b) / 2.0; }
+
+class Particle {
+    public:
+        var x: f64 = 0.0;
+        var vx: f64 = 1.5;
+        fn step(dt: f64) { this.x += this.vx * dt; }
+}
+
+var scale: f32 = 2.5;
+
+fn main() -> i32 {
+    println(1.5 + 2.25);
+    println(area(2.0));
+    var v: Vec3;
+    v.x = 3.0; v.y = 4.0; v.z = 12.0;
+    println(len(v));
+    println(half(scale));
+    let x: f32 = 0.1;
+    println(x as f64);
+    println(7 as f64 / 2.0);
+    println(7.9 as i32);
+    println((-7.9) as i64);
+    println(18446744073709551615 as u64 as f64);
+    println(Math.pow(2.0, 10.0));
+    println(1.0 / 3.0);
+    let a = 1e300 * 1e300;
+    println(a);
+    println(-a);
+    let nan = a - a;
+    println(nan == nan);
+    println(nan != nan);
+    println(nan < 1.0);
+    println(1.5 < 2.5);
+    println(2.5 <= 2.5);
+    println(3.0 > 2.0 && 2.0 >= 2.0);
+    println(-(2.5));
+    var acc = 0.0;
+    for i in 0..10 { acc += 0.1; }
+    println(acc);
+    match safeDiv(1.0, 4.0) { Ok(q) => { println(q); } Err(e) => { println(e); } }
+    match safeDiv(1.0, 0.0) { Ok(q) => { println(q); } Err(e) => { println(e); } }
+    let big: f32 = 16777217.0;
+    println(big);
+    println(avg(1.0, 4.0));
+    println(avg(1.0 as f32, 2.0 as f32));
+    var p = Particle();
+    for i in 0..4 { p.step(0.5); }
+    println(p.x);
+    println(Math.floor(-2.5));
+    println(Math.round(2.5));
+    println(Math.sin(PI / 2.0));
+    println(Math.max(3.0, 7.25));
+    println(1_000.5e-3);
+    println(3 + 0.5);
+    return 0;
+}

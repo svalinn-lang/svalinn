@@ -1,0 +1,71 @@
+// A tiny tokenizer written in Aegis: files, heap, linked list, argv.
+// This is the shape of code the self-hosted compiler will be made of.
+module Tokens;
+allow Console;
+allow Native;
+allow File.Read;
+
+extern fn fopen(path: String, mode: String) -> *u8;
+extern fn fread(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+extern fn fclose(f: *u8) -> i32;
+extern fn malloc(n: u64) -> *u8;
+extern fn free(p: *u8);
+
+enum Kind { Ident, Number, Punct }
+
+struct Token { kind: i32; start: i32; len: i32; next: *Token; }
+
+var head: *Token;
+var tail: *Token;
+var buf: *u8;
+var kinds: [3]i32;
+
+fn is_alpha(c: u8) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+fn is_digit(c: u8) -> bool { return c >= '0' && c <= '9'; }
+
+unsafe fn push(kind: Kind, start: i32, len: i32) {
+    let t = malloc(sizeof(Token)) as *Token;
+    t.kind = kind as i32;
+    t.start = start;
+    t.len = len;
+    t.next = null;
+    if tail == null { head = t; } else { tail.next = t; }
+    tail = t;
+    kinds[kind as i32] += 1;
+}
+
+unsafe fn main(argc: i32, argv: **u8) -> i32 {
+    if argc < 2 { println("usage: tokens <file>"); return 1; }
+    let f = fopen(argv[1] as String, "rb");
+    if f == null { println("cannot open file"); return 1; }
+    buf = malloc(1 << 20);
+    let n = fread(buf, 1, (1 << 20) - 1, f) as i32;
+    fclose(f);
+    buf[n] = 0;
+
+    var i = 0;
+    while i < n {
+        let c = buf[i];
+        if c == ' ' || c == '\n' || c == '\t' || c == '\r' { i += 1; }
+        else if is_alpha(c) {
+            let s = i;
+            while i < n && (is_alpha(buf[i]) || is_digit(buf[i])) { i += 1; }
+            push(Kind.Ident, s, i - s);
+        } else if is_digit(c) {
+            let s = i;
+            while i < n && is_digit(buf[i]) { i += 1; }
+            push(Kind.Number, s, i - s);
+        } else { push(Kind.Punct, i, 1); i += 1; }
+    }
+
+    println("identifiers:"); println(kinds[0]);
+    println("numbers:");     println(kinds[1]);
+    println("punctuation:"); println(kinds[2]);
+
+    var p = head; var total = 0;
+    while p != null { total += 1; let nx = p.next; free(p as *u8); p = nx; }
+    println("tokens freed:"); println(total);
+    return 0;
+}

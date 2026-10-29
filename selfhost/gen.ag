@@ -1,0 +1,1601 @@
+// Code generator for the self-hosted compiler: a port of gen_* in aegisc.c (x86-64, Intel syntax).
+module Gen;
+
+import std.sys;
+import std.mem;
+import lex;
+import types;
+import ast;
+import sema;
+import opt;
+
+var out: *u8;
+var lbl_n: i32;
+var push_cnt: i32;
+var ret_lbl: i32;
+var loop_brk: [64]i32;
+var loop_cont: [64]i32;
+var loop_sp: i32;
+var str_d: [8192]*u8;
+var str_n: [8192]i32;
+var nstr: i32;
+var gcur_fn: *Func;
+
+unsafe fn emit3(fmt: String, a: i64, b: i64, c: i64) {
+    var buf: [512]u8;
+    snprintf(&buf[0], 512, fmt, a, b, c);
+    fprintf(out, "\t%s\n", &buf[0] as i64, 0, 0);
+}
+unsafe fn emit(fmt: String) { emit3(fmt, 0, 0, 0); }
+unsafe fn emit1(fmt: String, a: i64) { emit3(fmt, a, 0, 0); }
+unsafe fn emit2(fmt: String, a: i64, b: i64) { emit3(fmt, a, b, 0); }
+unsafe fn S(s: *u8) -> i64 { return s as i64; }
+
+// generic instances contain characters that are not valid in assembler symbols
+unsafe fn mangle(s: *u8) -> *u8 {
+    var b: StrBuf;
+    sb_init(ref b);
+    var i = 0;
+    while s[i] != 0 {
+        let c = s[i];
+        if is_alnum(c) || c == '.' { sb_push(ref b, c); }
+        else {
+            var t: [16]u8;
+            snprintf(&t[0], 16, "_x%02x_", c as i64, 0, 0);
+            sb_cat_c(ref b, &t[0]);
+        }
+        i += 1;
+    }
+    return b.data;
+}
+unsafe fn newlbl() -> i32 { let l = lbl_n; lbl_n += 1; return l; }
+unsafe fn place(l: i32) { fprintf(out, ".L%d:\n", l as i64, 0, 0); }
+unsafe fn gpush(r: String) { emit1("push %s", r as i64); push_cnt += 1; }
+unsafe fn gpop(r: String) { emit1("pop %s", r as i64); push_cnt -= 1; }
+unsafe fn add_str(d: *u8, n: i32) -> i32 {
+    str_d[nstr] = dup_n(d, n);
+    str_n[nstr] = n;
+    nstr += 1;
+    return nstr - 1;
+}
+
+// ---- floating point: values travel as raw bits in rax like everything else; arithmetic uses xmm0/xmm1 ----
+
+extern fn strtod(s: *u8, end: *u8) -> f64;
+extern fn strtof(s: *u8, end: *u8) -> f32;
+
+var fc_text: [4096]*u8;
+var fc_is32: [4096]i32;
+var nfc: i32;
+
+// exact IEEE bits (strtod/strtof round correctly; the assembler may not)
+unsafe fn emit_fbits(text: *u8, is32: i32) {
+    if is32 != 0 {
+        var f: f32 = strtof(text, null);
+        let u = *(&f as *u32);
+        fprintf(out, "\t.long 0x%08x\n", u as i64, 0, 0);
+    } else {
+        var d: f64 = strtod(text, null);
+        let u = *(&d as *u64);
+        fprintf(out, "\t.quad 0x%016llx\n", u as i64, 0, 0);
+    }
+}
+unsafe fn add_fconst(text: *u8, is32: i32) -> i32 {
+    fc_text[nfc] = dup_n(text, strlen(text) as i32);
+    fc_is32[nfc] = is32;
+    nfc += 1;
+    return nfc - 1;
+}
+// bits in a GP register -> xmmN
+unsafe fn to_xmm(x: i32, t: *Type, r64: String) {
+    if t.size == 4 {
+        var r: String = "ecx";
+        if strcmp(r64 as *u8, "rax" as *u8) == 0 { r = "eax"; }
+        emit2("movd xmm%d, %s", x as i64, r as i64);
+    } else { emit2("movq xmm%d, %s", x as i64, r64 as i64); }
+}
+unsafe fn from_xmm0(t: *Type) {
+    if t.size == 4 { emit("movd eax, xmm0"); } else { emit("movq rax, xmm0"); }
+}
+unsafe fn load_fconst(c: i32, t: *Type) {
+    if t.size == 4 { emit1("mov eax, DWORD PTR [rip+.LF%d]", c as i64); } else { emit1("mov rax, QWORD PTR [rip+.LF%d]", c as i64); }
+}
+
+unsafe fn R64(i: i32) -> String {
+    if i == 0 { return "rdi"; } if i == 1 { return "rsi"; } if i == 2 { return "rdx"; }
+    if i == 3 { return "rcx"; } if i == 4 { return "r8"; } return "r9";
+}
+unsafe fn R32(i: i32) -> String {
+    if i == 0 { return "edi"; } if i == 1 { return "esi"; } if i == 2 { return "edx"; }
+    if i == 3 { return "ecx"; } if i == 4 { return "r8d"; } return "r9d";
+}
+unsafe fn R16(i: i32) -> String {
+    if i == 0 { return "di"; } if i == 1 { return "si"; } if i == 2 { return "dx"; }
+    if i == 3 { return "cx"; } if i == 4 { return "r8w"; } return "r9w";
+}
+unsafe fn R8(i: i32) -> String {
+    if i == 0 { return "dil"; } if i == 1 { return "sil"; } if i == 2 { return "dl"; }
+    if i == 3 { return "cl"; } if i == 4 { return "r8b"; } return "r9b";
+}
+
+unsafe fn norm(t: *Type) {
+    if t.kind != TY_INT && t.kind != TY_ENUM { return; }
+    if t.size == 1 { if t.sign != 0 { emit("movsx rax, al"); } else { emit("movzx eax, al"); } }
+    else if t.size == 2 { if t.sign != 0 { emit("movsx rax, ax"); } else { emit("movzx eax, ax"); } }
+    else if t.size == 4 { if t.sign != 0 { emit("movsxd rax, eax"); } else { emit("mov eax, eax"); } }
+}
+
+unsafe fn load(t: *Type, m: String) {
+    let a = m as i64;
+    if t.kind == TY_BOOL { emit1("movzx eax, BYTE PTR %s", a); }
+    else if t.kind == TY_PTR || t.kind == TY_STR { emit1("mov rax, QWORD PTR %s", a); }
+    else if t.size == 1 { if t.sign != 0 { emit1("movsx rax, BYTE PTR %s", a); } else { emit1("movzx eax, BYTE PTR %s", a); } }
+    else if t.size == 2 { if t.sign != 0 { emit1("movsx rax, WORD PTR %s", a); } else { emit1("movzx eax, WORD PTR %s", a); } }
+    else if t.size == 4 { if t.sign != 0 { emit1("movsxd rax, DWORD PTR %s", a); } else { emit1("mov eax, DWORD PTR %s", a); } }
+    else { emit1("mov rax, QWORD PTR %s", a); }
+}
+
+unsafe fn store_local(t: *Type, off: i32) {
+    if t.size == 1 { emit1("mov BYTE PTR [rbp-%d], al", off as i64); }
+    else if t.size == 2 { emit1("mov WORD PTR [rbp-%d], ax", off as i64); }
+    else if t.size == 4 { emit1("mov DWORD PTR [rbp-%d], eax", off as i64); }
+    else { emit1("mov QWORD PTR [rbp-%d], rax", off as i64); }
+}
+
+// address in rax, value in rdx
+unsafe fn store_ind(t: *Type) {
+    if t.size == 1 { emit("mov BYTE PTR [rax], dl"); }
+    else if t.size == 2 { emit("mov WORD PTR [rax], dx"); }
+    else if t.size == 4 { emit("mov DWORD PTR [rax], edx"); }
+    else { emit("mov QWORD PTR [rax], rdx"); }
+}
+
+unsafe fn gen_addr(e: *Expr) {
+    let k = e.kind;
+    if k == E_VAR {
+        if e.lv.reg != 0 {
+            if e.lv.is_ref == 0 { printf("internal error: address of a register variable\n", 0, 0, 0); exit(3); }
+            emit1("mov rax, %s", G(e.lv.reg));
+        }
+        else if e.lv.is_global != 0 { emit1("lea rax, [rip+ag_g_%s]", S(e.lv.name)); }
+        else if e.lv.is_ref != 0 { emit1("mov rax, QWORD PTR [rbp-%d]", e.lv.off as i64); }
+        else { emit1("lea rax, [rbp-%d]", e.lv.off as i64); }
+    }
+    else if k == E_INDEX {
+        let bt = e.a.ty;
+        gen_expr(e.a);
+        gpush("rax");
+        gen_expr(e.b);
+        if bt.kind == TY_ARRAY { emit1("cmp rax, %lld", bt.n); emit("jae .Ltrap"); }
+        if bt.kind == TY_STR {
+            // bounds-checked byte of a String (null is empty)
+            gpop("rcx");
+            emit("test rcx, rcx");
+            emit("jz .Ltrap");
+            emit("cmp rax, QWORD PTR [rcx-8]");
+            emit("jae .Ltrap");
+            emit("add rax, rcx");
+            return;
+        }
+        if e.ty.size != 1 { emit1("imul rax, rax, %d", e.ty.size as i64); }
+        gpop("rcx");
+        emit("add rax, rcx");
+    }
+    else if k == E_FIELD {
+        gen_expr(e.a);
+        if e.fld.off != 0 { emit1("add rax, %d", e.fld.off as i64); }
+    }
+    else if k == E_UN { gen_expr(e.a); }
+    else if is_agg(e.ty) { gen_expr(e); }
+    else { fprintf_err("internal error: gen_addr\n"); exit(3); }
+}
+unsafe fn fprintf_err(s: String) { printf("%s", s as i64, 0, 0); }
+
+unsafe fn gen_call(e: *Expr) {
+    if optlvl != 0 && gen_call_opt(e) { return; }
+    let f = e.callee;
+    let n = e.nargs;
+    var ctor = 0;
+    if e.builtin == 3 { ctor = 1; }
+    var hid = 0;
+    if f.is_async == 0 && (is_agg(f.ret) || ctor != 0) { hid = 1; }
+    let tot = n + hid;
+    var sa = 0;
+    if tot > 6 { sa = tot - 6; }
+    if ctor != 0 {
+        // zeroed object, 'this' = its address
+        emit1("lea rdi, [rbp-%d]", e.tmp as i64);
+        emit("xor eax, eax");
+        emit1("mov ecx, %d", f.cls.ty.size as i64);
+        emit("rep stosb");
+    }
+    let pad = (push_cnt + sa) & 1;
+    if pad != 0 { emit("sub rsp, 8"); push_cnt += 1; }
+    var i = n - 1;
+    while i >= 0 {
+        let a = nth_arg(e, i);
+        if i == 0 && f.ifc != null {
+            // interface call: this = object address, target = vtable[slot] (kept in r11)
+            gen_expr(a);
+            emit("mov r10, rax");
+            emit("push QWORD PTR [r10]");
+            push_cnt += 1;
+            emit("mov r11, QWORD PTR [r10+8]");
+            emit1("mov r11, QWORD PTR [r11+%d]", (8 * f.vt_idx) as i64);
+        } else {
+            if a.kind == E_REF { gen_addr(a.a); } else { gen_expr(a); }
+            gpush("rax");
+        }
+        i -= 1;
+    }
+    if hid != 0 { emit1("lea rax, [rbp-%d]", e.tmp as i64); gpush("rax"); }
+    i = 0;
+    var fx = f.is_extern != 0 && is_float(f.ret);
+    var nfp = 0;
+    i = 0;
+    while i < f.nparams {
+        if f.is_extern != 0 && is_float(f.pty[i]) { fx = true; }
+        i += 1;
+    }
+    if fx {
+        // System V: float arguments in xmm0-7, others in rdi.., al = number of vector registers
+        var gp = 0;
+        i = 0;
+        while i < n {
+            if is_float(f.pty[i]) {
+                gpop("rax");
+                to_xmm(nfp, f.pty[i], "rax");
+                nfp += 1;
+            } else {
+                gpop(R64(gp));
+                gp += 1;
+            }
+            i += 1;
+        }
+        emit1("mov eax, %d", nfp as i64);
+    } else {
+        i = 0;
+        while i < tot && i < 6 { gpop(R64(i)); i += 1; }
+        if f.is_extern != 0 { emit("xor eax, eax"); }
+    }
+    xsave();
+    if f.ifc != null { emit("call r11"); }
+    else if f.is_async != 0 { emit1("call ag__spawn_%s", S(mangle(f.name))); }   // starts the task, returns its handle
+    else if f.is_extern != 0 { emit1("call %s", S(f.name)); } else { emit1("call ag_%s", S(mangle(f.name))); }
+    xrestore();
+    if sa + pad != 0 {
+        emit1("add rsp, %d", (8 * (sa + pad)) as i64);
+        push_cnt -= sa + pad;
+    }
+    if f.is_extern != 0 && is_float(f.ret) { from_xmm0(f.ret); }
+    else if f.is_extern != 0 { norm(f.ret); }
+    if ctor != 0 { emit1("lea rax, [rbp-%d]", e.tmp as i64); }
+    if f.is_async != 0 {
+        emit1("mov QWORD PTR [rbp-%d], rax", e.tmp as i64);
+        emit1("lea rax, [rbp-%d]", e.tmp as i64);
+    }
+}
+
+unsafe fn gen_print(e: *Expr) {
+    let a = e.args;
+    let t = a.ty;
+    var fmt: String = "%s";
+    gen_expr(a);
+    if t.kind == TY_STR {
+        emit("mov rsi, rax");
+        emit("lea rcx, [rip+.Lempty]");
+        emit("test rsi, rsi");
+        emit("cmovz rsi, rcx");
+        fmt = "%s";
+    }
+    else if t.kind == TY_BOOL {
+        emit("lea rsi, [rip+.Lfalse]");
+        emit("lea rcx, [rip+.Ltrue]");
+        emit("test rax, rax");
+        emit("cmovne rsi, rcx");
+        fmt = "%s";
+    }
+    else if is_float(t) {
+        to_xmm(0, t, "rax");
+        if t.size == 4 { emit("cvtss2sd xmm0, xmm0"); }
+        fmt = "%.15g";
+    }
+    else if t.is_char != 0 { emit("mov rsi, rax"); fmt = "%c"; }
+    else {
+        emit("mov rsi, rax");
+        if t.sign != 0 { fmt = "%lld"; } else { fmt = "%llu"; }
+    }
+    var buf: [16]u8;
+    var nl: String = "";
+    if e.builtin == 2 { nl = "\n"; }
+    snprintf(&buf[0], 16, "%s%s", fmt as i64, nl as i64, 0);
+    emit1("lea rdi, [rip+.LS%d]", add_str(&buf[0], strlen(&buf[0]) as i32) as i64);
+    let pad = push_cnt & 1;
+    if pad != 0 { emit("sub rsp, 8"); }
+    if is_float(t) { emit("mov eax, 1"); } else { emit("xor eax, eax"); }
+    xsave();
+    emit("call printf");
+    xrestore();
+    if pad != 0 { emit("add rsp, 8"); }
+}
+
+unsafe fn is_unsigned_cmp(t: *Type) -> bool {
+    return (t.kind == TY_INT && t.sign == 0) || t.kind == TY_PTR || t.kind == TY_BOOL;
+}
+
+unsafe fn local_mem(off: i32, m: *u8) {
+    snprintf(m, 32, "[rbp-%d]", off as i64, 0, 0);
+}
+
+// ---- destructors: per-type drop functions, drop flags for locals and temporaries ----
+
+var glue_ty: [1024]*Type;
+var nglue: i32;
+var dl: [4096]*Local;
+var ndl: i32;
+var dscope: [512]i32;
+var ndscope: i32;
+var loop_dl: [64]i32;
+var cur_gstmt: *Stmt;
+var rt_async_text: *u8;   // lib/rt/async.s, appended when the program uses tasks
+var rt_fault_text: *u8;   // lib/rt/fault.s: runtime error messages, appended to every program
+
+// object address in rdi
+unsafe fn call_drop(t: *Type) {
+    let n = tname(t);
+    var found = false;
+    var Ls = -1;
+    if t.kind == TY_STR {
+        // only heap strings need the call: skip null and immortal literals inline
+        Ls = newlbl();
+        emit("mov rax, QWORD PTR [rdi]");
+        emit("test rax, rax");
+        emit1("jz .L%d", Ls as i64);
+        emit("cmp QWORD PTR [rax-16], 0");
+        emit1("jle .L%d", Ls as i64);
+    }
+    var i = 0;
+    while i < nglue {
+        if strcmp(tname(glue_ty[i]), n) == 0 { found = true; }
+        i += 1;
+    }
+    if !found {
+        glue_ty[nglue] = t;
+        nglue += 1;
+    }
+    let pad = push_cnt & 1;
+    if pad != 0 { emit("sub rsp, 8"); }
+    xsave();
+    emit1("call ag__drop_%s", S(mangle(n)));
+    xrestore();
+    if pad != 0 { emit("add rsp, 8"); }
+    if Ls >= 0 { place(Ls); }
+}
+var copy_ty: [1024]*Type;
+var ncopy: i32;
+// object address in rdi: increment the reference counts it holds
+unsafe fn call_copy(t: *Type) {
+    let n = tname(t);
+    var found = false;
+    var i = 0;
+    while i < ncopy {
+        if strcmp(tname(copy_ty[i]), n) == 0 { found = true; }
+        i += 1;
+    }
+    if !found {
+        copy_ty[ncopy] = t;
+        ncopy += 1;
+    }
+    let pad = push_cnt & 1;
+    if pad != 0 { emit("sub rsp, 8"); }
+    xsave();
+    emit1("call ag__copy_%s", S(mangle(n)));
+    xrestore();
+    if pad != 0 { emit("add rsp, 8"); }
+}
+// String pointer in register r: one more owner
+unsafe fn str_retain(r: String) {
+    let L = newlbl();
+    emit2("test %s, %s", S(r as *u8), S(r as *u8));
+    emit1("jz .L%d", L as i64);
+    emit1("cmp QWORD PTR [%s-16], 0", S(r as *u8));
+    emit1("jl .L%d", L as i64);
+    emit1("add QWORD PTR [%s-16], 1", S(r as *u8));
+    place(L);
+}
+unsafe fn drop_local(l: *Local) {
+    let L = newlbl();
+    emit1("cmp BYTE PTR [rbp-%d], 0", l.dflag as i64);
+    emit1("je .L%d", L as i64);
+    emit1("lea rdi, [rbp-%d]", l.off as i64);
+    call_drop(l.ty);
+    place(L);
+}
+unsafe fn drops_from(from: i32) {
+    var i = ndl - 1;
+    while i >= from { drop_local(dl[i]); i -= 1; }
+}
+unsafe fn scope_open() { xscope[ndscope] = nxl; dscope[ndscope] = ndl; ndscope += 1; }
+unsafe fn scope_close() {
+    ndscope -= 1;
+    let b = dscope[ndscope];
+    drops_from(b);
+    ndl = b;
+    nxl = xscope[ndscope];
+}
+unsafe fn reg_local(l: *Local) {
+    emit1("mov BYTE PTR [rbp-%d], 1", l.dflag as i64);
+    dl[ndl] = l;
+    ndl += 1;
+}
+unsafe fn temps_zero(s: *Stmt) {
+    var t = s.temps;
+    while t != null { emit1("mov BYTE PTR [rbp-%d], 0", t.dflag as i64); t = t.tnext; }
+}
+unsafe fn temps_drop(s: *Stmt) {
+    var t = s.temps;
+    while t != null {
+        let L = newlbl();
+        emit1("cmp BYTE PTR [rbp-%d], 0", t.dflag as i64);
+        emit1("je .L%d", L as i64);
+        emit1("mov BYTE PTR [rbp-%d], 0", t.dflag as i64);
+        emit1("lea rdi, [rbp-%d]", t.tmp as i64);
+        call_drop(t.ty);
+        place(L);
+        t = t.tnext;
+    }
+}
+// same, preserving rax
+unsafe fn temps_drop_keep(s: *Stmt) {
+    if s.temps == null { return; }
+    gpush("rax");
+    gpush("rax");
+    temps_drop(s);
+    gpop("rax");
+    gpop("rax");
+}
+
+unsafe fn gen_expr(e: *Expr) {
+    gen_expr0(e);
+    if e.copy != 0 {
+        // a copied place: count the new owner
+        if e.ty.kind == TY_STR { str_retain("rax"); }
+        else {
+            gpush("rax");
+            emit("mov rdi, rax");
+            call_copy(e.ty);
+            gpop("rax");
+        }
+    }
+    if e.dflag != 0 && !is_agg(e.ty) { emit1("mov QWORD PTR [rbp-%d], rax", e.tmp as i64); }   // scalar temporary: kept for its drop
+    if e.dflag != 0 { emit1("mov BYTE PTR [rbp-%d], 1", e.dflag as i64); }   // temporary now alive
+    if e.move != 0 && e.lv.dflag != 0 { emit1("mov BYTE PTR [rbp-%d], 0", e.lv.dflag as i64); }   // moved out: no drop at scope end
+}
+
+unsafe fn gen_expr0(e: *Expr) {
+    let k = e.kind;
+    let nofr = no_froute;   // gen_fexpr fell back to the generic path for this node
+    no_froute = 0;
+    if optlvl != 0 && nofr == 0 && e.ty != null && is_float(e.ty) && fnative(e) && fbase < 7 {
+        gen_fexpr(e, fbase);
+        if e.ty.size == 4 { emit1("movd eax, xmm%d", fbase as i64); } else { emit1("movq rax, xmm%d", fbase as i64); }
+        return;
+    }
+    if optlvl != 0 && k == E_BIN && e.op >= O_EQ && e.op <= O_GE && is_float(e.a.ty) && fbase < 6 { fcmp_value(e); return; }
+    if optlvl != 0 && k == E_CAST && is_float(e.a.ty) && is_intlike(e.ty) && fbase < 7 {
+        // float -> integer
+        gen_fexpr(e.a, fbase);
+        if e.a.ty.size == 8 { emit1("cvttsd2si rax, xmm%d", fbase as i64); } else { emit1("cvttss2si rax, xmm%d", fbase as i64); }
+        norm(e.ty);
+        return;
+    }
+    if k == E_INT && is_float(e.ty) {
+        // integer literal used as a float
+        var tx: [32]u8;
+        snprintf(&tx[0], 32, "%lld", e.ival, 0, 0);
+        var is32 = 0;
+        if e.ty.size == 4 { is32 = 1; }
+        load_fconst(add_fconst(&tx[0], is32), e.ty);
+    }
+    else if k == E_INT || k == E_ENUMVAL || k == E_BOOL {
+        if e.ival == 0 { emit("xor eax, eax"); } else { emit1("mov rax, %lld", e.ival); }
+    }
+    else if k == E_FLOAT {
+        var is32 = 0;
+        if e.ty.size == 4 { is32 = 1; }
+        load_fconst(add_fconst(e.sval, is32), e.ty);
+    }
+    else if k == E_STR { emit1("lea rax, [rip+.LS%d]", add_str(e.sval, e.slen) as i64); }
+    else if k == E_VAR || k == E_INDEX || k == E_FIELD {
+        if k == E_VAR && e.lv.reg != 0 && e.lv.is_ref == 0 { load_var(e.lv); return; }
+        if optlvl != 0 && !is_agg(e.ty) && k != E_VAR {
+            var a: Addr;
+            var am: [96]u8;
+            if lvaddr(e, &a, true) { addr_str(&a, &am[0]); load(e.ty, &am[0] as String); return; }
+        }
+        if k == E_VAR && e.lv.is_ref == 0 && e.lv.is_global == 0 && !is_agg(e.ty) {
+            var m: [32]u8;
+            local_mem(e.lv.off, &m[0]);
+            load(e.ty, &m[0] as String);
+        } else {
+            gen_addr(e);
+            if !is_agg(e.ty) { load(e.ty, "[rax]"); }
+        }
+    }
+    else if k == E_REF { gen_addr(e.a); }
+    else if k == E_SLIT {
+        // fill the temporary field by field
+        var fi = e.args;
+        while fi != null {
+            let f = fi.fld;
+            gen_expr(fi.a);
+            if is_agg(f.ty) {
+                emit("mov rsi, rax");
+                emit1("lea rdi, [rbp-%d]", (e.tmp - f.off) as i64);
+                gen_copy(f.ty.size);
+            } else { store_local(f.ty, e.tmp - f.off); }
+            fi = fi.next;
+        }
+        emit1("lea rax, [rbp-%d]", e.tmp as i64);
+    }
+    else if k == E_CALL {
+        let ib = try_inline(e);
+        if ib != null { inl_depth += 1; gen_expr(ib); inl_depth -= 1; return; }
+        if e.builtin == 1 || e.builtin == 2 { gen_print(e); }
+        else if e.builtin == 6 {
+            let pad = push_cnt & 1;
+            if pad != 0 { emit("sub rsp, 8"); }
+            xsave();
+            emit("call ag__rt_yield");
+            xrestore();
+            if pad != 0 { emit("add rsp, 8"); }
+        }
+        else if e.builtin == 5 {
+            gen_expr(e.args);
+            if has_drop(e.args.ty.elem) {
+                emit("mov rdi, rax");
+                call_drop(e.args.ty.elem);
+            }
+        }
+        else if e.builtin == 7 {
+            // take(p): a raw move
+            gen_expr(e.args);
+            if !is_agg(e.ty) { load(e.ty, "[rax]"); }
+        }
+        else if e.builtin == 8 {
+            // s.len()
+            let L = newlbl();
+            gen_expr(e.args);
+            emit("test rax, rax");
+            emit1("jz .L%d", L as i64);
+            emit("mov rax, QWORD PTR [rax-8]");
+            place(L);
+        }
+        else if e.builtin == 9 {
+            // String for C: never null
+            gen_expr(e.args);
+            emit("test rax, rax");
+            emit("lea rcx, [rip+.Lempty]");
+            emit("cmovz rax, rcx");
+        }
+        else { gen_call(e); }
+    }
+    else if k == E_OK || k == E_ERR {
+        // build tag + payload in the expression's temporary
+        var pt = e.ty.elem;
+        if k == E_ERR { pt = e.ty.err; }
+        if e.a != null {
+            gen_expr(e.a);
+            if is_agg(pt) {
+                emit("mov rsi, rax");
+                emit1("lea rdi, [rbp-%d]", (e.tmp - 8) as i64);
+                gen_copy(pt.size);
+            } else { store_local(pt, e.tmp - 8); }
+        }
+        var tag: i64 = 0;
+        if k == E_ERR { tag = 1; }
+        emit2("mov QWORD PTR [rbp-%d], %d", e.tmp as i64, tag);
+        emit1("lea rax, [rbp-%d]", e.tmp as i64);
+    }
+    else if k == E_AWAIT {
+        let t = e.ty;
+        gen_expr(e.a);
+        emit("mov rdi, QWORD PTR [rax]");
+        emit1("lea rsi, [rbp-%d]", e.tmp as i64);
+        emit1("mov edx, %d", t.size as i64);
+        let pad = push_cnt & 1;
+        if pad != 0 { emit("sub rsp, 8"); }
+        xsave();
+        emit("call ag__rt_await");
+        xrestore();
+        if pad != 0 { emit("add rsp, 8"); }
+        if is_agg(t) { emit1("lea rax, [rbp-%d]", e.tmp as i64); }
+        else if t.kind != TY_VOID {
+            var m: [32]u8;
+            local_mem(e.tmp, &m[0]);
+            load(t, &m[0] as String);
+        }
+    }
+    else if k == E_TOIFACE {
+        gen_expr(e.a);
+        emit1("mov QWORD PTR [rbp-%d], rax", e.tmp as i64);
+        emit1("lea rax, [rip+.Lvt%lld]", e.ival);
+        emit1("mov QWORD PTR [rbp-%d], rax", (e.tmp - 8) as i64);
+        emit1("lea rax, [rbp-%d]", e.tmp as i64);
+    }
+    else if k == E_TRY {
+        // on Err: copy the error into our own return slot as Err(e) and return
+        let t = e.a.ty;
+        let Lok = newlbl();
+        gen_expr(e.a);
+        emit("cmp QWORD PTR [rax], 0");
+        emit1("je .L%d", Lok as i64);
+        emit1("mov rdi, QWORD PTR [rbp-%d]", gcur_fn.retslot as i64);
+        emit("mov QWORD PTR [rdi], 1");
+        emit("lea rsi, [rax+8]");
+        emit("add rdi, 8");
+        emit1("mov ecx, %d", t.err.size as i64);
+        emit("rep movsb");
+        if cur_gstmt != null { temps_drop(cur_gstmt); }
+        drops_from(0);
+        emit1("mov rax, QWORD PTR [rbp-%d]", gcur_fn.retslot as i64);
+        emit1("jmp .L%d", ret_lbl as i64);
+        place(Lok);
+        if t.elem.kind != TY_VOID {
+            if is_agg(t.elem) { emit("add rax, 8"); } else { load(t.elem, "[rax+8]"); }
+        }
+    }
+    else if k == E_UN {
+        let op = e.op;
+        if op == O_NEG {
+            gen_expr(e.a);
+            if is_float(e.ty) {
+                if e.ty.size == 4 { emit("btc eax, 31"); } else { emit("btc rax, 63"); }
+            } else {
+                emit("neg rax");
+                norm(e.ty);
+            }
+        }
+        else if op == O_BNOT { gen_expr(e.a); emit("not rax"); norm(e.ty); }
+        else if op == O_NOT { gen_expr(e.a); emit("xor eax, 1"); }
+        else if op == O_DEREF {
+            if optlvl != 0 && !is_agg(e.ty) {
+                var a: Addr;
+                var am: [96]u8;
+                if lvaddr(e, &a, true) { addr_str(&a, &am[0]); load(e.ty, &am[0] as String); return; }
+            }
+            gen_expr(e.a);
+            if !is_agg(e.ty) { load(e.ty, "[rax]"); }
+        }
+        else if op == O_ADDR { gen_addr(e.a); }
+    }
+    else if k == E_CAST { gen_cast(e); }
+    else if k == E_BIN { gen_bin(e); }
+}
+
+unsafe fn gen_bin(e: *Expr) {
+    let op = e.op;
+    if op == O_LAND || op == O_LOR {
+        let L = newlbl();
+        gen_expr(e.a);
+        emit("test rax, rax");
+        if op == O_LAND { emit1("jz .L%d", L as i64); } else { emit1("jnz .L%d", L as i64); }
+        gen_expr(e.b);
+        place(L);
+        return;
+    }
+    if optlvl != 0 && is_intlike(e.a.ty) && !(e.a.ty.kind == TY_PTR && (op == O_ADD || op == O_SUB)) {
+        var L = e.a;
+        var R = e.b;
+        var rb: [48]u8;
+        var lo: i64 = 0;
+        var hi: i64 = 0;
+        let comm = op == O_ADD || op == O_MUL || op == O_AND || op == O_OR || op == O_XOR || op == O_EQ || op == O_NE;
+        if comm && simple_int(L, &rb[0]) && !simple_int(R, &rb[0]) && !has_call(R) { let t2 = L; L = R; R = t2; }   // constant/variable on the right
+        if comm && !simple_int(R, &rb[0]) {
+            // keep L aside, evaluate R into rax, combine in either order
+            var t = 0;
+            var sr: String = "";
+            var have = false;
+            if !has_call(R) && scr_depth < 4 { sr = SCR(scr_depth); have = true; }
+            else { t = tmp_gp(); if t != 0 { sr = GREG(t); have = true; } }
+            if have {
+                gen_expr(L);
+                emit1("mov %s, rax", sr as i64);
+                if t == 0 { scr_depth += 1; }
+                gen_expr(R);
+                if t == 0 { scr_depth -= 1; } else { gp_busy[t] = 0; }
+                if irange(e, ref lo, ref hi) { nonorm = 1; } else { nonorm = 0; }
+                int_binop(op, e.a.ty, e.ty, sr as *u8, null);
+                return;
+            }
+        }
+        gen_expr(L);
+        gen_rhs(R, &rb[0]);
+        if irange(e, ref lo, ref hi) { nonorm = 1; } else { nonorm = 0; }
+        int_binop(op, e.a.ty, e.ty, &rb[0], R);
+        return;
+    }
+    gen_expr(e.a);
+    gpush("rax");
+    gen_expr(e.b);
+    emit("mov rcx, rax");
+    gpop("rax");
+    let t = e.a.ty;
+    if is_float(t) {
+        var sfx: String = "ss";
+        if t.size == 8 { sfx = "sd"; }
+        to_xmm(0, t, "rax");
+        to_xmm(1, t, "rcx");
+        if op == O_ADD { emit1("add%s xmm0, xmm1", sfx as i64); from_xmm0(t); }
+        else if op == O_SUB { emit1("sub%s xmm0, xmm1", sfx as i64); from_xmm0(t); }
+        else if op == O_MUL { emit1("mul%s xmm0, xmm1", sfx as i64); from_xmm0(t); }
+        else if op == O_DIV { emit1("div%s xmm0, xmm1", sfx as i64); from_xmm0(t); }
+        else {
+            // comparisons are false when either side is NaN (except !=)
+            var uc: String = "ucomiss";
+            if t.size == 8 { uc = "ucomisd"; }
+            if op == O_EQ { emit1("%s xmm0, xmm1", uc as i64); emit("sete al"); emit("setnp cl"); emit("and al, cl"); }
+            else if op == O_NE { emit1("%s xmm0, xmm1", uc as i64); emit("setne al"); emit("setp cl"); emit("or al, cl"); }
+            else if op == O_LT { emit1("%s xmm1, xmm0", uc as i64); emit("seta al"); }
+            else if op == O_LE { emit1("%s xmm1, xmm0", uc as i64); emit("setae al"); }
+            else if op == O_GT { emit1("%s xmm0, xmm1", uc as i64); emit("seta al"); }
+            else { emit1("%s xmm0, xmm1", uc as i64); emit("setae al"); }
+            emit("movzx eax, al");
+        }
+        return;
+    }
+    if t.kind == TY_PTR && (op == O_ADD || op == O_SUB) {
+        var es = t.elem.size;
+        if es == 0 { es = 1; }
+        emit1("imul rcx, rcx, %d", es as i64);
+        if op == O_ADD { emit("add rax, rcx"); } else { emit("sub rax, rcx"); }
+        return;
+    }
+    if op == O_ADD { emit("add rax, rcx"); norm(e.ty); }
+    else if op == O_SUB { emit("sub rax, rcx"); norm(e.ty); }
+    else if op == O_MUL { emit("imul rax, rcx"); norm(e.ty); }
+    else if op == O_DIV || op == O_MOD {
+        if t.sign != 0 { emit("cqo"); emit("idiv rcx"); } else { emit("xor edx, edx"); emit("div rcx"); }
+        if op == O_MOD { emit("mov rax, rdx"); }
+        norm(e.ty);
+    }
+    else if op == O_AND { emit("and rax, rcx"); }
+    else if op == O_OR { emit("or rax, rcx"); }
+    else if op == O_XOR { emit("xor rax, rcx"); }
+    else if op == O_SHL { emit("shl rax, cl"); norm(e.ty); }
+    else if op == O_SHR { if t.sign != 0 { emit("sar rax, cl"); } else { emit("shr rax, cl"); } }
+    else {
+        let u = is_unsigned_cmp(t);
+        var cc: String = "e";
+        if op == O_EQ { cc = "e"; }
+        else if op == O_NE { cc = "ne"; }
+        else if op == O_LT { if u { cc = "b"; } else { cc = "l"; } }
+        else if op == O_LE { if u { cc = "be"; } else { cc = "le"; } }
+        else if op == O_GT { if u { cc = "a"; } else { cc = "g"; } }
+        else if op == O_GE { if u { cc = "ae"; } else { cc = "ge"; } }
+        emit("cmp rax, rcx");
+        emit1("set%s al", cc as i64);
+        emit("movzx eax, al");
+    }
+}
+
+unsafe fn gen_cast(e: *Expr) {
+    let from = e.a.ty;
+    let to = e.ty;
+    gen_expr(e.a);
+    if is_float(from) && is_float(to) {
+        if from.size != to.size {
+            to_xmm(0, from, "rax");
+            if to.size == 8 { emit("cvtss2sd xmm0, xmm0"); } else { emit("cvtsd2ss xmm0, xmm0"); }
+            from_xmm0(to);
+        }
+    } else if is_float(to) {
+        // integer -> float (u64 above 2^63 handled by halving)
+        var cv: String = "cvtsi2ss";
+        if to.size == 8 { cv = "cvtsi2sd"; }
+        if from.size == 8 && from.sign == 0 {
+            let L1 = newlbl();
+            let L2 = newlbl();
+            emit("test rax, rax");
+            emit1("js .L%d", L1 as i64);
+            emit1("%s xmm0, rax", cv as i64);
+            emit1("jmp .L%d", L2 as i64);
+            place(L1);
+            emit("mov rcx, rax");
+            emit("shr rcx, 1");
+            emit("and eax, 1");
+            emit("or rcx, rax");
+            emit1("%s xmm0, rcx", cv as i64);
+            if to.size == 8 { emit("addsd xmm0, xmm0"); } else { emit("addss xmm0, xmm0"); }
+            place(L2);
+        } else { emit1("%s xmm0, rax", cv as i64); }
+        from_xmm0(to);
+    } else if is_float(from) {
+        // float -> integer: truncates toward zero
+        to_xmm(0, from, "rax");
+        if from.size == 8 { emit("cvttsd2si rax, xmm0"); } else { emit("cvttss2si rax, xmm0"); }
+        norm(to);
+    } else { norm(to); }
+}
+
+unsafe fn gen_copy(size: i32) { emit1("mov ecx, %d", size as i64); emit("rep movsb"); }
+
+unsafe fn loop_push(brk: i32, cont: i32) {
+    loop_dl[loop_sp] = ndl;
+    loop_brk[loop_sp] = brk;
+    loop_cont[loop_sp] = cont;
+    loop_sp += 1;
+}
+
+unsafe fn gen_stmt(s: *Stmt) {
+    let prev = cur_gstmt;
+    cur_gstmt = s;
+    if s.kind != S_WHILE { temps_zero(s); }
+    gen_stmt0(s);
+    if s.kind == S_ASSIGN && s.e.kind == E_VAR { facts_kill(s.e.lv); }
+    if s.kind == S_LET { facts_kill(s.lv); }
+    if s.kind == S_LET || s.kind == S_ASSIGN || s.kind == S_EXPR { temps_drop(s); }
+    cur_gstmt = prev;
+}
+
+unsafe fn gen_stmt0(s: *Stmt) {
+    let k = s.kind;
+    if k == S_BLOCK {
+        scope_open();
+        var c = s.list;
+        while c != null { gen_stmt(c); c = c.next; }
+        scope_close();
+    }
+    else if k == S_LET {
+        let l = s.lv;
+        if is_agg(l.ty) {
+            if s.e != null {
+                gen_expr(s.e);
+                emit("mov rsi, rax");
+                emit1("lea rdi, [rbp-%d]", l.off as i64);
+                gen_copy(l.ty.size);
+            } else {
+                emit1("lea rdi, [rbp-%d]", l.off as i64);
+                emit("xor eax, eax");
+                emit1("mov ecx, %d", l.ty.size as i64);
+                emit("rep stosb");
+            }
+        } else {
+            var rb: [48]u8;
+            var r = 0;
+            if optlvl != 0 && l.reg != 0 && l.reg < 8 { r = l.reg; }
+            if r != 0 && (s.e == null || simple_int(s.e, &rb[0])) {
+                if s.e == null || strcmp(&rb[0], "0" as *u8) == 0 { emit2("xor %s, %s", GREG32(r) as i64, GREG32(r) as i64); }
+                else { emit2("mov %s, %s", G(r), &rb[0] as i64); }
+            }
+            else if r != 0 && is_intlike(l.ty) && l.is_ref == 0 { gen_int_to(s.e, r); }
+            else if optlvl != 0 && l.reg >= 8 {
+                if s.e != null { gen_fexpr_to(s.e, l.reg); } else { emit2("pxor xmm%d, xmm%d", l.reg as i64, l.reg as i64); }
+            }
+            else if optlvl != 0 && is_float(l.ty) && s.e != null {
+                gen_fexpr(s.e, 0);
+                if l.ty.size == 4 { emit1("movss DWORD PTR [rbp-%d], xmm0", l.off as i64); } else { emit1("movsd QWORD PTR [rbp-%d], xmm0", l.off as i64); }
+            }
+            else {
+                if s.e != null { gen_expr(s.e); } else { emit("xor eax, eax"); }
+                store_var(l);
+            }
+            xlive(l);
+        }
+        if l.dflag != 0 { reg_local(l); }
+    }
+    else if k == S_ASSIGN {
+        if has_drop(s.e.ty) {
+            // drop the old value (unless moved out / raw pointer write), then move in
+            let x = s.e;
+            let flagged = x.kind == E_VAR && x.lv.dflag != 0;
+            let raw = x.kind == E_UN;
+            gen_expr(s.e2);
+            gpush("rax");
+            gen_addr(x);
+            gpush("rax");
+            if !raw && s.init_store == 0 {
+                var L = 0 - 1;
+                if flagged {
+                    L = newlbl();
+                    emit1("cmp BYTE PTR [rbp-%d], 0", x.lv.dflag as i64);
+                    emit1("je .L%d", L as i64);
+                }
+                emit("mov rdi, QWORD PTR [rsp]");
+                call_drop(x.ty);
+                if L >= 0 { place(L); }
+            }
+            if is_agg(x.ty) {
+                gpop("rdi");
+                gpop("rsi");
+                gen_copy(x.ty.size);
+            } else {
+                // String
+                gpop("rdi");
+                gpop("rax");
+                emit("mov QWORD PTR [rdi], rax");
+            }
+            if flagged { emit1("mov BYTE PTR [rbp-%d], 1", x.lv.dflag as i64); }
+        } else if is_agg(s.e.ty) {
+            gen_expr(s.e2);
+            gpush("rax");
+            gen_addr(s.e);
+            emit("mov rdi, rax");
+            gpop("rsi");
+            gen_copy(s.e.ty.size);
+        } else if optlvl != 0 && gen_assign_opt(s) { }
+        else if s.e.kind == E_VAR && s.e.lv.reg != 0 && s.e.lv.is_ref == 0 { gen_expr(s.e2); store_var(s.e.lv); }
+        else {
+            gen_expr(s.e2);
+            gpush("rax");
+            gen_addr(s.e);
+            gpop("rdx");
+            store_ind(s.e.ty);
+        }
+    }
+    else if k == S_EXPR { gen_expr(s.e); }
+    else if k == S_IF {
+        let Le = newlbl();
+        let Ld = newlbl();
+        if optlvl != 0 && s.temps == null { gen_branch(s.e, Le, false); }
+        else {
+            gen_expr(s.e);
+            temps_drop_keep(s);
+            emit("test rax, rax");
+            emit1("jz .L%d", Le as i64);
+        }
+        gen_stmt(s.body);
+        if s.els != null {
+            emit1("jmp .L%d", Ld as i64);
+            place(Le);
+            gen_stmt(s.els);
+            place(Ld);
+        } else { place(Le); }
+    }
+    else if k == S_WHILE {
+        let Lc = newlbl();
+        let Lb = newlbl();
+        if optlvl != 0 { facts_kill_assigned(s); }
+        if optlvl != 0 && s.temps == null {
+            // jump to the test, body, test at the bottom
+            let Ltop = newlbl();
+            emit1("jmp .L%d", Lc as i64);
+            fprintf(out, "\t.p2align 4,,10\n", 0, 0, 0);
+            place(Ltop);
+            let fmark = nfacts;
+            facts_from(s.e);
+            loop_push(Lb, Lc);
+            gen_stmt(s.body);
+            loop_sp -= 1;
+            nfacts = fmark;
+            place(Lc);
+            gen_branch(s.e, Ltop, true);
+            place(Lb);
+            return;
+        }
+        place(Lc);
+        temps_zero(s);
+        gen_expr(s.e);
+        temps_drop_keep(s);
+        emit("test rax, rax");
+        emit1("jz .L%d", Lb as i64);
+        loop_push(Lb, Lc);
+        gen_stmt(s.body);
+        loop_sp -= 1;
+        emit1("jmp .L%d", Lc as i64);
+        place(Lb);
+    }
+    else if k == S_FOR { gen_for(s); }
+    else if k == S_RET {
+        if s.e != null {
+            gen_expr(s.e);
+            if is_agg(gcur_fn.ret) {
+                emit("mov rsi, rax");
+                emit1("mov rdi, QWORD PTR [rbp-%d]", gcur_fn.retslot as i64);
+                gen_copy(gcur_fn.ret.size);
+                emit1("mov rax, QWORD PTR [rbp-%d]", gcur_fn.retslot as i64);
+            }
+        }
+        if s.temps != null || ndl != 0 {
+            gpush("rax");
+            gpush("rax");
+            temps_drop(s);
+            drops_from(0);
+            gpop("rax");
+            gpop("rax");
+        }
+        emit1("jmp .L%d", ret_lbl as i64);
+    }
+    else if k == S_BRK {
+        drops_from(loop_dl[loop_sp - 1]);
+        emit1("jmp .L%d", loop_brk[loop_sp - 1] as i64);
+    }
+    else if k == S_CONT {
+        drops_from(loop_dl[loop_sp - 1]);
+        emit1("jmp .L%d", loop_cont[loop_sp - 1] as i64);
+    }
+    else if k == S_MATCH {
+        let Lend = newlbl();
+        gen_expr(s.e);
+        emit1("mov QWORD PTR [rbp-%d], rax", s.slot1 as i64);
+        temps_drop(s);
+        if s.e.ty.kind == TY_RESULT {
+            var ra = s.list;
+            while ra != null {
+                let Ln = newlbl();
+                let p = ra.e;
+                scope_open();
+                if p != null {
+                    var er = 0;
+                    if p.name[0] == 'E' { er = 1; }
+                    var pt = s.e.ty.elem;
+                    if er != 0 { pt = s.e.ty.err; }
+                    emit1("mov rax, QWORD PTR [rbp-%d]", s.slot1 as i64);
+                    emit1("cmp QWORD PTR [rax], %d", er as i64);
+                    emit1("jne .L%d", Ln as i64);
+                    let b = ra.lv;
+                    if b != null {
+                        if is_agg(pt) {
+                            emit("lea rsi, [rax+8]");
+                            emit1("lea rdi, [rbp-%d]", b.off as i64);
+                            gen_copy(pt.size);
+                        } else {
+                            load(pt, "[rax+8]");
+                            store_var(b);
+                            xlive(b);
+                        }
+                        if b.dflag != 0 { reg_local(b); }
+                    } else if has_drop(pt) {
+                        // Ok(_) / Err(_): the payload is dropped
+                        emit("lea rdi, [rax+8]");
+                        call_drop(pt);
+                    }
+                } else if has_drop(s.e.ty) {
+                    // '_' arm
+                    emit1("mov rdi, QWORD PTR [rbp-%d]", s.slot1 as i64);
+                    call_drop(s.e.ty);
+                }
+                gen_stmt(ra.body);
+                scope_close();
+                emit1("jmp .L%d", Lend as i64);
+                place(Ln);
+                ra = ra.next;
+            }
+            place(Lend);
+            return;
+        }
+        var arm = s.list;
+        while arm != null {
+            let Ln = newlbl();
+            if arm.e != null {
+                emit1("mov rax, QWORD PTR [rbp-%d]", s.slot1 as i64);
+                emit1("mov rcx, %lld", arm.e.ival);
+                emit("cmp rax, rcx");
+                emit1("jne .L%d", Ln as i64);
+            }
+            gen_stmt(arm.body);
+            emit1("jmp .L%d", Lend as i64);
+            place(Ln);
+            arm = arm.next;
+        }
+        place(Lend);
+    }
+}
+
+unsafe fn gen_for(s: *Stmt) {
+    let Lt = newlbl();
+    let Lc = newlbl();
+    let Lb = newlbl();
+    let v = s.lv;
+    var m: [32]u8;
+    if optlvl != 0 { facts_kill_assigned(s); }
+    if s.is_range != 0 && optlvl != 0 { scope_open(); gen_for_opt(s, Lt, Lc, Lb); scope_close(); return; }
+    if optlvl != 0 { scope_open(); }
+    if s.is_range != 0 {
+        gen_expr(s.e);
+        store_local(v.ty, v.off);
+        gen_expr(s.e2);
+        emit1("mov QWORD PTR [rbp-%d], rax", s.slot1 as i64);
+        place(Lt);
+        local_mem(v.off, &m[0]);
+        load(v.ty, &m[0] as String);
+        emit1("cmp rax, QWORD PTR [rbp-%d]", s.slot1 as i64);
+        if v.ty.sign != 0 { emit1("jge .L%d", Lb as i64); } else { emit1("jae .L%d", Lb as i64); }
+        loop_push(Lb, Lc);
+        gen_stmt(s.body);
+        loop_sp -= 1;
+        place(Lc);
+        load(v.ty, &m[0] as String);
+        emit("add rax, 1");
+        norm(v.ty);
+        store_local(v.ty, v.off);
+        emit1("jmp .L%d", Lt as i64);
+    } else {
+        let at = s.e.ty;
+        emit1("mov QWORD PTR [rbp-%d], 0", s.slot1 as i64);
+        place(Lt);
+        emit1("mov rax, QWORD PTR [rbp-%d]", s.slot1 as i64);
+        emit1("cmp rax, %lld", at.n);
+        emit1("jae .L%d", Lb as i64);
+        gen_expr(s.e);
+        emit1("mov rcx, QWORD PTR [rbp-%d]", s.slot1 as i64);
+        if at.elem.size != 1 { emit1("imul rcx, rcx, %d", at.elem.size as i64); }
+        emit("add rax, rcx");
+        load(at.elem, "[rax]");
+        store_var(v);
+        xlive(v);
+        loop_push(Lb, Lc);
+        gen_stmt(s.body);
+        loop_sp -= 1;
+        place(Lc);
+        emit1("add QWORD PTR [rbp-%d], 1", s.slot1 as i64);
+        emit1("jmp .L%d", Lt as i64);
+    }
+    place(Lb);
+    if optlvl != 0 { scope_close(); }
+}
+
+unsafe fn store_param(sz: i32, off: i32, reg: String, from_stack: bool) {
+    if from_stack { /* value already in rax */ }
+    if sz == 1 { emit2("mov BYTE PTR [rbp-%d], %s", off as i64, reg as i64); }
+    else if sz == 2 { emit2("mov WORD PTR [rbp-%d], %s", off as i64, reg as i64); }
+    else if sz == 4 { emit2("mov DWORD PTR [rbp-%d], %s", off as i64, reg as i64); }
+    else { emit2("mov QWORD PTR [rbp-%d], %s", off as i64, reg as i64); }
+}
+
+unsafe fn gen_func(f: *Func) {
+    if f.is_extern != 0 || f.ifc != null { return; }
+    push_cnt = 0;
+    ret_lbl = newlbl();
+    loop_sp = 0;
+    gcur_fn = f;
+    ndl = 0;
+    ndscope = 0;
+    nxl = 0;
+    nfacts = 0;
+    if optlvl != 0 { opt_analyze(f); } else { nolocs = 0; f_has_xmm = 0; f.nsaved = 0; }
+    let fout = out;
+    var fbuf: *u8 = null;
+    var flen: u64 = 0;
+    if optlvl != 0 { out = open_memstream(&fbuf, &flen); }   // body first: the prologue depends on the registers it used
+    else {
+        fprintf(out, "ag_%s:\n", S(mangle(f.name)), 0, 0);
+        emit("push rbp");
+        emit("mov rbp, rsp");
+        if f.frame != 0 { emit1("sub rsp, %d", f.frame as i64); }
+    }
+    var k = 0;
+    if is_agg(f.ret) { k = 1; }
+    if k != 0 { emit1("mov QWORD PTR [rbp-%d], rdi", f.retslot as i64); }
+    var i = 0;
+    while i < f.nparams {
+        let l = f.plocal[i];
+        let agg = l.is_ref == 0 && is_agg(l.ty);
+        let ri = i + k;
+        var sz = l.ty.size;
+        if l.is_ref != 0 || agg { sz = 8; }
+        var off = l.off;
+        if agg { off = l.tmp; }
+        if l.reg != 0 {
+            // promoted parameter: straight from the argument register
+            if ri < 6 {
+                if l.reg >= 8 {
+                    if sz == 4 { emit2("movd xmm%d, %s", l.reg as i64, R32(ri) as i64); } else { emit2("movq xmm%d, %s", l.reg as i64, R64(ri) as i64); }
+                } else { emit2("mov %s, %s", G(l.reg), R64(ri) as i64); }
+            } else {
+                emit1("mov rax, QWORD PTR [rbp+%d]", (16 + 8 * (ri - 6)) as i64);
+                store_var(l);
+            }
+        }
+        else if ri < 6 {
+            if sz == 1 { store_param(sz, off, R8(ri), false); }
+            else if sz == 2 { store_param(sz, off, R16(ri), false); }
+            else if sz == 4 { store_param(sz, off, R32(ri), false); }
+            else { store_param(sz, off, R64(ri), false); }
+        } else {
+            emit1("mov rax, QWORD PTR [rbp+%d]", (16 + 8 * (ri - 6)) as i64);
+            if sz == 1 { store_param(sz, off, "al", true); }
+            else if sz == 2 { store_param(sz, off, "ax", true); }
+            else if sz == 4 { store_param(sz, off, "eax", true); }
+            else { store_param(sz, off, "rax", true); }
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < f.nparams {
+        let l = f.plocal[i];
+        if l.is_ref == 0 && is_agg(l.ty) {
+            emit1("mov rsi, QWORD PTR [rbp-%d]", l.tmp as i64);
+            emit1("lea rdi, [rbp-%d]", l.off as i64);
+            gen_copy(l.ty.size);
+        }
+        i += 1;
+    }
+    scope_open();
+    var pi = 0;
+    while pi < f.nparams {
+        // by-value parameters are owned by the callee
+        if f.plocal[pi].dflag != 0 { reg_local(f.plocal[pi]); }
+        xlive(f.plocal[pi]);
+        pi += 1;
+    }
+    if f.is_ctor != 0 {
+        // field default values run before the constructor body
+        var fi = 0;
+        while fi < f.cls.nf {
+            let fl = &f.cls.f[fi];
+            if fl.init != null {
+                gen_expr(fl.init);
+                if is_agg(fl.ty) {
+                    emit("mov rsi, rax");
+                    if f.plocal[0].reg != 0 { emit1("mov rdi, %s", G(f.plocal[0].reg)); }
+                    else { emit1("mov rdi, QWORD PTR [rbp-%d]", f.plocal[0].off as i64); }
+                    if fl.off != 0 { emit1("add rdi, %d", fl.off as i64); }
+                    gen_copy(fl.ty.size);
+                } else {
+                    gpush("rax");
+                    load_var(f.plocal[0]);
+                    if fl.off != 0 { emit1("add rax, %d", fl.off as i64); }
+                    gpop("rdx");
+                    store_ind(fl.ty);
+                }
+            }
+            fi += 1;
+        }
+    }
+    gen_stmt(f.body);
+    scope_close();
+    emit("xor eax, eax");
+    place(ret_lbl);
+    if optlvl != 0 {
+        fclose(out);
+        out = fout;
+        f.nsaved = 0;
+        var r = 1;
+        while r <= 5 { if gp_used[r] != 0 { f.saved[f.nsaved] = r; f.nsaved += 1; } r += 1; }
+        var frame = f.frame;
+        if f.nsaved != 0 { frame = (f.frame + 8 * f.nsaved + 15) / 16 * 16; }
+        // no stack frame needed when the body never touches the stack: save registers with push/pop
+        let frameless = f.is_async == 0 && strstr(fbuf, "rbp" as *u8) == null && strstr(fbuf, "rsp" as *u8) == null
+            && strstr(fbuf, "\tpush" as *u8) == null && strstr(fbuf, "\tpop" as *u8) == null;
+        var epi: [256]u8;
+        var ep = 0;
+        fprintf(out, "ag_%s:\n", S(mangle(f.name)), 0, 0);
+        var si = 0;
+        if frameless {
+            let pad = (f.nsaved & 1) == 0;
+            si = 0;
+            while si < f.nsaved { emit1("push %s", G(f.saved[si])); si += 1; }
+            if pad { emit("sub rsp, 8"); }
+            if pad { ep += sprintf(&epi[ep], "\tadd rsp, 8\n", 0, 0, 0, 0); }
+            si = f.nsaved - 1;
+            while si >= 0 { ep += sprintf(&epi[ep], "\tpop %s\n", G(f.saved[si]), 0, 0, 0); si -= 1; }
+            sprintf(&epi[ep], "\tret\n", 0, 0, 0, 0);
+        } else {
+            emit("push rbp");
+            emit("mov rbp, rsp");
+            if frame != 0 { emit1("sub rsp, %d", frame as i64); }
+            si = 0;
+            while si < f.nsaved { emit2("mov QWORD PTR [rbp-%d], %s", (f.frame + 8 * (si + 1)) as i64, G(f.saved[si])); si += 1; }
+            si = 0;
+            while si < f.nsaved { ep += sprintf(&epi[ep], "\tmov %s, QWORD PTR [rbp-%d]\n", G(f.saved[si]), (f.frame + 8 * (si + 1)) as i64, 0, 0); si += 1; }
+            sprintf(&epi[ep], "\tleave\n\tret\n", 0, 0, 0, 0);
+        }
+        if f.nsaved <= 3 { peephole(fbuf, ret_lbl, &epi[0]); } else { peephole(fbuf, ret_lbl, null); }
+        free(fbuf);
+        fprintf(out, "%s", &epi[0] as i64, 0, 0);
+    } else {
+        emit("leave");
+        emit("ret");
+    }
+    if f.is_async != 0 {
+        // spawn stub: same arguments as the function, starts it as a task, returns the task
+        fprintf(out, "ag__spawn_%s:\n", S(mangle(f.name)), 0, 0);
+        emit("push rbp");
+        emit("mov rbp, rsp");
+        emit("sub rsp, 48");
+        var i = 0;
+        while i < 6 { emit2("mov QWORD PTR [rsp+%d], %s", (8 * i) as i64, R64(i) as i64); i += 1; }
+        emit1("lea rdi, [rip+ag_%s]", S(mangle(f.name)));
+        emit("mov rsi, rsp");
+        var rs = f.ret.size;
+        if f.ret.kind == TY_VOID { rs = 0; }
+        emit1("mov edx, %d", rs as i64);
+        var ag: i64 = 0;
+        if is_agg(f.ret) { ag = 1; }
+        emit1("mov ecx, %d", ag);
+        emit("call ag__rt_spawn");
+        emit("leave");
+        emit("ret");
+    }
+}
+
+unsafe fn gen_program(o: *u8) {
+    out = o;
+    fprintf(out, "# generated by aegisc 1.0.0-rc.1 - module %s\n\t.intel_syntax noprefix\n\t.text\n", S(mod_name), 0, 0);
+    var i = 0;
+    while i < nfuncs { gen_func(funcs[i]); i += 1; }
+    var m: *Func = null;
+    i = 0;
+    while i < nfuncs {
+        if strcmp(funcs[i].name, "main" as *u8) == 0 { m = funcs[i]; }
+        i += 1;
+    }
+    fprintf(out, "\t.globl main\nmain:\n", 0, 0, 0);
+    emit("push rbp");
+    emit("mov rbp, rsp");
+    emit("call ag__rt_init");
+    if protect_process != 0 {
+        emit("push rdi");
+        emit("push rsi");
+        emit("mov edi, 4");
+        emit("xor esi, esi");
+        emit("xor edx, edx");
+        emit("xor ecx, ecx");
+        emit("xor r8d, r8d");
+        emit("xor eax, eax");
+        emit("call prctl");
+        emit("pop rsi");
+        emit("pop rdi");
+    }
+    if test_mode != 0 { emit("call ag___aegis_tests"); }   // --test: runs the @test functions
+    else if m.nparams == 1 { emit("call ag___aegis_main"); }   // builds the Vec<String> of arguments, then calls main
+    else {
+        emit("call ag_main");
+        if m.ret.kind == TY_VOID { emit("xor eax, eax"); }
+    }
+    emit("pop rbp");
+    emit("ret");
+    fprintf(out, ".Ltrap:\n\tjmp ag__rt_trap\n", 0, 0, 0);
+    fprintf(out, "%s", S(rt_fault_text), 0, 0);
+    if uses_async != 0 { fprintf(out, "%s", S(rt_async_text), 0, 0); }
+    var gi = 0;
+    while gi < nglue {
+        // drop functions: destructor(s), then fields / elements / payload
+        let t = glue_ty[gi];
+        push_cnt = 0;
+        fprintf(out, "ag__drop_%s:\n", S(mangle(tname(t))), 0, 0);
+        emit("push rbp");
+        emit("mov rbp, rsp");
+        emit("push rbx");
+        emit("push r12");
+        emit("mov rbx, rdi");
+        if t.kind == TY_STRUCT {
+            var c = t.sd;
+            while c != null {
+                if c.dtor != null {
+                    emit("mov rdi, rbx");
+                    emit1("call ag_%s", S(mangle(c.dtor.name)));
+                }
+                c = c.base;
+            }
+            var fi = t.sd.nf - 1;
+            while fi >= 0 {
+                let fl = &t.sd.f[fi];
+                if has_drop(fl.ty) {
+                    emit1("lea rdi, [rbx+%d]", fl.off as i64);
+                    call_drop(fl.ty);
+                }
+                fi -= 1;
+            }
+        } else if t.kind == TY_ARRAY {
+            let L1 = newlbl();
+            let L2 = newlbl();
+            emit("xor r12d, r12d");
+            place(L1);
+            emit1("cmp r12, %lld", t.n);
+            emit1("jae .L%d", L2 as i64);
+            emit("mov rdi, r12");
+            emit1("imul rdi, rdi, %d", t.elem.size as i64);
+            emit("add rdi, rbx");
+            call_drop(t.elem);
+            emit("add r12, 1");
+            emit1("jmp .L%d", L1 as i64);
+            place(L2);
+        } else if t.kind == TY_TASK {
+            // dropping a task waits for it, then destroys its result
+            let Ld = newlbl();
+            emit("mov r12, QWORD PTR [rbx]");
+            emit("test r12, r12");
+            emit1("je .L%d", Ld as i64);
+            emit("mov rdi, r12");
+            emit("call ag__rt_join");
+            if has_drop(t.elem) {
+                emit("lea rdi, [r12+112]");
+                call_drop(t.elem);
+            }
+            emit("mov rdi, r12");
+            emit("call ag__rt_free");
+            place(Ld);
+        } else if t.kind == TY_STR {
+            // release: free at the last owner (null and literals never get here)
+            let Ld = newlbl();
+            emit("mov rax, QWORD PTR [rbx]");
+            emit("sub QWORD PTR [rax-16], 1");
+            emit1("jnz .L%d", Ld as i64);
+            emit("lea rdi, [rax-16]");
+            emit("call free");
+            place(Ld);
+        } else if t.kind == TY_RESULT {
+            let Le = newlbl();
+            let Lx = newlbl();
+            emit("cmp QWORD PTR [rbx], 0");
+            emit1("jne .L%d", Le as i64);
+            if has_drop(t.elem) {
+                emit("lea rdi, [rbx+8]");
+                call_drop(t.elem);
+            }
+            emit1("jmp .L%d", Lx as i64);
+            place(Le);
+            if has_drop(t.err) {
+                emit("lea rdi, [rbx+8]");
+                call_drop(t.err);
+            }
+            place(Lx);
+        }
+        emit("pop r12");
+        emit("pop rbx");
+        emit("pop rbp");
+        emit("ret");
+        gi += 1;
+    }
+    gi = 0;
+    while gi < ncopy {
+        // copy functions: one more owner for every string inside
+        let t = copy_ty[gi];
+        push_cnt = 0;
+        fprintf(out, "ag__copy_%s:\n", S(mangle(tname(t))), 0, 0);
+        emit("push rbp");
+        emit("mov rbp, rsp");
+        emit("push rbx");
+        emit("push r12");
+        emit("mov rbx, rdi");
+        if t.kind == TY_STRUCT {
+            var fi = 0;
+            while fi < t.sd.nf {
+                let fl = &t.sd.f[fi];
+                if has_drop(fl.ty) {
+                    if fl.ty.kind == TY_STR {
+                        emit1("mov rax, QWORD PTR [rbx+%d]", fl.off as i64);
+                        str_retain("rax");
+                    } else {
+                        emit1("lea rdi, [rbx+%d]", fl.off as i64);
+                        call_copy(fl.ty);
+                    }
+                }
+                fi += 1;
+            }
+        } else if t.kind == TY_ARRAY {
+            let L1 = newlbl();
+            let L2 = newlbl();
+            emit("xor r12d, r12d");
+            place(L1);
+            emit1("cmp r12, %lld", t.n);
+            emit1("jae .L%d", L2 as i64);
+            emit("mov rdi, r12");
+            emit1("imul rdi, rdi, %d", t.elem.size as i64);
+            emit("add rdi, rbx");
+            if t.elem.kind == TY_STR {
+                emit("mov rax, QWORD PTR [rdi]");
+                str_retain("rax");
+            } else { call_copy(t.elem); }
+            emit("add r12, 1");
+            emit1("jmp .L%d", L1 as i64);
+            place(L2);
+        } else if t.kind == TY_RESULT {
+            let Le = newlbl();
+            let Lx = newlbl();
+            emit("cmp QWORD PTR [rbx], 0");
+            emit1("jne .L%d", Le as i64);
+            if has_drop(t.elem) {
+                if t.elem.kind == TY_STR {
+                    emit("mov rax, QWORD PTR [rbx+8]");
+                    str_retain("rax");
+                } else {
+                    emit("lea rdi, [rbx+8]");
+                    call_copy(t.elem);
+                }
+            }
+            emit1("jmp .L%d", Lx as i64);
+            place(Le);
+            if has_drop(t.err) {
+                if t.err.kind == TY_STR {
+                    emit("mov rax, QWORD PTR [rbx+8]");
+                    str_retain("rax");
+                } else {
+                    emit("lea rdi, [rbx+8]");
+                    call_copy(t.err);
+                }
+            }
+            place(Lx);
+        }
+        emit("pop r12");
+        emit("pop rbx");
+        emit("pop rbp");
+        emit("ret");
+        gi += 1;
+    }
+    fprintf(out, "\t.data\n", 0, 0, 0);
+    i = 0;
+    while i < nglobals {
+        let g = globals[i];
+        let x = g.init;
+        let sz = g.ty.size;
+        if g.is_const != 0 { }   // constants have no storage
+        else if x == null {
+            // zero-initialised: no space in the binary
+            fprintf(out, "\t.bss\n\t.balign %d\nag_g_%s:\n", g.ty.align as i64, S(g.name), 0);
+            fprintf(out, "\t.zero %d\n\t.data\n", sz as i64, 0, 0);
+        }
+        else {
+        fprintf(out, "\t.balign %d\nag_g_%s:\n", g.ty.align as i64, S(g.name), 0);
+        if x.kind == E_STR { fprintf(out, "\t.quad .LS%d\n", add_str(x.sval, x.slen) as i64, 0, 0); }
+        else if x.kind == E_FLOAT {
+            var is32 = 0;
+            if sz == 4 { is32 = 1; }
+            emit_fbits(x.sval, is32);
+        }
+        else if is_float(g.ty) {
+            var tx: [32]u8;
+            snprintf(&tx[0], 32, "%lld", x.ival, 0, 0);
+            var is32 = 0;
+            if sz == 4 { is32 = 1; }
+            emit_fbits(&tx[0], is32);
+        }
+        else {
+            var dir: String = "quad";
+            if sz == 1 { dir = "byte"; } else if sz == 2 { dir = "short"; } else if sz == 4 { dir = "long"; }
+            fprintf(out, "\t.%s %lld\n", dir as i64, x.ival, 0);
+        }
+        }
+        i += 1;
+    }
+    fprintf(out, "\t.section .rodata\n.Ltrue:\n\t.string \"true\"\n.Lfalse:\n\t.string \"false\"\n.Lempty:\n\t.string \"\"\n", 0, 0, 0);
+    i = 0;
+    while i < nstr {
+        fprintf(out, "\t.balign 8\n\t.quad -1, %d\n.LS%d:\n\t.byte ", str_n[i] as i64, i as i64, 0);
+        var j = 0;
+        while j < str_n[i] {
+            fprintf(out, "%d,", str_d[i][j] as i64, 0, 0);
+            j += 1;
+        }
+        fprintf(out, "0\n", 0, 0, 0);
+        i += 1;
+    }
+    i = 0;
+    while i < nfc {
+        fprintf(out, "\t.balign 8\n.LF%d:\n", i as i64, 0, 0);
+        emit_fbits(fc_text[i], fc_is32[i]);
+        i += 1;
+    }
+    if need_fneg != 0 { fprintf(out, "\t.balign 16\n.Lfneg64:\n\t.quad 0x8000000000000000, 0\n.Lfneg32:\n\t.long 0x80000000, 0, 0, 0\n", 0, 0, 0); }
+    i = 0;
+    while i < nvts {
+        fprintf(out, ".Lvt%d:\n", i as i64, 0, 0);
+        var j = 0;
+        while j < vt_if[i].nm {
+            let mf = find_method(vt_sd[i], after_dot(vt_if[i].m[j].name));
+            fprintf(out, "\t.quad ag_%s\n", S(mangle(mf.name)), 0, 0);
+            j += 1;
+        }
+        i += 1;
+    }
+    fprintf(out, "\t.section .aegis.caps,\"\",@progbits\n\t.asciz \"module=%s;allow=", S(mod_name), 0, 0);
+    i = 0;
+    while i < nallow {
+        if i != 0 { fprintf(out, ",", 0, 0, 0); }
+        fprintf(out, "%s", S(allow_caps[i]), 0, 0);
+        i += 1;
+    }
+    fprintf(out, ";deny=", 0, 0, 0);
+    i = 0;
+    while i < ndeny {
+        if i != 0 { fprintf(out, ",", 0, 0, 0); }
+        fprintf(out, "%s", S(deny_caps[i]), 0, 0);
+        i += 1;
+    }
+    var pp: String = "";
+    if protect_process != 0 { pp = "Process"; }
+    fprintf(out, ";protect=%s\"\n\t.section .note.GNU-stack,\"\",@progbits\n", pp as i64, 0, 0);
+}

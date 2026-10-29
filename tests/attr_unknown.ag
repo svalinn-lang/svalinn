@@ -1,0 +1,4 @@
+module A;
+@inline
+fn f() {}
+fn main() -> i32 { return 0; }

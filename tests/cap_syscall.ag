@@ -1,0 +1,1 @@
+module A; allow Native; extern fn syscall(n: i64, a: i64, b: i64) -> i64; fn main() -> i32 { unsafe { syscall(101, 0, 0); } return 0; }

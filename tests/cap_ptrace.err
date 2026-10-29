@@ -1,0 +1,3 @@
+tests/cap_ptrace.ag:1:112: error: calling 'ptrace' requires capability 'Process.Debug' (add 'allow Process.Debug;' to the module)
+    1 | module A; allow Native; extern fn ptrace(r: i64, pid: i32, a: i64, d: i64) -> i64; fn main() -> i32 { unsafe { ptrace(16, 1, 0, 0); } return 0; }
+      |                                                                                                                ^

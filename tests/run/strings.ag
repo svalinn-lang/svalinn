@@ -1,0 +1,41 @@
+module S;
+allow Console;
+
+fn greet(name: String) -> String { return "Hello, " + name + "!"; }
+
+fn main() -> i32 {
+    let a = "abc";
+    let b = a + "def";
+    println(b);
+    println(b.len());
+    println(greet("Aegis"));
+    var s = "";
+    for i in 0..5 { s = s + i + ","; }
+    println(s);
+    println("x=" + 42 + " y=" + 2.5 + " ok=" + true + " c=" + 'z');
+    println(str(-17) + str(3.25));
+    if b == "abcdef" { println("eq"); }
+    if "abc" < "abd" { println("lt"); }
+    println(b[3]);
+    println(b.slice(1, 4));
+    println(b.find("cd"));
+    println(b.contains("zz"));
+    println("  pad  ".trim() + "|");
+    println("Hello".to_upper());
+    println("a-b-c".replace("-", "+"));
+    println("ab".repeat(3));
+    match "123".parse_int() { Ok(v) => { println(v + 1); } Err(e) => { println("bad"); } }
+    match "12x".parse_int() { Ok(v) => { println(v); } Err(e) => { println("bad int"); } }
+    match "2.5e3".parse_float() { Ok(v) => { println(v); } Err(e) => { println("bad"); } }
+    var n = 0;
+    for c in "hello" { if c == 'l' { n += 1; } }
+    println(n);
+    var names: [3]String;
+    names[0] = "x"; names[1] = names[0] + "y"; names[2] = names[1] + "z";
+    for nm in names { print(nm); print(" "); }
+    println("");
+    let empty: String = null;
+    println(empty.len());
+    println(empty == "");
+    return 0;
+}

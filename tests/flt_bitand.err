@@ -1,0 +1,3 @@
+tests/flt_bitand.ag:1:42: error: '&' is not supported for floating point
+    1 | module A; fn main() -> i32 { let x = 1.5 & 2.5; return 0; }
+      |                                          ^

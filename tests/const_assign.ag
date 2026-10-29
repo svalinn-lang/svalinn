@@ -1,0 +1,4 @@
+module T;
+allow Console;
+const N = 3;
+fn main() -> i32 { N = 4; println(N); return 0; }

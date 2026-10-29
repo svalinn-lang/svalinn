@@ -1,0 +1,80 @@
+// std.console - reading standard input (needs `allow Console.Read;`, which `allow Console;` includes)
+// and writing to standard error (needs `allow Console;`, like print).
+module std.console;
+
+import std.error;
+
+extern fn read(fd: i32, buf: *u8, n: u64) -> i64;
+extern fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern fn fflush(f: *u8) -> i32;
+extern fn malloc(n: u64) -> *u8;
+extern fn realloc(p: *u8, n: u64) -> *u8;
+extern fn free(p: *u8);
+
+var rt_in_buf: [4096]u8;
+var rt_in_pos: i64;
+var rt_in_len: i64;
+var rt_in_eof: bool;
+
+// next byte of standard input, or -1 at the end
+fn rt_in_byte() -> i32 {
+    if rt_in_pos == rt_in_len {
+        if rt_in_eof { return -1; }
+        unsafe {
+            fflush(null);   // a prompt printed without a newline shows up before we wait
+            let n = read(0, &rt_in_buf[0], 4096);
+            if n <= 0 { rt_in_eof = true; return -1; }
+            rt_in_len = n;
+        }
+        rt_in_pos = 0;
+    }
+    let c = rt_in_buf[rt_in_pos];
+    rt_in_pos += 1;
+    return c as i32;
+}
+
+// the next line of standard input without its line break; Err(EndOfFile) when the input has ended
+fn read_line() -> Result<String, IOError> requires Console.Read {
+    var c = rt_in_byte();
+    if c < 0 { return Err(IOError.EndOfFile); }
+    unsafe {
+        var cap: i64 = 128;
+        var n: i64 = 0;
+        var buf = malloc(cap as u64);
+        while c >= 0 && c != 10 {
+            if n == cap {
+                cap = cap * 2;
+                buf = realloc(buf, cap as u64);
+            }
+            *(buf + n) = c as u8;
+            n += 1;
+            c = rt_in_byte();
+        }
+        if n > 0 && *(buf + n - 1) == 13 { n -= 1; }
+        let s = rt_str_from_buf(buf, n);
+        free(buf);
+        return Ok(s);
+    }
+}
+
+// all of the remaining standard input
+fn read_all_input() -> String requires Console.Read {
+    var out = "";
+    while true {
+        match read_line() {
+            Ok(line) => { out = out + line + "\n"; }
+            Err(e) => { break; }
+        }
+    }
+    return out;
+}
+
+// writes to standard error
+fn eprint(s: String) requires Console {
+    unsafe {
+        fflush(null);
+        let n = s.len();
+        if n > 0 { write(2, s as *u8, n as u64); }
+    }
+}
+fn eprintln(s: String) requires Console { eprint(s + "\n"); }

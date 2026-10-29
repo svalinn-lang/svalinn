@@ -1,0 +1,19 @@
+module Ffi;
+allow Console;
+allow Native;
+
+extern fn putchar(c: i32) -> i32;
+extern fn strlen(s: *u8) -> u64;
+
+unsafe fn poke(p: *i32) { *p = 42; }
+
+fn main() -> i32 {
+    var x: i32 = 1;
+    unsafe {
+        poke(&x);
+        putchar(72); putchar(105); putchar(10);
+        println(strlen("aegis" as *u8));
+    }
+    println(x);
+    return 0;
+}

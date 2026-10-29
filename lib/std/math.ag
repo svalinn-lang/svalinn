@@ -1,0 +1,38 @@
+// std.math - floating-point functions (libm). They are safe: no capability or unsafe block is needed.
+module std.math;
+
+safe extern fn sqrt(x: f64) -> f64;
+safe extern fn sin(x: f64) -> f64;
+safe extern fn cos(x: f64) -> f64;
+safe extern fn tan(x: f64) -> f64;
+safe extern fn atan2(y: f64, x: f64) -> f64;
+safe extern fn pow(x: f64, y: f64) -> f64;
+safe extern fn exp(x: f64) -> f64;
+safe extern fn log(x: f64) -> f64;
+safe extern fn floor(x: f64) -> f64;
+safe extern fn ceil(x: f64) -> f64;
+safe extern fn fabs(x: f64) -> f64;
+safe extern fn fmod(x: f64, y: f64) -> f64;
+safe extern fn round(x: f64) -> f64;
+
+let PI: f64 = 3.141592653589793;
+let E: f64 = 2.718281828459045;
+
+class Math {
+    public static:
+        fn sqrt(x: f64) -> f64 { unsafe { return sqrt(x); } }
+        fn sin(x: f64) -> f64 { unsafe { return sin(x); } }
+        fn cos(x: f64) -> f64 { unsafe { return cos(x); } }
+        fn tan(x: f64) -> f64 { unsafe { return tan(x); } }
+        fn atan2(y: f64, x: f64) -> f64 { unsafe { return atan2(y, x); } }
+        fn pow(x: f64, y: f64) -> f64 { unsafe { return pow(x, y); } }
+        fn exp(x: f64) -> f64 { unsafe { return exp(x); } }
+        fn log(x: f64) -> f64 { unsafe { return log(x); } }
+        fn floor(x: f64) -> f64 { unsafe { return floor(x); } }
+        fn ceil(x: f64) -> f64 { unsafe { return ceil(x); } }
+        fn abs(x: f64) -> f64 { unsafe { return fabs(x); } }
+        fn fmod(x: f64, y: f64) -> f64 { unsafe { return fmod(x, y); } }
+        fn round(x: f64) -> f64 { unsafe { return round(x); } }
+        fn min(a: f64, b: f64) -> f64 { if a < b { return a; } return b; }
+        fn max(a: f64, b: f64) -> f64 { if a > b { return a; } return b; }
+}

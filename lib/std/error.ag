@@ -1,0 +1,32 @@
+// std.error - the error type of the input/output modules (std.fs, std.console, std.env, std.process).
+module std.error;
+
+enum IOError { NotFound, PermissionDenied, AlreadyExists, IsDirectory, InvalidInput, EndOfFile, Closed, Other }
+
+extern fn __errno_location() -> *i32;
+
+// a short description, e.g. for error messages
+fn io_error_text(e: IOError) -> String {
+    match e {
+        IOError.NotFound => { return "not found"; }
+        IOError.PermissionDenied => { return "permission denied"; }
+        IOError.AlreadyExists => { return "already exists"; }
+        IOError.IsDirectory => { return "is a directory"; }
+        IOError.InvalidInput => { return "invalid input"; }
+        IOError.EndOfFile => { return "end of file"; }
+        IOError.Closed => { return "closed"; }
+        _ => { return "input/output error"; }
+    }
+}
+
+// the error of the last failed C library call (errno)
+fn last_io_error() -> IOError {
+    var code: i32 = 0;
+    unsafe { code = *__errno_location(); }
+    if code == 2 { return IOError.NotFound; }
+    if code == 1 || code == 13 { return IOError.PermissionDenied; }
+    if code == 17 { return IOError.AlreadyExists; }
+    if code == 21 { return IOError.IsDirectory; }
+    if code == 22 { return IOError.InvalidInput; }
+    return IOError.Other;
+}

@@ -1,0 +1,313 @@
+// AST dump: identical output to `aegisc --dump-ast` / `--dump-sema`.
+module Dump;
+
+import std.sys;
+import std.mem;
+import types;
+import ast;
+
+var dump_typed: i32;
+
+unsafe fn ps(s: String) { printf("%s", s as i64, 0, 0); }
+unsafe fn pn(v: i64) { printf("%lld", v, 0, 0); }
+
+unsafe fn opname(op: i32) -> String {
+    if op == O_ADD { return "+"; }
+    if op == O_SUB { return "-"; }
+    if op == O_MUL { return "*"; }
+    if op == O_DIV { return "/"; }
+    if op == O_MOD { return "%"; }
+    if op == O_AND { return "&"; }
+    if op == O_OR { return "|"; }
+    if op == O_XOR { return "^"; }
+    if op == O_SHL { return "<<"; }
+    if op == O_SHR { return ">>"; }
+    if op == O_EQ { return "=="; }
+    if op == O_NE { return "!="; }
+    if op == O_LT { return "<"; }
+    if op == O_LE { return "<="; }
+    if op == O_GT { return ">"; }
+    if op == O_GE { return ">="; }
+    if op == O_LAND { return "&&"; }
+    if op == O_LOR { return "||"; }
+    if op == O_NEG { return "neg"; }
+    if op == O_NOT { return "!"; }
+    if op == O_BNOT { return "~"; }
+    if op == O_DEREF { return "deref"; }
+    return "addr";
+}
+
+unsafe fn tn(t: *Type) { printf("%s", tname(t) as i64, 0, 0); }
+
+unsafe fn d_ty(e: *Expr) {
+    if dump_typed != 0 {
+        ps(" :");
+        if e.ty != null { tn(e.ty); } else { ps("?"); }
+    }
+}
+
+unsafe fn d_expr(e: *Expr) {
+    let k = e.kind;
+    if k == E_INT {
+        if e.ty == ty_char && dump_typed == 0 { ps("(char "); pn(e.ival); ps(")"); }
+        else if dump_typed != 0 && e.cls == 1 { ps("(char "); pn(e.ival); d_ty(e); ps(")"); }
+        else if dump_typed != 0 && e.cls == 2 { ps("(null"); d_ty(e); ps(")"); }
+        else if e.cls == 2 { ps("(null)"); }
+        else if e.cls == 1 { ps("(char "); pn(e.ival); ps(")"); }
+        else { ps("(int "); pn(e.ival); d_ty(e); ps(")"); }
+    }
+    else if k == E_BOOL { ps("(bool "); pn(e.ival); d_ty(e); ps(")"); }
+    else if k == E_FLOAT { ps("(float "); ps(e.sval as String); d_ty(e); ps(")"); }
+    else if k == E_STR {
+        ps("(str \"");
+        var i = 0;
+        while i < e.slen {
+            let c = e.sval[i] as i64;
+            if c >= 32 && c < 127 && c != 34 && c != 92 { printf("%c", c, 0, 0); }
+            else { printf("\\x%02x", c, 0, 0); }
+            i += 1;
+        }
+        ps("\"");
+        d_ty(e);
+        ps(")");
+    }
+    else if k == E_VAR {
+        ps("(var ");
+        ps(e.name as String);
+        if dump_typed != 0 && e.lv != null {
+            if e.lv.is_global != 0 { ps(" @g"); }
+            else {
+                var c: i64 = 108;
+                if e.lv.is_ref != 0 { c = 114; }
+                printf(" @%c%d", c, e.lv.off as i64, 0);
+            }
+        }
+        if dump_typed != 0 && e.move != 0 { ps(" mv"); }
+        if dump_typed != 0 && e.copy != 0 { ps(" cp"); }
+        d_ty(e);
+        ps(")");
+    }
+    else if k == E_CALL {
+        ps("(call ");
+        ps(e.name as String);
+        if dump_typed != 0 {
+            if e.builtin != 0 { printf(" b%d", e.builtin as i64, 0, 0); }
+            if e.tmp != 0 { printf(" t%d", e.tmp as i64, 0, 0); }
+            if e.dflag != 0 { printf(" f%d", e.dflag as i64, 0, 0); }
+        }
+        var a = e.args;
+        while a != null { ps(" "); d_expr(a); a = a.next; }
+        d_ty(e);
+        ps(")");
+    }
+    else if k == E_BIN { ps("("); ps(opname(e.op)); ps(" "); d_expr(e.a); ps(" "); d_expr(e.b); d_ty(e); ps(")"); }
+    else if k == E_UN { ps("("); ps(opname(e.op)); ps(" "); d_expr(e.a); d_ty(e); ps(")"); }
+    else if k == E_CAST { ps("(as "); d_expr(e.a); ps(" "); tn(e.cty); d_ty(e); ps(")"); }
+    else if k == E_INDEX { ps("(index "); d_expr(e.a); ps(" "); d_expr(e.b); d_ty(e); ps(")"); }
+    else if k == E_FIELD {
+        ps("(. "); d_expr(e.a); ps(" "); ps(e.name as String);
+        if dump_typed != 0 && e.fld != null { printf(" +%d", e.fld.off as i64, 0, 0); }
+        d_ty(e);
+        ps(")");
+    }
+    else if k == E_REF { ps("(ref "); d_expr(e.a); d_ty(e); ps(")"); }
+    else if k == E_MCALL {
+        ps("(mcall ");
+        d_expr(e.a);
+        ps(" ");
+        ps(e.name as String);
+        var a = e.args;
+        while a != null { ps(" "); d_expr(a); a = a.next; }
+        ps(")");
+    }
+    else if k == E_OK || k == E_ERR {
+        if k == E_OK { ps("(ok"); } else { ps("(err"); }
+        if e.a != null { ps(" "); d_expr(e.a); }
+        if dump_typed != 0 && e.tmp != 0 { printf(" t%d", e.tmp as i64, 0, 0); }
+        if dump_typed != 0 && e.dflag != 0 { printf(" f%d", e.dflag as i64, 0, 0); }
+        d_ty(e);
+        ps(")");
+    }
+    else if k == E_TRY { ps("(try "); d_expr(e.a); d_ty(e); ps(")"); }
+    else if k == E_AWAIT {
+        ps("(await ");
+        d_expr(e.a);
+        if dump_typed != 0 && e.tmp != 0 { printf(" t%d", e.tmp as i64, 0, 0); }
+        if dump_typed != 0 && e.dflag != 0 { printf(" f%d", e.dflag as i64, 0, 0); }
+        d_ty(e);
+        ps(")");
+    }
+    else if k == E_TOIFACE {
+        ps("(toiface ");
+        d_expr(e.a);
+        printf(" vt%lld", e.ival, 0, 0);
+        if dump_typed != 0 && e.tmp != 0 { printf(" t%d", e.tmp as i64, 0, 0); }
+        d_ty(e);
+        ps(")");
+    }
+    else if k == E_SIZEOF { ps("(sizeof "); tn(e.cty); ps(")"); }
+    else if k == E_ENUMVAL {
+        ps("(enumval "); ps(e.a.name as String); ps("."); ps(e.name as String); ps(" "); pn(e.ival); d_ty(e); ps(")");
+    }
+    else if k == E_SLIT {
+        ps("(slit "); ps(e.name as String);
+        var fi = e.args;
+        while fi != null { ps(" (init "); ps(fi.name as String); ps(" "); d_expr(fi.a); ps(")"); fi = fi.next; }
+        if dump_typed != 0 && e.tmp != 0 { printf(" t%d", e.tmp as i64, 0, 0); }
+        if dump_typed != 0 && e.dflag != 0 { printf(" f%d", e.dflag as i64, 0, 0); }
+        d_ty(e);
+        ps(")");
+    }
+    else { ps("(?)"); }
+}
+
+unsafe fn d_expr_opt(e: *Expr) { if e != null { d_expr(e); } else { ps("_"); } }
+
+unsafe fn d_stmt(s: *Stmt) {
+    let k = s.kind;
+    if k == S_LET {
+        ps("(let "); ps(s.name as String);
+        if s.is_mut != 0 { ps(" var "); } else { ps(" let "); }
+        if s.dty != null { tn(s.dty); } else { ps("_"); }
+        ps(" ");
+        d_expr_opt(s.e);
+        if dump_typed != 0 && s.lv != null { printf(" @%d", s.lv.off as i64, 0, 0); }
+        if dump_typed != 0 && s.lv != null && s.lv.dflag != 0 { printf(" d%d", s.lv.dflag as i64, 0, 0); }
+        ps(")");
+    }
+    else if k == S_ASSIGN { ps("(assign "); d_expr(s.e); ps(" "); d_expr(s.e2); ps(")"); }
+    else if k == S_EXPR { ps("(expr "); d_expr(s.e); ps(")"); }
+    else if k == S_IF {
+        ps("(if "); d_expr(s.e); ps(" "); d_stmt(s.body); ps(" ");
+        if s.els != null { d_stmt(s.els); } else { ps("_"); }
+        ps(")");
+    }
+    else if k == S_WHILE { ps("(while "); d_expr(s.e); ps(" "); d_stmt(s.body); ps(")"); }
+    else if k == S_FOR {
+        ps("(for "); ps(s.name as String); ps(" "); d_expr(s.e); ps(" ");
+        if s.is_range != 0 { d_expr(s.e2); } else { ps("_"); }
+        ps(" "); d_stmt(s.body);
+        if dump_typed != 0 && s.lv != null { printf(" @%d @%d", s.lv.off as i64, s.slot1 as i64, 0); }
+        ps(")");
+    }
+    else if k == S_RET { ps("(return "); d_expr_opt(s.e); ps(")"); }
+    else if k == S_BRK { ps("(break)"); }
+    else if k == S_CONT { ps("(continue)"); }
+    else if k == S_BLOCK {
+        if s.unsafe_blk != 0 { ps("(unsafe"); } else { ps("(block"); }
+        var c = s.list;
+        while c != null { ps(" "); d_stmt(c); c = c.next; }
+        ps(")");
+    }
+    else if k == S_MATCH {
+        ps("(match "); d_expr(s.e);
+        if dump_typed != 0 { printf(" @%d", s.slot1 as i64, 0, 0); }
+        var c = s.list;
+        while c != null {
+            ps(" (arm ");
+            d_expr_opt(c.e);
+            if dump_typed != 0 && c.lv != null { printf(" @%d", c.lv.off as i64, 0, 0); }
+            ps(" ");
+            d_stmt(c.body);
+            ps(")");
+            c = c.next;
+        }
+        ps(")");
+    }
+}
+
+unsafe fn dump_ast() {
+    printf("(module %s)\n", mod_name as i64, 0, 0);
+    var i = 0;
+    while i < nallow { printf("(allow %s)\n", allow_caps[i] as i64, 0, 0); i += 1; }
+    i = 0;
+    while i < ndeny { printf("(deny %s)\n", deny_caps[i] as i64, 0, 0); i += 1; }
+    if protect_process != 0 { ps("(protect)\n"); }
+    i = 0;
+    while i < nstructs {
+        let sd = structs[i];
+        if sd.is_class != 0 { printf("(class %s", sd.name as i64, 0, 0); } else { printf("(struct %s", sd.name as i64, 0, 0); }
+        if sd.base != null { printf(" extends %s", sd.base.name as i64, 0, 0); }
+        var ii = 0;
+        while ii < sd.nifs { printf(" implements %s", sd.ifs[ii].name as i64, 0, 0); ii += 1; }
+        var j = 0;
+        while j < sd.nf {
+            printf(" (field %s ", sd.f[j].name as i64, 0, 0);
+            tn(sd.f[j].ty);
+            if sd.is_class != 0 {
+                ps(" ");
+                ps(vis_name(sd.f[j].vis));
+                if sd.f[j].is_mut != 0 { ps(" var"); } else { ps(" let"); }
+                if sd.f[j].init != null { ps(" "); d_expr(sd.f[j].init); }
+            }
+            if dump_typed != 0 { printf(" +%d", sd.f[j].off as i64, 0, 0); }
+            ps(")");
+            j += 1;
+        }
+        if dump_typed != 0 { printf(" size=%d align=%d", sd.ty.size as i64, sd.ty.align as i64, 0); }
+        ps(")\n");
+        i += 1;
+    }
+    i = 0;
+    while i < nifaces { printf("(interface %s)\n", ifaces[i].name as i64, 0, 0); i += 1; }
+    i = 0;
+    while i < nenums {
+        printf("(enum %s", enums[i].name as i64, 0, 0);
+        var j = 0;
+        while j < enums[i].nv { printf(" %s", enums[i].vn[j] as i64, 0, 0); j += 1; }
+        ps(")\n");
+        i += 1;
+    }
+    i = 0;
+    while i < nglobals {
+        let g = globals[i];
+        printf("(global %s ", g.name as i64, 0, 0);
+        if g.is_const != 0 { ps("const "); } else if g.is_mut != 0 { ps("var "); } else { ps("let "); }
+        if g.ty != null { tn(g.ty); } else { ps("_"); }
+        ps(" ");
+        d_expr_opt(g.init);
+        ps(")\n");
+        i += 1;
+    }
+    i = 0;
+    while i < nfuncs {
+        let f = funcs[i];
+        printf("(fn %s ", f.name as i64, 0, 0);
+        if f.is_extern != 0 { ps("extern"); } else if f.is_unsafe != 0 { ps("unsafe"); } else { ps("safe"); }
+        if f.is_async != 0 { ps(" async"); }
+        if f.is_test != 0 { ps(" test"); }
+        if f.is_deprecated != 0 { ps(" deprecated"); }
+        if f.ifc != null { ps(" abstract"); }
+        if f.cls != null {
+            ps(" ");
+            if f.is_ctor != 0 { ps("ctor"); } else if f.is_dtor != 0 { ps("dtor"); } else if f.is_static != 0 { ps("static"); } else { ps("method"); }
+            ps(" ");
+            ps(vis_name(f.vis));
+        }
+        ps(" (");
+        var j = 0;
+        while j < f.nparams {
+            printf(" (param %s ", f.pname[j] as i64, 0, 0);
+            if f.pref[j] != 0 { ps("ref "); } else { ps("val "); }
+            tn(f.pty[j]);
+            if dump_typed != 0 && f.plocal[j] != null {
+                printf(" @%d", f.plocal[j].off as i64, 0, 0);
+                if f.plocal[j].tmp != 0 { printf(" t%d", f.plocal[j].tmp as i64, 0, 0); }
+            }
+            ps(")");
+            j += 1;
+        }
+        ps(") ");
+        tn(f.ret);
+        ps(" ");
+        var rq = 0;
+        while rq < f.nreq {
+            printf("(requires %s) ", f.req[rq] as i64, 0, 0);
+            rq += 1;
+        }
+        if f.body != null { d_stmt(f.body); } else { ps("_"); }
+        if dump_typed != 0 && f.is_extern == 0 && f.ifc == null { printf(" frame=%d retslot=%d", f.frame as i64, f.retslot as i64, 0); }
+        ps(")\n");
+        i += 1;
+    }
+}

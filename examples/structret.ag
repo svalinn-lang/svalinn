@@ -1,0 +1,37 @@
+module StructRet;
+allow Console;
+allow Native;
+
+import std.mem;
+
+struct Pair { a: i32; b: i32; }
+
+fn make_pair(a: i32, b: i32) -> Pair {
+    var p: Pair;
+    p.a = a;
+    p.b = b;
+    return p;
+}
+fn swap(p: Pair) -> Pair { return make_pair(p.b, p.a); }
+
+fn main() -> i32 {
+    var p = make_pair(1, 2);
+    println(p.a * 10 + p.b);                  // 12
+    p = swap(p);
+    println(p.a * 10 + p.b);                  // 21
+    println(make_pair(7, 9).b);               // 9
+    println(swap(swap(make_pair(5, 6))).a);   // 5
+
+    unsafe {
+        var sb: StrBuf;
+        sb_init(ref sb);
+        for i in 0..40 { sb_push(ref sb, 'a' + (i % 26) as u8); }
+        println(sb.data as String);
+        println(sb.len);
+        let s = slice(sb.data + 3, 5);
+        println(s.len);
+        println(s.ptr[0]);                    // 100 = 'd'
+        sb_free(ref sb);
+    }
+    return 0;
+}

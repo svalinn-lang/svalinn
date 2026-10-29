@@ -1,0 +1,1 @@
+module A; interface S { fn area() -> i64; } class R { public: var x: i32; } fn big<T: S>(a: T) -> i64 { return a.area(); } fn main() -> i32 { let r = R(); big(r); return 0; }

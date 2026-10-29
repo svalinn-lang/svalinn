@@ -1,0 +1,58 @@
+-- scope
+open 1
+open 2
+close 2
+close 1
+-- temp
+open 3
+3
+close 3
+-- move into fn
+open 4
+took 4
+close 4
+-- passthrough
+open 5
+5
+-- reassign
+open 6
+open 7
+close 6
+-- loop
+open 10
+close 10
+open 11
+close 11
+open 12
+close 12
+-- result
+open 50
+50
+close 50
+open 50
+close 50
+ignored
+open 50
+close 50
+51
+7
+-- early return
+open 60
+open 61
+close 61
+close 60
+1
+open 60
+open 62
+close 62
+close 60
+0
+-- fields
+open 20
+open 21
+pair dtor
+close 21
+close 20
+-- end
+close 7
+close 5

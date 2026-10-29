@@ -1,0 +1,1 @@
+module A; class R { public: var x: i32; dtor { } } fn main() -> i32 { let a = R(); let b = a; let c = a.x; return 0; }

@@ -1,0 +1,1 @@
+module A; class Box<T> { public: var v: T; } fn main() -> i32 { let b: Box; return 0; }

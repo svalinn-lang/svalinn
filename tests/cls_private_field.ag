@@ -1,0 +1,1 @@
+module A; allow Console; class P { private: var hp: i32; public: ctor() { this.hp = 1; } } fn main() -> i32 { let p = P(); println(p.hp); return 0; }

@@ -1,0 +1,27 @@
+module Fs1;
+allow Console;
+allow File.Read;
+allow File.Write;
+import std.fs;
+
+fn main() -> i32 {
+    let path = "/tmp/aegis_std_fs_test.txt";
+    match File.write_string(path, "line one\nline two\r\nlast") { Ok() => { println("written"); } Err(e) => { println("write failed: " + io_error_text(e)); } }
+    match File.read_to_string(path) { Ok(s) => { println(s.len()); } Err(e) => { println("read failed"); } }
+    match File.open(path) {
+        Ok(f) => {
+            var n = 0;
+            while true {
+                match f.read_line() { Ok(line) => { n += 1; println(str(n) + ": " + line); } Err(e) => { break; } }
+            }
+        }
+        Err(e) => { println("open failed"); }
+    }
+    match File.append(path) { Ok(f) => { f.write_line("!"); } Err(e) => { } }
+    match File.read_to_string(path) { Ok(s) => { println(s); } Err(e) => { } }
+    println(File.exists(path));
+    match File.open("/nonexistent/x") { Ok(f) => { println("??"); } Err(e) => { println(io_error_text(e)); } }
+    match File.remove(path) { Ok() => { println("removed"); } Err(e) => { println("remove failed"); } }
+    println(File.exists(path));
+    return 0;
+}

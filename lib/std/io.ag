@@ -1,0 +1,33 @@
+// std.io - low-level whole-file reading into C buffers (used by the self-hosted compiler; most programs want
+// std.fs). Needs `allow File.Read;`.
+module std.io;
+
+import std.mem;
+
+extern fn fopen(path: String, mode: String) -> *u8;
+extern fn fread(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+extern fn fclose(f: *u8) -> i32;
+extern fn fseek(f: *u8, off: i64, whence: i32) -> i32;
+extern fn ftell(f: *u8) -> i64;
+
+// Returns a NUL-terminated buffer, or null (and out_len = -1) if the file can't be opened.
+unsafe fn read_file(path: String, ref out_len: i32) -> *u8 requires File.Read {
+    let f = fopen(path, "rb");
+    if f == null { out_len = -1; return null; }
+    fseek(f, 0, 2);
+    let size = ftell(f);
+    fseek(f, 0, 0);
+    let buf = alloc(size as u64 + 1);
+    fread(buf, 1, size as u64, f);
+    buf[size] = 0;
+    fclose(f);
+    out_len = size as i32;
+    return buf;
+}
+
+unsafe fn file_exists(path: *u8) -> bool requires File.Read {
+    let f = fopen(path as String, "rb");
+    if f == null { return false; }
+    fclose(f);
+    return true;
+}

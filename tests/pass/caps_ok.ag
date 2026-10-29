@@ -1,0 +1,24 @@
+// Compile-only: parent capabilities (Process, File) cover their children; Unrestricted opens unclassified externs.
+module CapsOk;
+allow Native;
+allow Process;
+allow File;
+allow Network;
+allow Unrestricted;
+
+extern fn ptrace(r: i64, pid: i32, a: i64, d: i64) -> i64;
+extern fn process_vm_readv(pid: i32, l: *u8, lc: u64, r: *u8, rc: u64, f: u64) -> i64;
+extern fn fopen(p: String, m: String) -> *u8;
+extern fn fork() -> i32;
+extern fn socket(d: i32, t: i32, p: i32) -> i32;
+extern fn mprotect(p: *u8, n: u64, f: i32) -> i32;
+
+unsafe fn everything() {
+    ptrace(16, 1, 0, 0);
+    process_vm_readv(1, null, 0, null, 0, 0);
+    fopen("x", "wb");
+    fork();
+    socket(2, 1, 0);
+    mprotect(null, 0, 7);
+}
+fn main() -> i32 { return 0; }

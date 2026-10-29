@@ -1,0 +1,75 @@
+// wordcount: lines, words and bytes of files, like `wc`, plus the most common word.
+//   ./aegisc examples/wordcount.ag -o wc && ./wc README.md src/aegisc.c
+module WordCount;
+allow Console;
+allow File.Read;
+import std.fs;
+import std.vec;
+
+struct Counts { lines: i64; words: i64; bytes: i64; }
+
+fn count(text: String) -> Counts {
+    var c = Counts { lines: 0, words: 0, bytes: text.len() };
+    var in_word = false;
+    for ch in text {
+        if ch == '\n' { c.lines += 1; }
+        let space = ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r';
+        if !space && !in_word { c.words += 1; }
+        in_word = !space;
+    }
+    return c;
+}
+
+// the most frequent word of at least 4 letters (a small linear-probing hash table)
+fn top_word(text: String) -> String {
+    var keys: [4096]String;
+    var hits: [4096]i64;
+    var best = "";
+    var best_n: i64 = 0;
+    var start: i64 = 0;
+    let n = text.len();
+    var i: i64 = 0;
+    while i <= n {
+        var letter = false;
+        if i < n { let ch = text[i]; letter = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'); }
+        if !letter {
+            if i - start >= 4 {
+                let w = text.slice(start, i).to_lower();
+                var h: u64 = 1469598103934665603;
+                for b in w { h = (h ^ (b as u64)) * 1099511628211; }
+                var slot = (h % 4096) as i64;
+                var probes = 0;
+                while probes < 4096 && hits[slot] != 0 && keys[slot] != w { slot = (slot + 1) % 4096; probes += 1; }
+                if probes < 4096 {
+                    keys[slot] = w;
+                    hits[slot] += 1;
+                    if hits[slot] > best_n { best_n = hits[slot]; best = w; }
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if best_n == 0 { return "-"; }
+    return best + " (" + best_n + "x)";
+}
+
+fn main(args: Vec<String>) -> i32 {
+    if args.len() < 2 { println("usage: wordcount FILE..."); return 0; }
+    var total = Counts { lines: 0, words: 0, bytes: 0 };
+    var failed = 0;
+    for i in 1..args.len() {
+        let path = args.item(i);
+        match File.read_to_string(path) {
+            Ok(text) => {
+                let c = count(text);
+                println(str(c.lines) + "\t" + c.words + "\t" + c.bytes + "\t" + path + "\t" + top_word(text));
+                total.lines += c.lines; total.words += c.words; total.bytes += c.bytes;
+            }
+            Err(e) => { println(path + ": " + io_error_text(e)); failed += 1; }
+        }
+    }
+    if args.len() > 2 { println(str(total.lines) + "\t" + total.words + "\t" + total.bytes + "\ttotal"); }
+    if failed > 0 { return 1; }
+    return 0;
+}

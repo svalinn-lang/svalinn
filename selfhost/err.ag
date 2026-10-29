@@ -1,0 +1,85 @@
+// Error reporting in the C compiler's exact format:  file:line: error: message
+module Err;
+
+import std.sys;
+import std.mem;
+
+extern fn dprintf(fd: i32, fmt: String, a: i64, b: i64, c: i64) -> i32;
+extern fn setjmp(env: *i64) -> i32;
+extern fn longjmp(env: *i64, v: i32);
+
+var file_names: [64]*u8;
+var nfile_names: i32;
+var file_trusted: [64]i32;   // files of the runtime and the standard library: no capability checks inside
+var file_src: [32]*u8;       // source text of each file, for the excerpt under an error
+
+// errors are recoverable while one function is checked: die() jumps back to the checking loop
+var err_jb: [64]i64;
+var err_recover: i32;
+var nerrors: i32;
+var ps_depth: i32;   // > 0 while a generic is being instantiated: errors there are not recoverable
+
+unsafe fn add_file_name(p: *u8) {
+    file_names[nfile_names] = p;
+    nfile_names += 1;
+}
+
+//     12 | let x = a + b;   and a caret under the column
+unsafe fn show_excerpt(pos: i32) {
+    let fi = pos >> 26;
+    let ln = pos & 65535;
+    let col = (pos >> 16) & 1023;
+    if col == 0 || fi >= 32 || file_src[fi] == null { return; }
+    var p = file_src[fi];
+    var l = 1;
+    while l < ln && *p != 0 {
+        if *p == 10 { l += 1; }
+        p = p + 1;
+    }
+    var e = p;
+    while *e != 0 && *e != 10 { e = e + 1; }
+    if e > p && *(e - 1) == 13 { e = e - 1; }
+    dprintf(2, "%5d | ", ln as i64, 0, 0);
+    dprintf(2, "%.*s", (e as i64) - (p as i64), p as i64, 0);
+    dprintf(2, "\n      | ", 0, 0, 0);
+    var i = 1;
+    while i < col && p + (i - 1) < e {
+        if *(p + (i - 1)) == 9 { dprintf(2, "\t", 0, 0, 0); } else { dprintf(2, " ", 0, 0, 0); }
+        i += 1;
+    }
+    dprintf(2, "^\n", 0, 0, 0);
+}
+
+// file:line:col: kind: message
+unsafe fn report(kind: *u8, line: i32, msg: *u8) {
+    let fi = line >> 26;
+    let col = (line >> 16) & 1023;
+    var name: *u8 = "<input>" as *u8;
+    if fi < nfile_names { name = file_names[fi]; }
+    dprintf(2, "%s:%d:", name as i64, (line & 65535) as i64, 0);
+    if col != 0 { dprintf(2, "%d:", col as i64, 0, 0); }
+    dprintf(2, " %s: %s\n", kind as i64, msg as i64, 0);
+    show_excerpt(line);
+}
+unsafe fn warnf(line: i32, fmt: String, a: i64, b: i64, c: i64) {
+    var buf: [512]u8;
+    snprintf(&buf[0], 512, fmt, a, b, c);
+    report("warning" as *u8, line, &buf[0]);
+}
+unsafe fn die_at(line: i32, msg: *u8) {
+    report("error" as *u8, line, msg);
+    if err_recover != 0 && ps_depth == 0 {
+        nerrors += 1;
+        longjmp(&err_jb[0], 1);
+    }
+    exit(1);
+}
+
+unsafe fn die(line: i32, msg: String) { die_at(line, msg as *u8); }
+
+// printf-style message with up to three integer/pointer arguments (pass pointers as `p as i64`)
+unsafe fn dief(line: i32, fmt: String, a: i64, b: i64, c: i64) {
+    var buf: [512]u8;
+    snprintf(&buf[0], 512, fmt, a, b, c);
+    die_at(line, &buf[0]);
+}

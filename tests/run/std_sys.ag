@@ -1,0 +1,41 @@
+// std.process, std.env, std.time, std.math
+module StdSys;
+allow Console;
+allow Process.Spawn;
+allow Env;
+import std.process;
+import std.env;
+import std.time;
+import std.math;
+
+fn main() -> i32 {
+    var a = Vec<String>();
+    a.push("hello");
+    a.push("");
+    a.push("world");
+    match run("echo", ref a) { Ok(code) => { println("exit " + code); } Err(e) => { println("spawn failed"); } }
+    var b = Vec<String>();
+    b.push("%s|%s|%s");
+    b.push("x");
+    b.push("");
+    b.push("y z");
+    match run_output("printf", ref b) {
+        Ok(o) => { println("status " + o.status + " out=[" + o.stdout + "]"); }
+        Err(e) => { println("spawn failed"); }
+    }
+    var none = Vec<String>();
+    match run("no-such-program-xyz", ref none) { Ok(code) => { println("exit " + code); } Err(e) => { println("spawn failed"); } }
+    match run("false", ref none) { Ok(code) => { println("false exits " + code); } Err(e) => { println("spawn failed"); } }
+    match set_env_var("AEGIS_TEST", "42") { Ok() => { } Err(e) => { println("setenv failed"); } }
+    match env_var("AEGIS_TEST") { Ok(v) => { println("AEGIS_TEST=" + v); } Err(e) => { println("unset"); } }
+    match remove_env_var("AEGIS_TEST") { Ok() => { } Err(e) => { println("unsetenv failed"); } }
+    match env_var("AEGIS_TEST") { Ok(v) => { println(v); } Err(e) => { println("AEGIS_TEST: " + io_error_text(e)); } }
+    match set_env_var("A=B", "1") { Ok() => { println("??"); } Err(e) => { println(io_error_text(e)); } }
+    let t0 = monotonic_ns();
+    sleep_ms(15);
+    println("slept: " + ((monotonic_ns() - t0) / 1000000 >= 15));
+    println("clock: " + (now_secs() > 1700000000 && now_ms() / 1000 >= now_secs() - 1));
+    println(sqrt(2.0) + floor(2.7) + pow(2.0, 10.0));
+    println(process_id() > 0);
+    return 0;
+}

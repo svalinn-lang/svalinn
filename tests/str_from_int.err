@@ -1,0 +1,3 @@
+tests/str_from_int.ag:2:30: error: cannot convert 'i32' to String with 'as'; use str(x) or "" + x
+    2 | fn main() -> i32 { let s = 5 as String; return 0; }
+      |                              ^

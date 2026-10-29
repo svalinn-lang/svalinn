@@ -1,0 +1,59 @@
+module A;
+allow Console;
+
+async fn worker(name: String, n: i32) -> i32 {
+    var sum = 0;
+    for i in 0..n {
+        print(name);
+        println(i);
+        sum += i;
+        yield_now();
+    }
+    return sum;
+}
+
+class Big { public: var a: i64; var b: i64; var c: i64; dtor { println("big dropped"); } }
+
+async fn makeBig(x: i64) -> Big {
+    yield_now();
+    var b = Big();
+    b.a = x; b.b = x * 2; b.c = x * 3;
+    return b;
+}
+
+async fn compute(x: i64) -> Result<i64, String> {
+    if x < 0 { return Err("negative"); }
+    yield_now();
+    return Ok(x * 10);
+}
+
+async fn pipeline(x: i64) -> Result<i64, String> {
+    let a = await compute(x);
+    let v = a?;
+    let b = await compute(v + 1);
+    return Ok(b? + 1);
+}
+
+async fn fib(n: i64) -> i64 {
+    if n < 2 { return n; }
+    let a = fib(n - 1);
+    let b = fib(n - 2);
+    return await a + await b;
+}
+
+fn main() -> i32 {
+    let a = worker("a", 3);
+    let b = worker("b", 3);
+    println(await a + await b);
+    let big = await makeBig(7);
+    println(big.c);
+    match await pipeline(4) { Ok(v) => { println(v); } Err(e) => { println(e); } }
+    match await pipeline(0 - 1) { Ok(v) => { println(v); } Err(e) => { println(e); } }
+    println(await fib(15));
+    {
+        let t = worker("c", 2);
+        println("not awaited, joined at scope end");
+    }
+    println("done");
+    return 0;
+}

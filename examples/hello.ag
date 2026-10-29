@@ -1,0 +1,7 @@
+module Hello;
+allow Console;
+
+fn main() -> i32 {
+    println("Hello Aegis");
+    return 0;
+}

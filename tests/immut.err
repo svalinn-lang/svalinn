@@ -1,0 +1,3 @@
+tests/immut.ag:1:41: error: cannot assign to immutable value; declare it with 'var'
+    1 | module A; fn main() -> i32 { let x = 1; x = 2; return 0; }
+      |                                         ^

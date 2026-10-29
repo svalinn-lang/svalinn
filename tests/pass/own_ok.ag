@@ -1,0 +1,21 @@
+module A;
+class R { public: var x: i32; dtor { } }
+fn take(r: R) { }
+fn make() -> R { return R(); }
+fn pick(c: bool) -> R {
+    let a = R();
+    if c { return a; }
+    let b = make();
+    return b;
+}
+fn main() -> i32 {
+    let r = R();
+    if true { take(r); return 0; }
+    take(r);
+    var v = R();
+    take(v);
+    v = R();
+    take(v);
+    let p = pick(true);
+    return 0;
+}

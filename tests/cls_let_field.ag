@@ -1,0 +1,1 @@
+module A; class P { public: let id: i32; ctor(i: i32) { this.id = i; } fn set() { this.id = 5; } } fn main() -> i32 { return 0; }

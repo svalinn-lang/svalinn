@@ -1,0 +1,1 @@
+module A; fn f() -> Result<i32, String> { return Ok(1); } fn g() -> Result<i32, i32> { let x = f()?; return Ok(x); } fn main() -> i32 { return 0; }

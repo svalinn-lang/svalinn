@@ -1,0 +1,103 @@
+// String ownership: copies share the bytes (reference counts), every owner releases its share
+module S2;
+allow Console;
+allow Native;
+import std.vec;
+
+struct Person { name: String; age: i32; }
+
+class Book {
+    public:
+    var title: String;
+    var tags: Vec<String>;
+    ctor(t: String) { this.title = t; this.tags = Vec<String>(); }
+    fn tag(t: String) { this.tags.push(t); }
+    fn describe() -> String {
+        var s = this.title + " [";
+        for i in 0..this.tags.len() {
+            if i > 0 { s = s + ", "; }
+            s = s + this.tags.item(i);
+        }
+        return s + "]";
+    }
+}
+
+enum Err { NotFound }
+
+fn lookup(k: String) -> Result<String, Err> {
+    if k == "a" { return Ok("alpha"); }
+    if k == "b" { return Ok("beta" + "!"); }
+    return Err(Err.NotFound);
+}
+
+fn longest(a: String, b: String) -> String {
+    if a.len() >= b.len() { return a; }
+    return b;
+}
+
+fn join(ref v: Vec<String>, sep: String) -> String {
+    var out = "";
+    for i in 0..v.len() {
+        if i > 0 { out = out + sep; }
+        out = out + v.item(i);
+    }
+    return out;
+}
+
+fn main() -> i32 {
+    let p = Person { name: "Ada" + " Lovelace", age: 36 };
+    let q = p;              // copies the struct: both own the name
+    println(q.name + " " + q.age);
+    println(p.name.len());
+
+    var people: [2]Person;
+    people[0] = Person { name: "Grace", age: 85 };
+    people[1] = people[0];
+    people[1].name = people[1].name + " Hopper";
+    println(people[0].name + " / " + people[1].name);
+
+    let b = Book("Dune");
+    b.tag("sci-fi");
+    b.tag("classic" + "");
+    let t = "desert";
+    b.tag(t);
+    println(t);
+    println(b.describe());
+
+    var v = Vec<String>();
+    var words: [3]String;
+    words[0] = "one"; words[1] = "two"; words[2] = "three";
+    for w in words { v.push(w.to_upper()); }
+    println(join(ref v, "-"));
+    match v.pop() { Ok(last) => { println(last); } Err(e) => { println("empty"); } }
+    println(v.len());
+
+    match lookup("a") { Ok(s) => { println(s); } Err(e) => { println("missing"); } }
+    match lookup("b") { Ok(s) => { println(s); } Err(e) => { println("missing"); } }
+    match lookup("z") { Ok(s) => { println(s); } Err(e) => { println("missing"); } }
+
+    var acc = "x";
+    var i = 0;
+    while i < 6 { acc = acc + acc; i += 1; }
+    println(acc.len());
+    println(longest("short", "longer one"));
+
+    let parts = "k1=v1;k2=v2;k3=v3";
+    var start: i64 = 0;
+    var n = 0;
+    while true {
+        let at = parts.find_from(";", start);
+        var piece = "";
+        if at < 0 { piece = parts.slice(start, parts.len()); } else { piece = parts.slice(start, at); }
+        let eq = piece.find("=");
+        println(piece.slice(0, eq) + " -> " + piece.slice(eq + 1, piece.len()));
+        n += 1;
+        if at < 0 { break; }
+        start = at + 1;
+    }
+    println(n);
+    println("abc".starts_with("ab") && "abc".ends_with("bc") && !"abc".is_empty());
+    println("MiXeD".to_lower() + "|" + "x".char_at(0));
+    println(str(18446744073709551615 as u64) + " " + str(-5 as i8) + " " + str(1.0 / 3.0));
+    return 0;
+}

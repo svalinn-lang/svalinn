@@ -1,0 +1,56 @@
+module BinaryTrees;
+allow Console;
+allow Native;
+
+extern fn malloc(n: u64) -> *u8;
+extern fn free(p: *u8);
+
+struct Node { left: *Node; right: *Node; }
+
+unsafe fn make(d: i32) -> *Node {
+    let n = malloc(16) as *Node;
+    if d > 0 {
+        n.left = make(d - 1);
+        n.right = make(d - 1);
+    } else {
+        n.left = null;
+        n.right = null;
+    }
+    return n;
+}
+
+unsafe fn check(n: *Node) -> i64 {
+    if n.left == null { return 1; }
+    return 1 + check(n.left) + check(n.right);
+}
+
+unsafe fn release(n: *Node) {
+    if n.left != null {
+        release(n.left);
+        release(n.right);
+    }
+    free(n as *u8);
+}
+
+unsafe fn main(argc: i32, argv: **u8) -> i32 {
+    let maxDepth = 18;
+    let stretch = make(maxDepth + 1);
+    println(check(stretch));
+    release(stretch);
+    let longLived = make(maxDepth);
+    var d = 4;
+    while d <= maxDepth {
+        let iters = 1 << (maxDepth - d + 4);
+        var total: i64 = 0;
+        for i in 0..iters {
+            let t = make(d);
+            total += check(t);
+            release(t);
+        }
+        println(total);
+        d += 2;
+    }
+    println(check(longLived));
+    release(longLived);
+    return 0;
+}

@@ -1,0 +1,59 @@
+module Fannkuch;
+allow Console;
+
+fn main() -> i32 {
+    let n = 10;
+    var perm: [16]i32;
+    var perm1: [16]i32;
+    var count: [16]i32;
+    var maxFlips = 0;
+    var checksum = 0;
+    var permCount = 0;
+    for i in 0..n { perm1[i] = i; }
+    var r = n;
+    while true {
+        while r != 1 {
+            count[r - 1] = r;
+            r -= 1;
+        }
+        for i in 0..n { perm[i] = perm1[i]; }
+        var flips = 0;
+        var k = perm[0];
+        while k != 0 {
+            var i = 0;
+            var j = k;
+            while i < j {
+                let t = perm[i];
+                perm[i] = perm[j];
+                perm[j] = t;
+                i += 1;
+                j -= 1;
+            }
+            flips += 1;
+            k = perm[0];
+        }
+        if flips > maxFlips { maxFlips = flips; }
+        if permCount % 2 == 0 { checksum += flips; } else { checksum -= flips; }
+        var done = true;
+        while r != n {
+            let p0 = perm1[0];
+            var i = 0;
+            while i < r {
+                perm1[i] = perm1[i + 1];
+                i += 1;
+            }
+            perm1[r] = p0;
+            count[r] -= 1;
+            if count[r] > 0 {
+                done = false;
+                break;
+            }
+            r += 1;
+        }
+        if done { break; }
+        permCount += 1;
+    }
+    println(checksum);
+    println(maxFlips);
+    return 0;
+}

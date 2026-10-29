@@ -1,0 +1,298 @@
+// Aegis lexer as a library: turns source text into an array of tokens.
+module Lex;
+
+import std.sys;
+import std.mem;
+import err;
+
+let TK_EOF: i32 = 0;
+let TK_ID: i32 = 1;
+let TK_INT: i32 = 2;
+let TK_CHAR: i32 = 3;
+let TK_STR: i32 = 4;
+let TK_OP: i32 = 5;
+let TK_FLOAT: i32 = 6;
+
+// line = (file index << 26) | (column << 16) | line number, like the C compiler (column 0 = unknown)
+struct Token { kind: i32; line: i32; len: i32; s: *u8; v: u64; }
+
+var toks: *Token;
+var ntoks: i32;
+var ctoks: i32;
+
+var lx_src: *u8;
+var lx_n: i32;
+var lx_pos: i32;
+var lx_line: i64 = 1;
+var lx_file: i32;
+var lx_ls: i32;          // position where the current line starts
+var lx_tok_start: i32;   // position of the token being lexed
+
+unsafe fn lxl() -> i32 {
+    var col = lx_tok_start - lx_ls + 1;
+    if col > 1023 { col = 1023; }
+    return (lx_file << 26) | (col << 16) | (lx_line as i32);
+}
+
+unsafe fn lx_fail(msg: String) { die(lxl(), msg); }
+
+unsafe fn push_tok(kind: i32, line: i32, s: *u8, len: i32, v: u64) {
+    if ntoks >= ctoks {
+        var nc = ctoks * 2;
+        if nc < 256 { nc = 256; }
+        toks = realloc(toks as *u8, nc as u64 * sizeof(Token)) as *Token;
+        if toks == null { abort(); }
+        ctoks = nc;
+    }
+    toks[ntoks].kind = kind;
+    toks[ntoks].line = line;
+    toks[ntoks].s = s;
+    toks[ntoks].len = len;
+    toks[ntoks].v = v;
+    ntoks += 1;
+}
+
+unsafe fn peek(off: i32) -> u8 {
+    let i = lx_pos + off;
+    if i >= lx_n { return 0; }
+    return lx_src[i];
+}
+
+fn is_digit(c: u8) -> bool { return c >= '0' && c <= '9'; }
+fn is_letter(c: u8) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+fn is_alpha(c: u8) -> bool { return is_letter(c) || c == '_'; }
+fn is_alnum(c: u8) -> bool { return is_alpha(c) || is_digit(c); }
+fn is_hex(c: u8) -> bool { return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+fn hexval(c: u8) -> u64 {
+    if is_digit(c) { return (c - '0') as u64; }
+    return ((c | 32) - 'a' + 10) as u64;
+}
+
+unsafe fn is_op1(c: u8) -> bool {
+    let set = "+-*/%&|^~!<>=(){}[];:,.@?";
+    var i = 0;
+    while set[i] != 0 {
+        if set[i] == c { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+fn is_op2(a: u8, b: u8) -> bool {
+    if a == '.' && b == '.' { return true; }
+    if a == '=' && (b == '>' || b == '=') { return true; }
+    if a == '-' && b == '>' { return true; }
+    if a == '!' && b == '=' { return true; }
+    if a == '<' && (b == '=' || b == '<') { return true; }
+    if a == '>' && (b == '=' || b == '>') { return true; }
+    if a == '&' && (b == '&' || b == '=') { return true; }
+    if a == '|' && (b == '|' || b == '=') { return true; }
+    if (a == '+' || a == '-' || a == '*' || a == '/' || a == '%' || a == '^') && b == '=' { return true; }
+    return false;
+}
+
+unsafe fn read_escape() -> i64 {
+    let c = peek(0);
+    lx_pos += 1;
+    match c {
+        'n' => { return 10; }
+        't' => { return 9; }
+        'r' => { return 13; }
+        '0' => { return 0; }
+        '\\' => { return 92; }
+        '\'' => { return 39; }
+        '"' => { return 34; }
+        'x' => {
+            var v: i64 = 0;
+            var i = 0;
+            while i < 2 && is_hex(peek(0)) {
+                v = v * 16 + hexval(peek(0)) as i64;
+                lx_pos += 1;
+                i += 1;
+            }
+            return v;
+        }
+        _ => { dief(lxl(), "unknown escape '\\%c'", c as i64, 0, 0); return 0; }
+    }
+}
+
+unsafe fn lx_skip() {
+    var skipping = true;
+    while skipping {
+        let c = peek(0);
+        if c == '\n' { lx_line += 1; lx_pos += 1; lx_ls = lx_pos; }
+        else if c == ' ' || c == '\t' || c == '\r' || c == 11 || c == 12 { lx_pos += 1; }
+        else if c == '/' && peek(1) == '/' {
+            while lx_pos < lx_n && lx_src[lx_pos] != '\n' { lx_pos += 1; }
+        }
+        else if c == '/' && peek(1) == '*' {
+            lx_pos += 2;
+            while lx_pos < lx_n && !(lx_src[lx_pos] == '*' && peek(1) == '/') {
+                if lx_src[lx_pos] == '\n' { lx_line += 1; lx_ls = lx_pos + 1; }
+                lx_pos += 1;
+            }
+            if lx_pos >= lx_n { die((lx_file << 26) | (lx_line as i32), "unterminated comment"); }
+            lx_pos += 2;
+        }
+        else { skipping = false; }
+    }
+}
+
+// digits followed by '.digit' or an exponent (not hex/binary, not '..')
+unsafe fn is_float_lit() -> bool {
+    let c1 = peek(1);
+    if peek(0) == '0' && (c1 == 'x' || c1 == 'X' || c1 == 'b' || c1 == 'B') { return false; }
+    var i = 0;
+    while is_digit(peek(i)) || peek(i) == '_' { i += 1; }
+    if peek(i) == '.' && is_digit(peek(i + 1)) { return true; }
+    if peek(i) == 'e' || peek(i) == 'E' {
+        if is_digit(peek(i + 1)) { return true; }
+        if (peek(i + 1) == '+' || peek(i + 1) == '-') && is_digit(peek(i + 2)) { return true; }
+    }
+    return false;
+}
+
+// floating-point literal: kept as text (converted exactly later); '_' separators dropped
+unsafe fn lex_float() {
+    var buf: [128]u8;
+    var n = 0;
+    while is_digit(peek(0)) || peek(0) == '_' {
+        if peek(0) != '_' && n < 120 { buf[n] = peek(0); n += 1; }
+        lx_pos += 1;
+    }
+    if peek(0) == '.' {
+        buf[n] = '.';
+        n += 1;
+        lx_pos += 1;
+        while is_digit(peek(0)) || peek(0) == '_' {
+            if peek(0) != '_' && n < 120 { buf[n] = peek(0); n += 1; }
+            lx_pos += 1;
+        }
+    }
+    if peek(0) == 'e' || peek(0) == 'E' {
+        buf[n] = peek(0);
+        n += 1;
+        lx_pos += 1;
+        if peek(0) == '+' || peek(0) == '-' { buf[n] = peek(0); n += 1; lx_pos += 1; }
+        while is_digit(peek(0)) {
+            if n < 120 { buf[n] = peek(0); n += 1; }
+            lx_pos += 1;
+        }
+    }
+    if is_letter(peek(0)) || peek(0) == '_' { lx_fail("invalid numeric literal"); }
+    push_tok(TK_FLOAT, lxl(), dup_n(&buf[0], n), n, 0);
+}
+
+unsafe fn lex_number() {
+    var v: u64 = 0;
+    let c1 = peek(1);
+    if peek(0) == '0' && (c1 == 'x' || c1 == 'X') {
+        lx_pos += 2;
+        while is_hex(peek(0)) || peek(0) == '_' {
+            if peek(0) != '_' { v = v * 16 + hexval(peek(0)); }
+            lx_pos += 1;
+        }
+    } else if peek(0) == '0' && (c1 == 'b' || c1 == 'B') {
+        lx_pos += 2;
+        while peek(0) == '0' || peek(0) == '1' || peek(0) == '_' {
+            if peek(0) != '_' { v = v * 2 + (peek(0) - '0') as u64; }
+            lx_pos += 1;
+        }
+    } else {
+        while is_digit(peek(0)) || peek(0) == '_' {
+            if peek(0) != '_' { v = v * 10 + (peek(0) - '0') as u64; }
+            lx_pos += 1;
+        }
+    }
+    if is_letter(peek(0)) { lx_fail("invalid numeric literal"); }
+    push_tok(TK_INT, lxl(), null, 0, v);
+}
+
+unsafe fn lex_char() {
+    lx_pos += 1;
+    var v: i64 = 0;
+    if peek(0) == '\\' { lx_pos += 1; v = read_escape(); }
+    else { v = peek(0) as i64; lx_pos += 1; }
+    if peek(0) != '\'' { lx_fail("unterminated char literal"); }
+    lx_pos += 1;
+    push_tok(TK_CHAR, lxl(), null, 0, v as u64);
+}
+
+unsafe fn lex_string() {
+    lx_pos += 1;
+    var b: StrBuf;
+    sb_init(ref b);
+    while peek(0) != '"' {
+        if lx_pos >= lx_n || peek(0) == '\n' { lx_fail("unterminated string literal"); }
+        if peek(0) == '\\' {
+            lx_pos += 1;
+            sb_push(ref b, read_escape() as u8);
+        } else {
+            sb_push(ref b, peek(0));
+            lx_pos += 1;
+        }
+    }
+    lx_pos += 1;
+    push_tok(TK_STR, lxl(), b.data, b.len as i32, 0);
+}
+
+unsafe fn lex_op() {
+    let c = peek(0);
+    let c1 = peek(1);
+    let c2 = peek(2);
+    var l = 0;
+    if (c == '<' && c1 == '<' && c2 == '=') || (c == '>' && c1 == '>' && c2 == '=') { l = 3; }
+    else if is_op2(c, c1) { l = 2; }
+    else if is_op1(c) { l = 1; }
+    else { dief(lxl(), "unexpected character '%c'", c as i64, 0, 0); }
+    push_tok(TK_OP, lxl(), dup_n(lx_src + lx_pos, l), l, 0);
+    lx_pos += l;
+}
+
+unsafe fn lex_loop() {
+    while true {
+        lx_skip();
+        lx_tok_start = lx_pos;
+        if lx_line > 65535 { die((lx_file << 26) | 65535, "source files can have at most 65535 lines"); }
+        if lx_pos >= lx_n { break; }
+        let c = lx_src[lx_pos];
+        if is_alpha(c) {
+            let start = lx_pos;
+            while is_alnum(peek(0)) { lx_pos += 1; }
+            push_tok(TK_ID, lxl(), dup_n(lx_src + start, lx_pos - start), lx_pos - start, 0);
+        }
+        else if is_digit(c) && is_float_lit() { lex_float(); }
+        else if is_digit(c) { lex_number(); }
+        else if c == '\'' { lex_char(); }
+        else if c == '"' { lex_string(); }
+        else { lex_op(); }
+    }
+}
+
+// Lexes one source buffer into a fresh array (ending in an EOF token), leaving the global array untouched.
+unsafe fn lex_to_array(src: *u8, n: i32, file: i32, ref count: i32) -> *Token {
+    let st = toks;
+    let sn = ntoks;
+    let sc = ctoks;
+    toks = null;
+    ntoks = 0;
+    ctoks = 0;
+    lx_src = src;
+    lx_n = n;
+    lx_pos = 0;
+    lx_line = 1;
+    lx_file = file;
+    lx_ls = 0;
+    lx_tok_start = 0;
+    if file >= 32 { dprintf(2, "aegisc: too many source files (at most 32)\n", 0, 0, 0); exit(1); }
+    file_src[file] = src;
+    lex_loop();
+    push_tok(TK_EOF, lxl(), null, 0, 0);
+    let r = toks;
+    count = ntoks;
+    toks = st;
+    ntoks = sn;
+    ctoks = sc;
+    return r;
+}

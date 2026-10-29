@@ -1,0 +1,4 @@
+module A;
+allow Console.Write;
+import std.console;
+fn main() -> i32 { match read_line() { Ok(s) => { } Err(e) => { } } return 0; }

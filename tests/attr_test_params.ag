@@ -1,0 +1,4 @@
+module A;
+@test
+fn t(x: i32) {}
+fn main() -> i32 { return 0; }

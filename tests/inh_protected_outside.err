@@ -1,0 +1,3 @@
+tests/inh_protected_outside.ag:1:102: error: 'x' is protected in class 'B'
+    1 | module A; class B { protected: var x: i32; } class D : B { } fn main() -> i32 { let d = D(); return d.x; }
+      |                                                                                                      ^

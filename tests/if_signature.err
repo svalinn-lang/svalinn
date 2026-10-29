@@ -1,0 +1,3 @@
+tests/if_signature.ag:1:51: error: 'R.area' does not match the signature of 'S.area'
+    1 | module A; interface S { fn area() -> i64; } class R : S { public: fn area() -> i32 { return 1; } } fn main() -> i32 { return 0; }
+      |                                                   ^

@@ -1,0 +1,1500 @@
+// Parser for the self-hosted compiler: a port of the parser in aegisc.c.
+// Types are resolved while parsing (struct/enum names are pre-registered by prescan), like the C version.
+module Parse;
+
+import std.sys;
+import std.mem;
+import std.io;
+import err;
+import lex;
+import types;
+import ast;
+
+var tp: i32;
+var src_dir: *u8;
+var exe_dir: *u8;
+var loaded: [128]*u8;
+var nloaded: i32;
+
+unsafe fn cur() -> *Token { return &toks[tp]; }
+unsafe fn isop(s: String) -> bool { return toks[tp].kind == TK_OP && strcmp(toks[tp].s, s as *u8) == 0; }
+unsafe fn iskw(s: String) -> bool { return toks[tp].kind == TK_ID && strcmp(toks[tp].s, s as *u8) == 0; }
+unsafe fn acceptop(s: String) -> bool { if isop(s) { tp += 1; return true; } return false; }
+unsafe fn acceptkw(s: String) -> bool { if iskw(s) { tp += 1; return true; } return false; }
+unsafe fn expectop(s: String) {
+    if !acceptop(s) { dief(cur().line, "expected '%s'", s as i64, 0, 0); }
+}
+unsafe fn expect_id() -> *u8 {
+    if cur().kind != TK_ID { die(cur().line, "expected identifier"); }
+    let r = toks[tp].s;
+    tp += 1;
+    return r;
+}
+unsafe fn parse_dotted() -> *u8 {
+    var b: StrBuf;
+    sb_init(ref b);
+    sb_cat(ref b, expect_id() as String);
+    while isop(".") {
+        tp += 1;
+        sb_cat(ref b, ".");
+        sb_cat(ref b, expect_id() as String);
+    }
+    return b.data;
+}
+
+unsafe fn streq(a: *u8, b: String) -> bool { return strcmp(a, b as *u8) == 0; }
+
+var gens: [256]*Generic;
+var ngens: i32;
+var te_name: [8]*u8;
+var te_ty: [8]*Type;
+var nte: i32;
+var pend_gt: i32;
+struct PState { tp: i32; nte: i32; pend: i32; nm: [8]*u8; ty: [8]*Type; }
+
+unsafe fn find_generic(n: *u8) -> *Generic {
+    var i = 0;
+    while i < ngens {
+        if (strcmp(gens[i].name, n) == 0) { return gens[i]; }
+        i += 1;
+    }
+    return null;
+}
+unsafe fn ps_save(ref p: PState) {
+    ps_depth += 1;
+    p.tp = tp;
+    p.nte = nte;
+    p.pend = pend_gt;
+    var i = 0;
+    while i < 8 { p.nm[i] = te_name[i]; p.ty[i] = te_ty[i]; i += 1; }
+}
+unsafe fn ps_restore(ref p: PState) {
+    ps_depth -= 1;
+    tp = p.tp;
+    nte = p.nte;
+    pend_gt = p.pend;
+    var i = 0;
+    while i < 8 { te_name[i] = p.nm[i]; te_ty[i] = p.ty[i]; i += 1; }
+}
+unsafe fn check_constraints(g: *Generic, args: **Type, line: i32) {
+    var i = 0;
+    while i < g.np {
+        if g.pc[i] != null {
+            let ifc = find_iface(g.pc[i]);
+            if ifc == null { dief(g.line, "unknown interface '%s' in constraint", g.pc[i] as i64, 0, 0); }
+            let a = args[i];
+            if !(a.kind == TY_STRUCT && a.sd.is_class != 0 && implements(a.sd, ifc)) {
+                dief(line, "type '%s' does not implement '%s' (required by %s)", tname(a) as i64, ifc.name as i64, g.name as i64);
+            }
+        }
+        i += 1;
+    }
+}
+unsafe fn ps_bind(g: *Generic, args: **Type) {
+    nte = g.np;
+    pend_gt = 0;
+    var i = 0;
+    while i < g.np { te_name[i] = g.pn[i]; te_ty[i] = args[i]; i += 1; }
+}
+// closes '<' ... '>' ; splits '>>' into two closers without touching the token
+unsafe fn expect_gt() {
+    if pend_gt != 0 { pend_gt = 0; return; }
+    if isop(">>") { tp += 1; pend_gt = 1; return; }
+    expectop(">");
+}
+unsafe fn parse_type_args(g: *Generic, out: **Type, line: i32) -> i32 {
+    expectop("<");
+    var n = 0;
+    while true {
+        if n >= 8 { die(line, "too many type arguments"); }
+        out[n] = parse_type();
+        n += 1;
+        if !acceptop(",") { break; }
+    }
+    expect_gt();
+    if n != g.np { dief(line, "'%s' expects %d type argument(s), got %d", g.name as i64, g.np as i64, n as i64); }
+    return n;
+}
+unsafe fn inst_name(g: *Generic, args: **Type) -> *u8 {
+    var b: StrBuf;
+    sb_init(ref b);
+    sb_cat_c(ref b, g.name);
+    sb_cat(ref b, "<");
+    var i = 0;
+    while i < g.np {
+        if i != 0 { sb_cat(ref b, ", "); }
+        sb_cat(ref b, tname(args[i]) as String);
+        i += 1;
+    }
+    sb_cat(ref b, ">");
+    return b.data;
+}
+unsafe fn has_param(t: *Type) -> bool {
+    if t.kind == TY_PARAM { return true; }
+    if t.kind == TY_PTR || t.kind == TY_ARRAY { return has_param(t.elem); }
+    if t.kind == TY_RESULT { return has_param(t.elem) || has_param(t.err); }
+    if t.kind == TY_STRUCT && t.sd.gen != null {
+        var i = 0;
+        while i < t.sd.gen.np {
+            if has_param(t.sd.targs[i]) { return true; }
+            i += 1;
+        }
+    }
+    return false;
+}
+unsafe fn instantiate_type(g: *Generic, args: **Type, line: i32) -> *Type {
+    let nm = inst_name(g, args);
+    var sd = find_struct(nm);
+    if sd != null { return sd.ty; }
+    sd = zalloc(sizeof(StructDef)) as *StructDef;
+    sd.name = nm;
+    sd.ty = zalloc(sizeof(Type)) as *Type;
+    sd.ty.kind = TY_STRUCT;
+    sd.ty.sd = sd;
+    sd.ty.size = 1;
+    sd.ty.align = 1;
+    sd.gen = g;
+    var i = 0;
+    while i < g.np { sd.targs[i] = args[i]; i += 1; }
+    i = 0;
+    while i < g.np {
+        if has_param(args[i]) {
+            // shell used only for argument inference
+            if g.kind == 0 { sd.is_class = 1; }
+            return sd.ty;
+        }
+        i += 1;
+    }
+    check_constraints(g, args, line);
+    structs[nstructs] = sd;
+    nstructs += 1;
+    var ps: PState;
+    ps_save(ref ps);
+    ps_bind(g, args);
+    tp = g.start;
+    if g.kind == 0 { parse_class_body(sd, line); } else { parse_struct_body(sd, line); }
+    ps_restore(ref ps);
+    return sd.ty;
+}
+unsafe fn instantiate_fn(g: *Generic, args: **Type, line: i32) -> *Func {
+    let nm = inst_name(g, args);
+    check_constraints(g, args, line);
+    var i = 0;
+    while i < nfuncs {
+        if (strcmp(funcs[i].name, nm) == 0) { return funcs[i]; }
+        i += 1;
+    }
+    var ps: PState;
+    ps_save(ref ps);
+    ps_bind(g, args);
+    tp = g.start;
+    let nf0 = nfuncs;
+    parse_fn_ex(null, g.is_unsafe, 0, 0, 0, 0, nm, null);
+    if nfuncs > nf0 { funcs[nfuncs - 1].is_async = g.is_async; }
+    ps_restore(ref ps);
+    return funcs[nfuncs - 1];
+}
+
+// value of an integer constant declared so far
+unsafe fn const_int(n: *u8, ref v: i64) -> bool {
+    var i = 0;
+    while i < nglobals {
+        if globals[i].is_const != 0 && (strcmp(globals[i].name, n) == 0) && globals[i].init.kind == E_INT { v = globals[i].init.ival; return true; }
+        i += 1;
+    }
+    return false;
+}
+// integer constant expression of literals and constants
+unsafe fn const_eval(e: *Expr, ref v: i64) -> bool {
+    var a: i64 = 0;
+    var b: i64 = 0;
+    let k = e.kind;
+    if k == E_INT { if e.cls != 0 { return false; } v = e.ival; return true; }
+    if k == E_VAR { return const_int(e.name, ref v); }
+    if k == E_UN {
+        if e.op != O_NEG || !const_eval(e.a, ref a) { return false; }
+        v = ((0 as u64) - (a as u64)) as i64;
+        return true;
+    }
+    if k == E_BIN {
+        if !const_eval(e.a, ref a) || !const_eval(e.b, ref b) { return false; }
+        let op = e.op;
+        if op == O_ADD { v = ((a as u64) + (b as u64)) as i64; return true; }
+        if op == O_SUB { v = ((a as u64) - (b as u64)) as i64; return true; }
+        if op == O_MUL { v = ((a as u64) * (b as u64)) as i64; return true; }
+        if op == O_DIV { if b == 0 || (b == -1 && a == ((1 as u64) << 63) as i64) { return false; } v = a / b; return true; }
+        if op == O_MOD { if b == 0 || b == -1 { return false; } v = a % b; return true; }
+        if op == O_AND { v = a & b; return true; }
+        if op == O_OR { v = a | b; return true; }
+        if op == O_XOR { v = a ^ b; return true; }
+        if op == O_SHL { if b < 0 || b > 63 { return false; } v = ((a as u64) << (b as u64)) as i64; return true; }
+        if op == O_SHR { if b < 0 || b > 63 { return false; } v = a >> b; return true; }
+        return false;
+    }
+    return false;
+}
+unsafe fn parse_type() -> *Type {
+    let line = cur().line;
+    if acceptop("*") { return mk_ptr(parse_type()); }
+    if acceptop("[") {
+        var n: i64 = 0;
+        if cur().kind == TK_INT { n = toks[tp].v as i64; tp += 1; }
+        else if cur().kind == TK_ID && const_int(cur().s, ref n) { tp += 1; }
+        else { die(line, "array length must be an integer literal or a constant defined above"); }
+        expectop("]");
+        let e = parse_type();
+        need_complete(e, line);
+        if n <= 0 { die(line, "array length must be positive"); }
+        return mk_arr(e, n);
+    }
+    let n = expect_id();
+    if streq(n, "Task") {
+        expectop("<");
+        let et = parse_type();
+        expect_gt();
+        need_complete(et, line);
+        return mk_task(et);
+    }
+    if streq(n, "Result") {
+        expectop("<");
+        let rt = parse_type();
+        expectop(",");
+        let re = parse_type();
+        expect_gt();
+        need_complete(rt, line);
+        need_complete(re, line);
+        return mk_result(rt, re);
+    }
+    if streq(n, "bool") { return ty_bool; }
+    if streq(n, "char") { return ty_char; }
+    if streq(n, "String") { return ty_str; }
+    if streq(n, "void") { return ty_void; }
+    if streq(n, "i8") { return ty_i8; }
+    if streq(n, "i16") { return ty_i16; }
+    if streq(n, "i32") { return ty_i32; }
+    if streq(n, "i64") || streq(n, "isize") { return ty_i64; }
+    if streq(n, "u8") { return ty_u8; }
+    if streq(n, "u16") { return ty_u16; }
+    if streq(n, "u32") { return ty_u32; }
+    if streq(n, "u64") || streq(n, "usize") { return ty_u64; }
+    if streq(n, "f32") { return ty_f32; }
+    if streq(n, "f64") { return ty_f64; }
+    var ti = 0;
+    while ti < nte {
+        if (strcmp(te_name[ti], n) == 0) { return te_ty[ti]; }
+        ti += 1;
+    }
+    let gn = find_generic(n);
+    if gn != null {
+        if gn.kind == 2 { dief(line, "'%s' is a generic function, not a type", n as i64, 0, 0); }
+        if !isop("<") { dief(line, "generic type '%s' needs type arguments, e.g. %s<i32>", n as i64, n as i64, 0); }
+        var ta: [8]*Type;
+        parse_type_args(gn, &ta[0], line);
+        return instantiate_type(gn, &ta[0], line);
+    }
+    let sd = find_struct(n);
+    if sd != null { return sd.ty; }
+    let ed = find_enum(n);
+    if ed != null { return ed.ty; }
+    let ifc = find_iface(n);
+    if ifc != null { return ifc.ty; }
+    dief(line, "unknown type '%s'", n as i64, 0, 0);
+    return null;
+}
+
+var no_slit: i32;   // parsing an if/while/match/for header: 'Name {' starts the body, not a struct literal
+unsafe fn parse_expr_free() -> *Expr {
+    let sv = no_slit;
+    no_slit = 0;
+    let e = parse_expr();
+    no_slit = sv;
+    return e;
+}
+unsafe fn parse_expr_head() -> *Expr {
+    let sv = no_slit;
+    no_slit = 1;
+    let e = parse_expr();
+    no_slit = sv;
+    return e;
+}
+// Name { field: value, field, ... }
+unsafe fn parse_struct_lit(nm: *u8, line: i32) -> *Expr {
+    let e = new_expr(E_SLIT, line);
+    e.name = nm;
+    expectop("{");
+    while !isop("}") {
+        let fl = cur().line;
+        let fi = new_expr(E_FINIT, fl);
+        fi.name = expect_id();
+        if acceptop(":") { fi.a = parse_expr_free(); }
+        else {
+            // shorthand: { x } means { x: x }
+            fi.a = new_expr(E_VAR, fl);
+            fi.a.name = fi.name;
+        }
+        add_arg(e, fi);
+        if !acceptop(",") { break; }
+    }
+    expectop("}");
+    return e;
+}
+unsafe fn parse_primary() -> *Expr {
+    let t = cur();
+    let line = t.line;
+    var e: *Expr;
+    if t.kind == TK_INT {
+        tp += 1;
+        e = new_expr(E_INT, line);
+        e.ival = t.v as i64;
+        return e;
+    }
+    if t.kind == TK_FLOAT {
+        tp += 1;
+        e = new_expr(E_FLOAT, line);
+        e.sval = t.s;
+        return e;
+    }
+    if t.kind == TK_CHAR {
+        tp += 1;
+        e = new_expr(E_INT, line);
+        e.ival = t.v as i64;
+        e.ty = ty_char;
+        e.cls = 1;
+        return e;
+    }
+    if t.kind == TK_STR {
+        tp += 1;
+        e = new_expr(E_STR, line);
+        e.sval = t.s;
+        e.slen = t.len;
+        return e;
+    }
+    if t.kind == TK_ID {
+        tp += 1;
+        if streq(t.s, "true") || streq(t.s, "false") {
+            e = new_expr(E_BOOL, line);
+            if t.s[0] == 't' { e.ival = 1; }
+            return e;
+        }
+        if streq(t.s, "null") {
+            e = new_expr(E_INT, line);
+            e.ty = ty_null;
+            e.cls = 2;
+            return e;
+        }
+        if streq(t.s, "sizeof") && isop("(") {
+            tp += 1;
+            e = new_expr(E_SIZEOF, line);
+            e.cty = parse_type();
+            expectop(")");
+            return e;
+        }
+        var nm = t.s;
+        let gn = find_generic(nm);
+        if gn != null && isop("<") {
+            // List<i32>(..), Vec<i32>.make(), max<i32>(..)
+            var ta: [8]*Type;
+            parse_type_args(gn, &ta[0], line);
+            if gn.kind == 2 {
+                if !isop("(") { dief(line, "generic function '%s' must be called", gn.name as i64, 0, 0); }
+                nm = instantiate_fn(gn, &ta[0], line).name;
+            } else { nm = instantiate_type(gn, &ta[0], line).sd.name; }
+        }
+        if isop("(") {
+            tp += 1;
+            e = new_expr(E_CALL, line);
+            e.name = nm;
+            if !isop(")") {
+                add_arg(e, parse_expr_free());
+                while acceptop(",") { add_arg(e, parse_expr_free()); }
+            }
+            expectop(")");
+            return e;
+        }
+        if isop("{") && no_slit == 0 {
+            let sd = find_struct(nm);
+            if sd != null && sd.is_class == 0 { return parse_struct_lit(nm, line); }
+        }
+        e = new_expr(E_VAR, line);
+        e.name = nm;
+        return e;
+    }
+    if acceptop("(") {
+        e = parse_expr_free();
+        expectop(")");
+        return e;
+    }
+    die(line, "expected expression");
+    return null;
+}
+
+unsafe fn parse_postfix() -> *Expr {
+    var e = parse_primary();
+    while true {
+        let line = cur().line;
+        if acceptop("[") {
+            let i = new_expr(E_INDEX, line);
+            i.a = e;
+            i.b = parse_expr_free();
+            expectop("]");
+            e = i;
+        } else if isop(".") {
+            tp += 1;
+            let fname = expect_id();
+            if isop("(") {
+                tp += 1;
+                let m = new_expr(E_MCALL, line);
+                m.a = e;
+                m.name = fname;
+                if !isop(")") {
+                    add_arg(m, parse_expr_free());
+                    while acceptop(",") { add_arg(m, parse_expr_free()); }
+                }
+                expectop(")");
+                e = m;
+            } else {
+                let f = new_expr(E_FIELD, line);
+                f.a = e;
+                f.name = fname;
+                e = f;
+            }
+        } else if isop("?") {
+            tp += 1;
+            let t = new_expr(E_TRY, line);
+            t.a = e;
+            e = t;
+        } else { break; }
+    }
+    return e;
+}
+
+unsafe fn parse_unary() -> *Expr {
+    let line = cur().line;
+    var e: *Expr;
+    if acceptop("-") {
+        let a = parse_unary();
+        if a.kind == E_INT && a.ty == null {
+            a.ival = 0 - a.ival;
+            a.neg = 1;
+            return a;
+        }
+        if a.kind == E_FLOAT {
+            // fold the sign into the literal text
+            if a.sval[0] == '-' { a.sval = a.sval + 1; }
+            else {
+                var nb: StrBuf;
+                sb_init(ref nb);
+                sb_cat(ref nb, "-");
+                sb_cat_c(ref nb, a.sval);
+                a.sval = nb.data;
+            }
+            return a;
+        }
+        e = new_expr(E_UN, line);
+        e.op = O_NEG;
+        e.a = a;
+        return e;
+    }
+    if acceptop("!") { e = new_expr(E_UN, line); e.op = O_NOT; e.a = parse_unary(); return e; }
+    if acceptop("~") { e = new_expr(E_UN, line); e.op = O_BNOT; e.a = parse_unary(); return e; }
+    if acceptop("*") { e = new_expr(E_UN, line); e.op = O_DEREF; e.a = parse_unary(); return e; }
+    if acceptop("&") { e = new_expr(E_UN, line); e.op = O_ADDR; e.a = parse_unary(); return e; }
+    if acceptkw("ref") { e = new_expr(E_REF, line); e.a = parse_unary(); return e; }
+    if acceptkw("await") { e = new_expr(E_AWAIT, line); e.a = parse_unary(); return e; }
+    return parse_postfix();
+}
+
+unsafe fn parse_cast() -> *Expr {
+    var e = parse_unary();
+    while iskw("as") {
+        let line = cur().line;
+        tp += 1;
+        let c = new_expr(E_CAST, line);
+        c.a = e;
+        c.cty = parse_type();
+        e = c;
+    }
+    return e;
+}
+
+// binary operator table: returns precedence (0 = not a binary operator); op code via bin_op
+unsafe fn bin_prec(s: *u8) -> i32 {
+    if strcmp(s as *u8, "||" as *u8) == 0 { return 1; }
+    if strcmp(s as *u8, "&&" as *u8) == 0 { return 2; }
+    if strcmp(s as *u8, "|" as *u8) == 0 { return 3; }
+    if strcmp(s as *u8, "^" as *u8) == 0 { return 4; }
+    if strcmp(s as *u8, "&" as *u8) == 0 { return 5; }
+    if strcmp(s as *u8, "==" as *u8) == 0 || strcmp(s as *u8, "!=" as *u8) == 0 { return 6; }
+    if strcmp(s as *u8, "<" as *u8) == 0 || strcmp(s as *u8, "<=" as *u8) == 0 || strcmp(s as *u8, ">" as *u8) == 0 || strcmp(s as *u8, ">=" as *u8) == 0 { return 7; }
+    if strcmp(s as *u8, "<<" as *u8) == 0 || strcmp(s as *u8, ">>" as *u8) == 0 { return 8; }
+    if strcmp(s as *u8, "+" as *u8) == 0 || strcmp(s as *u8, "-" as *u8) == 0 { return 9; }
+    if strcmp(s as *u8, "*" as *u8) == 0 || strcmp(s as *u8, "/" as *u8) == 0 || strcmp(s as *u8, "%" as *u8) == 0 { return 10; }
+    return 0;
+}
+unsafe fn bin_op(s: *u8) -> i32 {
+    if strcmp(s as *u8, "||" as *u8) == 0 { return O_LOR; }
+    if strcmp(s as *u8, "&&" as *u8) == 0 { return O_LAND; }
+    if strcmp(s as *u8, "|" as *u8) == 0 { return O_OR; }
+    if strcmp(s as *u8, "^" as *u8) == 0 { return O_XOR; }
+    if strcmp(s as *u8, "&" as *u8) == 0 { return O_AND; }
+    if strcmp(s as *u8, "==" as *u8) == 0 { return O_EQ; }
+    if strcmp(s as *u8, "!=" as *u8) == 0 { return O_NE; }
+    if strcmp(s as *u8, "<" as *u8) == 0 { return O_LT; }
+    if strcmp(s as *u8, "<=" as *u8) == 0 { return O_LE; }
+    if strcmp(s as *u8, ">" as *u8) == 0 { return O_GT; }
+    if strcmp(s as *u8, ">=" as *u8) == 0 { return O_GE; }
+    if strcmp(s as *u8, "<<" as *u8) == 0 { return O_SHL; }
+    if strcmp(s as *u8, ">>" as *u8) == 0 { return O_SHR; }
+    if strcmp(s as *u8, "+" as *u8) == 0 { return O_ADD; }
+    if strcmp(s as *u8, "-" as *u8) == 0 { return O_SUB; }
+    if strcmp(s as *u8, "*" as *u8) == 0 { return O_MUL; }
+    if strcmp(s as *u8, "/" as *u8) == 0 { return O_DIV; }
+    return O_MOD;
+}
+
+unsafe fn parse_binary(minprec: i32) -> *Expr {
+    var l = parse_cast();
+    while true {
+        if cur().kind != TK_OP { return l; }
+        let p = bin_prec(cur().s);
+        if p == 0 || p < minprec { return l; }
+        let op = bin_op(cur().s);
+        let line = cur().line;
+        tp += 1;
+        let r = parse_binary(p + 1);
+        let b = new_expr(E_BIN, line);
+        b.op = op;
+        b.a = l;
+        b.b = r;
+        l = b;
+    }
+    return l;
+}
+
+unsafe fn parse_expr() -> *Expr { return parse_binary(1); }
+
+unsafe fn parse_block() -> *Stmt {
+    let b = new_stmt(S_BLOCK, cur().line);
+    expectop("{");
+    while !isop("}") {
+        if cur().kind == TK_EOF { die(cur().line, "unexpected end of file in block"); }
+        add_child(b, parse_stmt());
+    }
+    tp += 1;
+    return b;
+}
+
+// compound-assignment operator for the current token, or -1
+unsafe fn asg_op() -> i32 {
+    if cur().kind != TK_OP { return 0 - 1; }
+    let s = cur().s;
+    if strcmp(s as *u8, "+=" as *u8) == 0 { return O_ADD; }
+    if strcmp(s as *u8, "-=" as *u8) == 0 { return O_SUB; }
+    if strcmp(s as *u8, "*=" as *u8) == 0 { return O_MUL; }
+    if strcmp(s as *u8, "/=" as *u8) == 0 { return O_DIV; }
+    if strcmp(s as *u8, "%=" as *u8) == 0 { return O_MOD; }
+    if strcmp(s as *u8, "&=" as *u8) == 0 { return O_AND; }
+    if strcmp(s as *u8, "|=" as *u8) == 0 { return O_OR; }
+    if strcmp(s as *u8, "^=" as *u8) == 0 { return O_XOR; }
+    if strcmp(s as *u8, "<<=" as *u8) == 0 { return O_SHL; }
+    if strcmp(s as *u8, ">>=" as *u8) == 0 { return O_SHR; }
+    return 0 - 1;
+}
+
+unsafe fn parse_stmt() -> *Stmt {
+    let line = cur().line;
+    var s: *Stmt;
+    if isop("{") { return parse_block(); }
+    if iskw("unsafe") && toks[tp + 1].kind == TK_OP && strcmp(toks[tp + 1].s, "{" as *u8) == 0 {
+        tp += 1;
+        s = parse_block();
+        s.unsafe_blk = 1;
+        return s;
+    }
+    if iskw("let") || iskw("var") || iskw("const") {
+        s = new_stmt(S_LET, line);
+        if iskw("var") { s.is_mut = 1; }
+        let is_c = iskw("const");
+        tp += 1;
+        s.name = expect_id();
+        if acceptop(":") { s.dty = parse_type(); }
+        if acceptop("=") { s.e = parse_expr(); }
+        if s.dty == null && s.e == null { dief(line, "declaration of '%s' needs a type or an initializer", s.name as i64, 0, 0); }
+        if is_c && s.e == null { dief(line, "constant '%s' needs a value", s.name as i64, 0, 0); }
+        expectop(";");
+        return s;
+    }
+    if acceptkw("if") {
+        s = new_stmt(S_IF, line);
+        s.e = parse_expr_head();
+        s.body = parse_block();
+        if acceptkw("else") {
+            if iskw("if") { s.els = parse_stmt(); } else { s.els = parse_block(); }
+        }
+        return s;
+    }
+    if acceptkw("while") {
+        s = new_stmt(S_WHILE, line);
+        s.e = parse_expr_head();
+        s.body = parse_block();
+        return s;
+    }
+    if acceptkw("for") {
+        s = new_stmt(S_FOR, line);
+        s.name = expect_id();
+        if !acceptkw("in") { die(line, "expected 'in'"); }
+        s.e = parse_expr_head();
+        if acceptop("..") {
+            s.is_range = 1;
+            s.e2 = parse_expr_head();
+        }
+        s.body = parse_block();
+        return s;
+    }
+    if acceptkw("return") {
+        s = new_stmt(S_RET, line);
+        if !isop(";") { s.e = parse_expr(); }
+        expectop(";");
+        return s;
+    }
+    if acceptkw("break") { s = new_stmt(S_BRK, line); expectop(";"); return s; }
+    if acceptkw("continue") { s = new_stmt(S_CONT, line); expectop(";"); return s; }
+    if acceptkw("match") {
+        s = new_stmt(S_MATCH, line);
+        s.e = parse_expr_head();
+        expectop("{");
+        while !isop("}") {
+            var pat: *Expr = null;
+            if iskw("_") { tp += 1; } else { pat = parse_expr(); }
+            expectop("=>");
+            var body: *Stmt;
+            if isop("{") { body = parse_block(); }
+            else {
+                body = new_stmt(S_EXPR, cur().line);
+                body.e = parse_expr();
+            }
+            acceptop(",");
+            let arm = new_stmt(S_ARM, body.line);
+            arm.e = pat;
+            arm.body = body;
+            add_child(s, arm);
+        }
+        tp += 1;
+        return s;
+    }
+    let lhs = parse_expr();
+    if acceptop("=") {
+        s = new_stmt(S_ASSIGN, line);
+        s.e = lhs;
+        s.e2 = parse_expr();
+        expectop(";");
+        return s;
+    }
+    let ao = asg_op();
+    if ao >= 0 {
+        tp += 1;
+        s = new_stmt(S_ASSIGN, line);
+        s.e = lhs;
+        let b = new_expr(E_BIN, line);
+        b.op = ao;
+        b.a = lhs;
+        b.b = parse_expr();
+        s.e2 = b;
+        expectop(";");
+        return s;
+    }
+    s = new_stmt(S_EXPR, line);
+    s.e = lhs;
+    expectop(";");
+    return s;
+}
+
+// at '{': skip to after the matching '}'
+unsafe fn skip_block() {
+    var depth = 0;
+    while true {
+        if cur().kind == TK_EOF { die(cur().line, "unexpected end of file"); }
+        if isop("{") { depth += 1; }
+        else if isop("}") {
+            depth -= 1;
+            if depth == 0 { tp += 1; return; }
+        }
+        tp += 1;
+    }
+}
+unsafe fn skip_type_params() {
+    while !isop(">") {
+        if cur().kind == TK_EOF { die(cur().line, "malformed type parameter list"); }
+        tp += 1;
+    }
+    tp += 1;
+}
+unsafe fn parse_struct() {
+    let line = cur().line;
+    let n = expect_id();
+    if isop("<") { skip_type_params(); skip_block(); return; }   // generic template
+    parse_struct_body(find_struct(n), line);
+}
+unsafe fn parse_struct_body(sd: *StructDef, line: i32) {
+    let n = sd.name;
+    if sd.done != 0 { dief(line, "struct '%s' redefined", n as i64, 0, 0); }
+    expectop("{");
+    var off = 0;
+    var al = 1;
+    while !isop("}") {
+        let fl = cur().line;
+        let fname = expect_id();
+        expectop(":");
+        let fty = parse_type();
+        need_complete(fty, fl);
+        if has_iface(fty) { dief(fl, IFACE_MSG, tname(fty) as i64, 0, 0); }
+        if !acceptop(";") { acceptop(","); }
+        if fty.align > al { al = fty.align; }
+        off = (off + fty.align - 1) / fty.align * fty.align;
+        var i = 0;
+        while i < sd.nf {
+            if (strcmp(sd.f[i].name, fname) == 0) { dief(fl, "duplicate field '%s'", fname as i64, 0, 0); }
+            i += 1;
+        }
+        if sd.nf >= 64 { die(fl, "too many fields"); }
+        sd.f[sd.nf].name = fname;
+        sd.f[sd.nf].ty = fty;
+        sd.f[sd.nf].off = off;
+        sd.f[sd.nf].is_mut = 1;
+        sd.nf += 1;
+        off += fty.size;
+    }
+    tp += 1;
+    sd.ty.size = (off + al - 1) / al * al;
+    sd.ty.align = al;
+    if sd.ty.size == 0 { sd.ty.size = 1; }
+    sd.done = 1;
+}
+
+unsafe fn parse_enum() {
+    let n = expect_id();
+    let ed = find_enum(n);
+    expectop("{");
+    while !isop("}") {
+        if ed.nv >= 128 { die(cur().line, "too many enum variants"); }
+        ed.vn[ed.nv] = expect_id();
+        ed.nv += 1;
+        if !acceptop(",") { break; }
+    }
+    expectop("}");
+}
+
+unsafe fn parse_fn_ex(cls: *StructDef, is_unsafe: i32, is_extern: i32, is_static: i32, vis: i32, is_ctor: i32, force: *u8, ifc: *Iface) {
+    let f = zalloc(sizeof(Func)) as *Func;
+    f.line = cur().line;
+    if rt_fidx >= 0 && (f.line >> 26) == rt_fidx { f.borrow = 1; }
+    f.is_unsafe = is_unsafe;
+    f.is_extern = is_extern;
+    var mn: *u8 = "ctor" as *u8;
+    if is_ctor == 2 { mn = "dtor" as *u8; }
+    if is_ctor == 0 { mn = expect_id(); }
+    var is_ctor2 = is_ctor;
+    var is_dtor = 0;
+    if is_ctor == 2 { is_dtor = 1; is_ctor2 = 0; }
+    if force != null { skip_type_params(); mn = force; }
+    if cls != null || ifc != null {
+        var nb: StrBuf;
+        sb_init(ref nb);
+        if cls != null { sb_cat_c(ref nb, cls.name); } else { sb_cat_c(ref nb, ifc.name); }
+        sb_cat(ref nb, ".");
+        sb_cat_c(ref nb, mn);
+        f.name = nb.data;
+    } else { f.name = mn; }
+    f.cls = cls;
+    f.is_ctor = is_ctor2;
+    f.is_static = is_static;
+    f.vis = vis;
+    if cls != null && is_static == 0 && is_ctor2 == 0 && is_dtor == 0 { f.is_method = 1; }
+    f.is_dtor = is_dtor;
+    if is_dtor != 0 { cls.dtor = f; }
+    if cls != null && is_static == 0 {
+        f.pname[0] = "this" as *u8;
+        f.pty[0] = cls.ty;
+        f.pref[0] = 1;
+        f.nparams = 1;
+    }
+    if ifc != null {
+        f.ifc = ifc;
+        f.is_method = 1;
+        f.vt_idx = ifc.nm;
+        f.pname[0] = "this" as *u8;
+        f.pty[0] = ifc.ty;
+        f.pref[0] = 1;
+        f.nparams = 1;
+    }
+    var plist = true;
+    if is_dtor != 0 && !isop("(") { plist = false; }   // dtor { ... }
+    if plist { expectop("("); }
+    if plist && !isop(")") {
+        var more = true;
+        while more {
+            if f.nparams >= 16 { die(cur().line, "too many parameters"); }
+            var rf = 0;
+            if acceptkw("ref") { rf = 1; }
+            let pn = expect_id();
+            expectop(":");
+            let pt = parse_type();
+            if has_iface(pt) && (rf != 0 || pt.kind != TY_IFACE) { dief(f.line, IFACE_MSG, tname(pt) as i64, 0, 0); }
+            f.pname[f.nparams] = pn;
+            f.pty[f.nparams] = pt;
+            f.pref[f.nparams] = rf;
+            f.nparams += 1;
+            more = acceptop(",");
+        }
+    }
+    if plist {
+        expectop(")");
+        if is_dtor != 0 && f.nparams != 1 { die(f.line, "a destructor takes no parameters"); }
+    }
+    f.ret = ty_void;
+    if is_ctor2 == 0 && is_dtor == 0 && acceptop("->") { f.ret = parse_type(); }
+    if acceptkw("requires") {
+        // callers need these capabilities
+        while true {
+            if f.nreq == 8 { die(f.line, "a function can require at most 8 capabilities"); }
+            f.req[f.nreq] = parse_dotted();
+            f.nreq += 1;
+            if !acceptop(",") { break; }
+        }
+    }
+    if has_iface(f.ret) { dief(f.line, IFACE_MSG, tname(f.ret) as i64, 0, 0); }
+    var i = 0;
+    while i < nfuncs {
+        if (strcmp(funcs[i].name, f.name) == 0) {
+            let g = funcs[i];
+            var same_sig = is_extern != 0 && g.is_extern != 0 && g.nparams == f.nparams && same(g.ret, f.ret);
+            var k = 0;
+            while same_sig && k < f.nparams {
+                if g.pref[k] != f.pref[k] || !same(g.pty[k], f.pty[k]) { same_sig = false; }
+                k += 1;
+            }
+            if same_sig { expectop(";"); return; }   // the same extern declared again (e.g. by two modules)
+            if rt_fidx >= 0 && (f.line >> 26) == rt_fidx { dief(g.line, "'%s' is a runtime function (lib/rt/prelude.ag); declare it with the same signature or use another name", f.name as i64, 0, 0); }
+            dief(f.line, "function '%s' redefined", f.name as i64, 0, 0);
+        }
+        i += 1;
+    }
+    if is_extern != 0 || ifc != null { expectop(";"); } else { f.body = parse_block(); }
+    if ifc != null {
+        if ifc.nm >= 64 { die(f.line, "too many interface methods"); }
+        ifc.m[ifc.nm] = f;
+        ifc.nm += 1;
+    }
+    if nfuncs >= 1024 { die(f.line, "too many functions"); }
+    funcs[nfuncs] = f;
+    nfuncs += 1;
+}
+
+unsafe fn parse_fn(is_unsafe: i32, is_extern: i32) {
+    if cur().kind == TK_ID && toks[tp + 1].kind == TK_OP && streq(toks[tp + 1].s, "<") {
+        // generic template: skipped until instantiated
+        tp += 2;
+        skip_type_params();
+        while !isop("{") {
+            if cur().kind == TK_EOF { die(cur().line, "unexpected end of file"); }
+            tp += 1;
+        }
+        skip_block();
+        return;
+    }
+    parse_fn_ex(null, is_unsafe, is_extern, 0, 0, 0, null, null);
+}
+
+// class bodies are parsed in two passes: fields first (so the layout is known and the class is
+// complete), then methods
+unsafe fn skip_member() {
+    var depth = 0;
+    while true {
+        if cur().kind == TK_EOF { die(cur().line, "unexpected end of file in class"); }
+        if isop("{") { depth += 1; }
+        else if isop("}") {
+            depth -= 1;
+            if depth <= 0 { tp += 1; return; }
+        }
+        else if isop(";") && depth == 0 { tp += 1; return; }
+        tp += 1;
+    }
+}
+
+unsafe fn parse_class_pass(sd: *StructDef, pass: i32, ref has_ctor: i32) {
+    var vis = 1;
+    var gstatic = 0;
+    var off = 0;
+    var al = 1;
+    if sd.base != null {
+        off = sd.base.ty.size;
+        al = sd.base.ty.align;
+    }
+    while !isop("}") {
+        let ml = cur().line;
+        if cur().kind == TK_EOF { die(ml, "unexpected end of file in class"); }
+        if cur().kind == TK_ID && vis_of(cur().s) >= 0 &&
+           ((toks[tp + 1].kind == TK_OP && streq(toks[tp + 1].s, ":")) ||
+            (toks[tp + 1].kind == TK_ID && streq(toks[tp + 1].s, "static") && toks[tp + 2].kind == TK_OP && streq(toks[tp + 2].s, ":"))) {
+            vis = vis_of(cur().s);
+            tp += 1;
+            gstatic = 0;
+            if acceptkw("static") { gstatic = 1; }
+            expectop(":");
+            continue;
+        }
+        if iskw("let") || iskw("var") {
+            if pass == 1 { skip_member(); continue; }
+            var fm = 0;
+            if iskw("var") { fm = 1; }
+            tp += 1;
+            let fname = expect_id();
+            expectop(":");
+            let fty = parse_type();
+            need_complete(fty, ml);
+            if has_iface(fty) { dief(ml, IFACE_MSG, tname(fty) as i64, 0, 0); }
+            var finit: *Expr = null;
+            if acceptop("=") { finit = parse_expr(); }
+            expectop(";");
+            if fty.align > al { al = fty.align; }
+            off = (off + fty.align - 1) / fty.align * fty.align;
+            var i = 0;
+            while i < sd.nf {
+                if (strcmp(sd.f[i].name, fname) == 0) { dief(ml, "duplicate field '%s'", fname as i64, 0, 0); }
+                i += 1;
+            }
+            if sd.nf >= 64 { die(ml, "too many fields"); }
+            sd.f[sd.nf].name = fname;
+            sd.f[sd.nf].ty = fty;
+            sd.f[sd.nf].off = off;
+            sd.f[sd.nf].is_mut = fm;
+            sd.f[sd.nf].vis = vis;
+            sd.f[sd.nf].init = finit;
+            sd.f[sd.nf].owner = sd;
+            sd.nf += 1;
+            off += fty.size;
+            continue;
+        }
+        var st = gstatic;
+        if iskw("static") && toks[tp + 1].kind != TK_OP { tp += 1; st = 1; }
+        if pass == 0 { skip_member(); continue; }
+        if iskw("ctor") {
+            tp += 1;
+            has_ctor = 1;
+            parse_fn_ex(sd, 0, 0, 0, 0, 1, null, null);
+        } else if iskw("dtor") {
+            tp += 1;
+            parse_fn_ex(sd, 0, 0, 0, 0, 2, null, null);
+        } else if acceptkw("fn") {
+            parse_fn_ex(sd, 0, 0, st, vis, 0, null, null);
+        } else if acceptkw("unsafe") {
+            if !acceptkw("fn") { die(ml, "expected 'fn' after 'unsafe'"); }
+            parse_fn_ex(sd, 1, 0, st, vis, 0, null, null);
+        } else if acceptkw("safe") {
+            if !acceptkw("fn") { die(ml, "expected 'fn' after 'safe'"); }
+            parse_fn_ex(sd, 0, 0, st, vis, 0, null, null);
+        } else {
+            var what: *u8 = "token" as *u8;
+            if cur().s != null { what = cur().s; }
+            dief(ml, "unexpected '%s' in class body (expected a field, 'fn' or 'ctor')", what as i64, 0, 0);
+        }
+    }
+    if pass == 0 {
+        sd.ty.size = (off + al - 1) / al * al;
+        sd.ty.align = al;
+        if sd.ty.size == 0 { sd.ty.size = 1; }
+    }
+}
+
+unsafe fn parse_class() {
+    let line = cur().line;
+    let n = expect_id();
+    if isop("<") {
+        // generic template
+        skip_type_params();
+        while !isop("{") {
+            if cur().kind == TK_EOF { die(line, "unexpected end of file"); }
+            tp += 1;
+        }
+        skip_block();
+        return;
+    }
+    parse_class_body(find_struct(n), line);
+}
+
+unsafe fn parse_class_body(sd: *StructDef, line: i32) {
+    let n = sd.name;
+    if sd.done != 0 { dief(line, "class '%s' redefined", n as i64, 0, 0); }
+    sd.line = line;
+    if acceptop(":") {
+        // class C : Base, Iface1, Iface2
+        var more = true;
+        while more {
+            let bl = cur().line;
+            let bt = parse_type();
+            if bt.kind == TY_IFACE {
+                if sd.nifs >= 16 { die(bl, "too many interfaces"); }
+                sd.ifs[sd.nifs] = bt.ifc;
+                sd.nifs += 1;
+            } else if bt.kind == TY_STRUCT && bt.sd.is_class != 0 {
+                if sd.base != null { dief(bl, "class '%s' can only extend one class", n as i64, 0, 0); }
+                if sd.nifs != 0 { die(bl, "the base class must come before the interfaces"); }
+                need_complete(bt, bl);
+                if is_sub(bt.sd, sd) { dief(bl, "class '%s' cannot extend itself", n as i64, 0, 0); }
+                sd.base = bt.sd;
+                var i = 0;
+                while i < bt.sd.nf {
+                    // inherited fields: same offsets
+                    if sd.nf >= 64 { die(bl, "too many fields"); }
+                    memcpy(&sd.f[sd.nf] as *u8, &bt.sd.f[i] as *u8, sizeof(FieldDef));
+                    sd.nf += 1;
+                    i += 1;
+                }
+            } else { dief(bl, "'%s' is not a class or interface", tname(bt) as i64, 0, 0); }
+            more = acceptop(",");
+        }
+    }
+    expectop("{");
+    let start = tp;
+    var has_ctor = 0;
+    parse_class_pass(sd, 0, ref has_ctor);
+    sd.done = 1;
+    sd.is_class = 1;
+    tp = start;
+    parse_class_pass(sd, 1, ref has_ctor);
+    expectop("}");
+    if has_ctor == 0 {
+        // synthesize an empty constructor so field defaults still run
+        let f = zalloc(sizeof(Func)) as *Func;
+        f.line = line;
+        var nb: StrBuf;
+        sb_init(ref nb);
+        sb_cat_c(ref nb, sd.name);
+        sb_cat(ref nb, ".ctor");
+        f.name = nb.data;
+        f.cls = sd;
+        f.is_ctor = 1;
+        f.ret = ty_void;
+        f.pname[0] = "this" as *u8;
+        f.pty[0] = sd.ty;
+        f.pref[0] = 1;
+        f.nparams = 1;
+        f.body = new_stmt(S_BLOCK, line);
+        if nfuncs >= 1024 { die(line, "too many functions"); }
+        funcs[nfuncs] = f;
+        nfuncs += 1;
+    }
+}
+
+unsafe fn parse_interface() {
+    let line = cur().line;
+    let n = expect_id();
+    let ifc = find_iface(n);
+    if ifc.nm != 0 { dief(line, "interface '%s' redefined", n as i64, 0, 0); }
+    expectop("{");
+    while !isop("}") {
+        let ml = cur().line;
+        if cur().kind == TK_EOF { die(ml, "unexpected end of file in interface"); }
+        if acceptkw("fn") { parse_fn_ex(null, 0, 0, 0, 0, 0, null, ifc); }
+        else if acceptkw("unsafe") {
+            if !acceptkw("fn") { die(ml, "expected 'fn' after 'unsafe'"); }
+            parse_fn_ex(null, 1, 0, 0, 0, 0, null, ifc);
+        }
+        else { die(ml, "interfaces can only contain method signatures ('fn name(..) -> T;')"); }
+    }
+    tp += 1;
+}
+
+unsafe fn prescan() {
+    var i = 0;
+    while toks[i].kind != TK_EOF {
+        if toks[i].kind == TK_ID && toks[i + 1].kind == TK_ID && toks[i + 2].kind == TK_OP && streq(toks[i + 2].s, "<") &&
+           (streq(toks[i].s, "class") || streq(toks[i].s, "struct") || streq(toks[i].s, "fn")) {
+            let g = zalloc(sizeof(Generic)) as *Generic;
+            g.name = toks[i + 1].s;
+            g.line = toks[i].line;
+            if toks[i].s[0] == 'c' { g.kind = 0; } else if toks[i].s[0] == 's' { g.kind = 1; } else { g.kind = 2; }
+            if i > 0 && toks[i - 1].kind == TK_ID && streq(toks[i - 1].s, "unsafe") { g.is_unsafe = 1; }
+            if i > 0 && toks[i - 1].kind == TK_ID && streq(toks[i - 1].s, "async") { g.is_async = 1; }
+            var j = i + 3;
+            while toks[j].kind == TK_ID {
+                if g.np >= 8 { die(g.line, "too many type parameters"); }
+                g.pn[g.np] = toks[j].s;
+                j += 1;
+                if toks[j].kind == TK_OP && streq(toks[j].s, ":") && toks[j + 1].kind == TK_ID {
+                    g.pc[g.np] = toks[j + 1].s;
+                    j += 2;
+                }
+                g.np += 1;
+                if toks[j].kind == TK_OP && streq(toks[j].s, ",") { j += 1; } else { break; }
+            }
+            if g.np == 0 || !(toks[j].kind == TK_OP && streq(toks[j].s, ">")) { die(g.line, "malformed type parameter list"); }
+            if g.kind == 2 { g.start = i + 1; } else { g.start = j + 1; }
+            if find_generic(g.name) != null || find_struct(g.name) != null || find_enum(g.name) != null || find_iface(g.name) != null { dief(g.line, "type '%s' redefined", g.name as i64, 0, 0); }
+            gens[ngens] = g;
+            ngens += 1;
+            i += 1;
+            continue;
+        }
+        if toks[i].kind == TK_ID && toks[i + 1].kind == TK_ID && streq(toks[i].s, "interface") {
+            let n = toks[i + 1].s;
+            if find_struct(n) != null || find_enum(n) != null || find_generic(n) != null || find_iface(n) != null { dief(toks[i].line, "type '%s' redefined", n as i64, 0, 0); }
+            let ifc = zalloc(sizeof(Iface)) as *Iface;
+            ifc.name = n;
+            ifc.ty = zalloc(sizeof(Type)) as *Type;
+            ifc.ty.kind = TY_IFACE;
+            ifc.ty.ifc = ifc;
+            ifc.ty.size = 16;
+            ifc.ty.align = 8;
+            ifaces[nifaces] = ifc;
+            nifaces += 1;
+            i += 1;
+            continue;
+        }
+        if toks[i].kind == TK_ID && toks[i + 1].kind == TK_ID && (streq(toks[i].s, "struct") || streq(toks[i].s, "enum") || streq(toks[i].s, "class")) {
+            let n = toks[i + 1].s;
+            if find_struct(n) != null || find_enum(n) != null || find_generic(n) != null || find_iface(n) != null { dief(toks[i].line, "type '%s' redefined", n as i64, 0, 0); }
+            if toks[i].s[0] != 'e' {
+                let sd = zalloc(sizeof(StructDef)) as *StructDef;
+                sd.name = n;
+                sd.ty = zalloc(sizeof(Type)) as *Type;
+                sd.ty.kind = TY_STRUCT;
+                sd.ty.sd = sd;
+                sd.ty.size = 1;
+                sd.ty.align = 1;
+                structs[nstructs] = sd;
+                nstructs += 1;
+            } else {
+                let ed = zalloc(sizeof(EnumDef)) as *EnumDef;
+                ed.name = n;
+                ed.ty = zalloc(sizeof(Type)) as *Type;
+                ed.ty.kind = TY_ENUM;
+                ed.ty.size = 4;
+                ed.ty.align = 4;
+                ed.ty.sign = 1;
+                ed.ty.ed = ed;
+                enums[nenums] = ed;
+                nenums += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+unsafe fn parse_program() {
+    mod_name = "main" as *u8;
+    while cur().kind != TK_EOF {
+        let line = cur().line;
+        let imp = (line >> 26) != 0;
+        if imp && (iskw("allow") || iskw("deny") || iskw("protect")) {
+            die(line, "imported modules cannot declare capabilities or protection; the importing module decides");
+        }
+        if acceptkw("module") {
+            let mn = parse_dotted();
+            if !imp { mod_name = mn; }
+            expectop(";");
+        } else if acceptkw("import") {
+            parse_dotted();
+            expectop(";");
+        } else if acceptkw("allow") {
+            let c = parse_dotted();
+            expectop(";");
+            allow_caps[nallow] = c;
+            nallow += 1;
+        } else if acceptkw("deny") {
+            let c = parse_dotted();
+            expectop(";");
+            deny_caps[ndeny] = c;
+            ndeny += 1;
+        } else if acceptkw("protect") {
+            let c = expect_id();
+            if !streq(c, "Process") { die(line, "only 'protect Process;' is supported"); }
+            protect_process = 1;
+            expectop(";");
+        } else if acceptkw("const") {
+            let g = zalloc(sizeof(Local)) as *Local;
+            g.is_global = 1;
+            g.is_const = 1;
+            g.line = line;
+            g.name = expect_id();
+            if acceptop(":") { g.ty = parse_type(); }
+            expectop("=");
+            var x = parse_expr();
+            var v: i64 = 0;
+            if const_eval(x, ref v) {
+                let cl = x.line;
+                x = new_expr(E_INT, cl);
+                x.ival = v;
+                if v < 0 { x.neg = 1; }
+            }
+            else if !(x.kind == E_FLOAT || x.kind == E_BOOL || x.kind == E_STR) {
+                dief(line, "constant '%s' must be a literal or an integer expression of literals and constants", g.name as i64, 0, 0);
+            }
+            g.init = x;
+            expectop(";");
+            globals[nglobals] = g;
+            nglobals += 1;
+        } else if iskw("let") || iskw("var") {
+            let g = zalloc(sizeof(Local)) as *Local;
+            g.is_global = 1;
+            if iskw("var") { g.is_mut = 1; }
+            g.line = line;
+            tp += 1;
+            g.name = expect_id();
+            if acceptop(":") { g.ty = parse_type(); }
+            if acceptop("=") { g.init = parse_expr(); }
+            if g.ty == null && g.init == null { dief(line, "global '%s' needs a type or an initializer", g.name as i64, 0, 0); }
+            expectop(";");
+            globals[nglobals] = g;
+            nglobals += 1;
+        } else if acceptkw("struct") {
+            parse_struct();
+        } else if acceptkw("enum") {
+            parse_enum();
+        } else if acceptkw("class") {
+            parse_class();
+        } else if acceptkw("interface") {
+            parse_interface();
+        } else if acceptkw("extern") {
+            if !acceptkw("fn") { die(line, "expected 'fn' after 'extern'"); }
+            parse_fn(1, 1);
+        } else if acceptkw("unsafe") {
+            if !acceptkw("fn") { die(line, "expected 'fn' after 'unsafe'"); }
+            parse_fn(1, 0);
+        } else if acceptkw("safe") {
+            if acceptkw("extern") {
+                // a C function the standard library vouches for: callable from safe code
+                if file_trusted[line >> 26] == 0 { die(line, "only the standard library can declare 'safe extern' functions"); }
+                if !acceptkw("fn") { die(line, "expected 'fn' after 'extern'"); }
+                parse_fn(0, 1);
+            } else {
+                if !acceptkw("fn") { die(line, "expected 'fn' after 'safe'"); }
+                parse_fn(0, 0);
+            }
+        } else if acceptkw("fn") {
+            parse_fn(0, 0);
+        } else if isop("@") {
+            // attributes: @test, @deprecated before a function
+            var at = 0;
+            var ad = 0;
+            while acceptop("@") {
+                let al = cur().line;
+                let a = expect_id();
+                if streq(a, "test") { at = 1; }
+                else if streq(a, "deprecated") { ad = 1; }
+                else { dief(al, "unknown attribute '@%s' (known: @test, @deprecated)", a as i64, 0, 0); }
+            }
+            let nf0 = nfuncs;
+            if !acceptkw("fn") { die(cur().line, "an attribute must be followed by a function"); }
+            parse_fn(0, 0);
+            if nfuncs == nf0 { die(line, "attributes cannot be used on generic functions"); }
+            funcs[nfuncs - 1].is_test = at;
+            funcs[nfuncs - 1].is_deprecated = ad;
+        } else if acceptkw("async") {
+            // async fn: calling it starts a task
+            if !acceptkw("fn") { die(line, "expected 'fn' after 'async'"); }
+            let nf0 = nfuncs;
+            parse_fn(0, 0);
+            if nfuncs > nf0 { funcs[nfuncs - 1].is_async = 1; }
+        } else {
+            var what: *u8 = "token" as *u8;
+            if cur().s != null { what = cur().s; }
+            dief(line, "unexpected '%s' at top level (expected fn, struct, class, enum, interface, const, let, var or import)", what as i64, 0, 0);
+        }
+    }
+}
+
+// ---- imports ----
+
+unsafe fn dir_of(path: *u8) -> *u8 {
+    var n = strlen(path) as i32;
+    var i = n - 1;
+    while i >= 0 && path[i] != '/' { i -= 1; }
+    if i < 0 { return dup_n("." as *u8, 1); }
+    if i == 0 { return dup_n("/" as *u8, 1); }
+    return dup_n(path, i);
+}
+
+var rt_fidx: i32 = -1;   // file index of lib/rt/prelude.ag: its code is trusted (no capability checks)
+// lib/rt/prelude.ag is part of every program (appended after the main module)
+unsafe fn load_prelude() {
+    var path: [1200]u8;
+    snprintf(&path[0], 1200, "%s/lib/rt/prelude.ag", exe_dir as i64, 0, 0);
+    if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/../lib/rt/prelude.ag", exe_dir as i64, 0, 0); }
+    if !file_exists(&path[0]) { printf("aegisc: cannot find the runtime prelude (lib/rt/prelude.ag)\n", 0, 0, 0); exit(1); }
+    let pc = dup_n(&path[0], strlen(&path[0]) as i32);
+    loaded[nloaded] = pc;
+    nloaded += 1;
+    add_file_name("lib/rt/prelude.ag" as *u8);
+    rt_fidx = nfile_names - 1;
+    file_trusted[rt_fidx] = 1;
+    var len: i32 = 0;
+    let src = read_file(pc as String, ref len);
+    var cnt: i32 = 0;
+    let nt = lex_to_array(src, len, nfile_names - 1, ref cnt);
+    let newn = ntoks - 1 + cnt;
+    let arr = zalloc(sizeof(Token) * ((newn + 1) as u64)) as *Token;
+    memcpy(arr as *u8, toks as *u8, sizeof(Token) * ((ntoks - 1) as u64));
+    memcpy((arr as *u8) + ((ntoks - 1) as i64) * (sizeof(Token) as i64), nt as *u8, sizeof(Token) * (cnt as u64));
+    toks = arr;
+    ntoks = newn;
+    ctoks = newn + 1;
+}
+// fn main(args: Vec<String>): a generated entry point (lib/rt/args.ag, not a real file) collects the command line
+unsafe fn tok_is(i: i32, k: i32, s: String) -> bool { return toks[i].kind == k && streq(toks[i].s, s); }
+unsafe fn load_main_args() {
+    var depth = 0;
+    var found = false;
+    var isvoid = true;
+    var i = 0;
+    while toks[i].kind != TK_EOF && (toks[i].line >> 26) == 0 {
+        if tok_is(i, TK_OP, "{") { depth += 1; }
+        else if tok_is(i, TK_OP, "}") { depth -= 1; }
+        else if depth == 0 && tok_is(i, TK_ID, "fn") && tok_is(i + 1, TK_ID, "main") && tok_is(i + 2, TK_OP, "(") && toks[i + 3].kind == TK_ID && !(i > 0 && tok_is(i - 1, TK_ID, "unsafe")) {
+            var j = i + 3;
+            while toks[j].kind != TK_EOF && !tok_is(j, TK_OP, ")") { j += 1; }
+            found = true;
+            isvoid = !(toks[j].kind != TK_EOF && tok_is(j + 1, TK_OP, "->"));
+        }
+        i += 1;
+    }
+    if !found { return; }
+    var b: StrBuf;
+    sb_init(ref b);
+    sb_cat(ref b, "module rt.args;\nimport std.vec;\n");
+    sb_cat(ref b, "unsafe fn __aegis_main(argc: i32, argv: **u8) -> i32 {\n");
+    sb_cat(ref b, "    var args = Vec<String>();\n");
+    sb_cat(ref b, "    var i = 0;\n");
+    sb_cat(ref b, "    while i < argc { args.push(*(argv + i) as String); i += 1; }\n");
+    if isvoid { sb_cat(ref b, "    main(args);\n    return 0;\n"); } else { sb_cat(ref b, "    return main(args);\n"); }
+    sb_cat(ref b, "}\n");
+    add_file_name("lib/rt/args.ag" as *u8);
+    file_trusted[nfile_names - 1] = 1;
+    var cnt: i32 = 0;
+    let nt = lex_to_array(b.data, b.len as i32, nfile_names - 1, ref cnt);
+    let newn = ntoks - 1 + cnt;
+    let arr = zalloc(sizeof(Token) * ((newn + 1) as u64)) as *Token;
+    memcpy(arr as *u8, toks as *u8, sizeof(Token) * ((ntoks - 1) as u64));
+    memcpy((arr as *u8) + ((ntoks - 1) as i64) * (sizeof(Token) as i64), nt as *u8, sizeof(Token) * (cnt as u64));
+    toks = arr;
+    ntoks = newn;
+    ctoks = newn + 1;
+}
+// aegisc --test: a generated runner (lib/rt/tests.ag, not a real file) runs every @test function of the main file
+// in its own process, so a failing test (panic, runtime error) does not stop the others
+var test_mode: i32;
+unsafe fn load_test_runner() {
+    var names: [512]*u8;
+    var n = 0;
+    var depth = 0;
+    var i = 0;
+    while toks[i].kind != TK_EOF && (toks[i].line >> 26) == 0 {
+        if tok_is(i, TK_OP, "{") { depth += 1; }
+        else if tok_is(i, TK_OP, "}") { depth -= 1; }
+        else if depth == 0 && tok_is(i, TK_OP, "@") && tok_is(i + 1, TK_ID, "test") {
+            var j = i + 2;
+            while tok_is(j, TK_OP, "@") && toks[j + 1].kind == TK_ID { j += 2; }
+            if tok_is(j, TK_ID, "fn") && toks[j + 1].kind == TK_ID && n < 512 { names[n] = toks[j + 1].s; n += 1; }
+        }
+        i += 1;
+    }
+    var b: StrBuf;
+    sb_init(ref b);
+    var buf: [400]u8;
+    sb_cat(ref b, "module rt.tests;\nextern fn fork() -> i32;\nextern fn waitpid(pid: i32, status: *i32, options: i32) -> i32;\n");
+    sb_cat(ref b, "extern fn _exit(code: i32);\nextern fn fflush(f: *u8) -> i32;\nfn __aegis_call_test(i: i32) {\n");
+    var k = 0;
+    while k < n {
+        snprintf(&buf[0], 400, "    if i == %d { %s(); }\n", k as i64, names[k] as i64, 0);
+        sb_cat_c(ref b, &buf[0]);
+        k += 1;
+    }
+    sb_cat(ref b, "}\nfn __aegis_run_test(i: i32) -> bool {\n    var st: i32 = 0;\n    unsafe {\n        fflush(null);\n");
+    sb_cat(ref b, "        let pid = fork();\n        if pid == 0 { __aegis_call_test(i); fflush(null); _exit(0); }\n");
+    sb_cat(ref b, "        waitpid(pid, &st, 0);\n    }\n    return st == 0;\n}\nfn __aegis_tests() -> i32 {\n    var failed = 0;\n");
+    var plural: *u8 = "s" as *u8;
+    if n == 1 { plural = "" as *u8; }
+    snprintf(&buf[0], 400, "    println(\"running %d test%s\");\n", n as i64, plural as i64, 0);
+    sb_cat_c(ref b, &buf[0]);
+    k = 0;
+    while k < n {
+        snprintf(&buf[0], 400, "    if __aegis_run_test(%d) { println(\"test %s ... ok\"); }", k as i64, names[k] as i64, 0);
+        sb_cat_c(ref b, &buf[0]);
+        snprintf(&buf[0], 400, " else { println(\"test %s ... FAILED\"); failed += 1; }\n", names[k] as i64, 0, 0);
+        sb_cat_c(ref b, &buf[0]);
+        k += 1;
+    }
+    snprintf(&buf[0], 400, "    if failed == 0 { println(\"test result: ok. %d passed\"); return 0; }\n", n as i64, 0, 0);
+    sb_cat_c(ref b, &buf[0]);
+    snprintf(&buf[0], 400, "    println(\"test result: FAILED. \" + (%d - failed) + \" passed, \" + failed + \" failed\");\n    return 1;\n}\n", n as i64, 0, 0);
+    sb_cat_c(ref b, &buf[0]);
+    add_file_name("lib/rt/tests.ag" as *u8);
+    file_trusted[nfile_names - 1] = 1;
+    var cnt: i32 = 0;
+    let nt = lex_to_array(b.data, b.len as i32, nfile_names - 1, ref cnt);
+    let newn = ntoks - 1 + cnt;
+    let arr = zalloc(sizeof(Token) * ((newn + 1) as u64)) as *Token;
+    memcpy(arr as *u8, toks as *u8, sizeof(Token) * ((ntoks - 1) as u64));
+    memcpy((arr as *u8) + ((ntoks - 1) as i64) * (sizeof(Token) as i64), nt as *u8, sizeof(Token) * (cnt as u64));
+    toks = arr;
+    ntoks = newn;
+    ctoks = newn + 1;
+}
+unsafe fn expand_imports() {
+    var i = 0;
+    while toks[i].kind != TK_EOF {
+        if !(toks[i].kind == TK_ID && streq(toks[i].s, "import") && toks[i + 1].kind == TK_ID) { i += 1; continue; }
+        let line = toks[i].line;
+        var j = i + 1;
+        var nm: StrBuf;
+        sb_init(ref nm);
+        while true {
+            if toks[j].kind != TK_ID { die(line, "malformed import"); }
+            sb_cat_c(ref nm, toks[j].s);
+            j += 1;
+            if toks[j].kind == TK_OP && streq(toks[j].s, ".") {
+                sb_cat(ref nm, "/");
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if !(toks[j].kind == TK_OP && streq(toks[j].s, ";")) { die(line, "expected ';' after import"); }
+        j += 1;
+        var path: [1200]u8;
+        snprintf(&path[0], 1200, "%s/%s.ag", src_dir as i64, nm.data as i64, 0);
+        var from_lib = false;
+        if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/lib/%s.ag", exe_dir as i64, nm.data as i64, 0); from_lib = true; }
+        if !file_exists(&path[0]) { snprintf(&path[0], 1200, "%s/../lib/%s.ag", exe_dir as i64, nm.data as i64, 0); from_lib = true; }
+        if !file_exists(&path[0]) { dief(line, "cannot find module '%s'", nm.data as i64, 0, 0); }
+        var dup = false;
+        var k = 0;
+        while k < nloaded {
+            if (strcmp(loaded[k], &path[0]) == 0) { dup = true; }
+            k += 1;
+        }
+        var nt: *Token = null;
+        var nn: i32 = 0;
+        if !dup {
+            let pc = dup_n(&path[0], strlen(&path[0]) as i32);
+            loaded[nloaded] = pc;
+            nloaded += 1;
+            add_file_name(pc);
+            if from_lib && nfile_names - 1 < 32 { file_trusted[nfile_names - 1] = 1; }
+            var len: i32 = 0;
+            let src = read_file(pc as String, ref len);
+            if src == null { dief(line, "cannot open '%s'", pc as i64, 0, 0); }
+            var cnt: i32 = 0;
+            nt = lex_to_array(src, len, nfile_names - 1, ref cnt);
+            nn = cnt - 1;
+        }
+        let newn = ntoks - (j - i) + nn;
+        let arr = zalloc(sizeof(Token) * ((newn + 1) as u64)) as *Token;
+        memcpy(arr as *u8, toks as *u8, sizeof(Token) * (i as u64));
+        if nn > 0 { memcpy((arr as *u8) + (i as i64) * (sizeof(Token) as i64), nt as *u8, sizeof(Token) * (nn as u64)); }
+        memcpy((arr as *u8) + ((i + nn) as i64) * (sizeof(Token) as i64), (toks as *u8) + (j as i64) * (sizeof(Token) as i64), sizeof(Token) * ((ntoks - j) as u64));
+        toks = arr;
+        ntoks = newn;
+        ctoks = newn + 1;
+    }
+}

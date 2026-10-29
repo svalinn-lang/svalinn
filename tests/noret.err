@@ -1,0 +1,3 @@
+tests/noret.ag:1:14: error: function 'f' may finish without returning a value
+    1 | module A; fn f() -> i32 { } fn main() -> i32 { return 0; }
+      |              ^

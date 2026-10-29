@@ -1,0 +1,101 @@
+module Shapes;
+allow Console;
+
+interface Shape {
+    fn area() -> i64;
+    fn name() -> String;
+    fn scale(k: i64);
+}
+
+interface Named {
+    fn name() -> String;
+}
+
+class Entity {
+    protected:
+        var id: i32;
+        var hp: i32 = 10;
+    public:
+        ctor(id: i32) { this.id = id; }
+        fn describe() -> i32 { return this.id * 100 + this.hp; }
+        fn hurt(n: i32) { this.hp -= n; }
+        fn kind() -> String { return "entity"; }
+}
+
+class Enemy : Entity, Named {
+    private:
+        var power: i32 = 3;
+    public:
+        ctor(id: i32, power: i32) { super(id); this.power = power; }
+        fn attack() -> i32 { return this.power * 2 + this.hp; }   // protected base field is visible here
+        fn kind() -> String { return "enemy"; }                    // shadows Entity.kind
+        fn baseKind() -> String { return super.kind(); }
+        fn name() -> String { return "goblin"; }
+}
+
+class Rect : Shape, Named {
+    private:
+        var w: i64;
+        var h: i64;
+    public:
+        ctor(w: i64, h: i64) { this.w = w; this.h = h; }
+        fn area() -> i64 { return this.w * this.h; }
+        fn name() -> String { return "rect"; }
+        fn scale(k: i64) { this.w *= k; this.h *= k; }
+}
+
+class Square : Rect {
+    public:
+        ctor(s: i64) { super(s, s); }
+        fn name() -> String { return "square"; }
+}
+
+class Circle : Shape {
+    private:
+        var r: i64;
+    public:
+        ctor(r: i64) { this.r = r; }
+        fn area() -> i64 { return 3 * this.r * this.r; }
+        fn name() -> String { return "circle"; }
+        fn scale(k: i64) { this.r *= k; }
+}
+
+fn report(s: Shape) {
+    print(s.name());
+    print(" ");
+    println(s.area());
+}
+
+fn grow(s: Shape) { s.scale(2); }
+
+fn hello(n: Named) { println(n.name()); }
+
+fn biggest<T: Shape>(a: T, b: T) -> i64 {
+    if a.area() > b.area() { return a.area(); }
+    return b.area();
+}
+
+fn useEntity(e: Entity) -> i32 { return e.describe(); }
+
+fn main() -> i32 {
+    let r = Rect(3, 4);
+    let c = Circle(2);
+    let q = Square(5);
+    report(r);
+    report(c);
+    report(q);
+    grow(c);
+    report(c);
+    hello(r);
+    hello(Enemy(1, 2));
+    println(biggest(Rect(1, 2), Rect(3, 3)));
+
+    var e = Enemy(7, 4);
+    e.hurt(3);
+    println(e.attack());
+    println(e.describe());
+    println(e.kind());
+    println(e.baseKind());
+    println(useEntity(e));
+    return 0;
+}

@@ -1,0 +1,17 @@
+// runtime errors: output printed before the error must appear, then one message, exit code 101
+module RtErr;
+allow Console;
+fn div(a: i32, b: i32) -> i32 { return a / b; }
+fn deep(n: i64) -> i64 { if n == 0 { return 0; } return 1 + deep(n - 1); }
+fn main(args: Vec<String>) -> i32 {
+    print("before ");
+    let which = args.item(1);
+    var a: [4]i32;
+    if which == "index" { println(a[args.len() + 3]); }
+    if which == "div" { println(div(7, (args.len() - 2) as i32)); }
+    if which == "stack" { println(deep(1000000000)); }
+    if which == "string" { println(which[10]); }
+    if which == "panic" { panic("gave up"); }
+    println("not reached");
+    return 0;
+}

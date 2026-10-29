@@ -1,0 +1,3 @@
+tests/str_extern_ret.ag:5:37: error: extern function 'getenv' cannot return String; declare it to return *u8 and convert with 'as String'
+    5 | fn main() -> i32 { unsafe { let v = getenv("HOME"); } return 0; }
+      |                                     ^

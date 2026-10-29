@@ -1,0 +1,10 @@
+// std.sys - libc declarations shared by the self-hosted compiler. Calling them needs `allow Native;` and an
+// unsafe block (system/remove also need Process.Spawn/File.Write).
+module std.sys;
+
+extern fn printf(fmt: String, a: i64, b: i64, c: i64) -> i32;
+extern fn snprintf(buf: *u8, n: u64, fmt: String, a: i64, b: i64, c: i64) -> i32;
+extern fn exit(code: i32);
+extern fn fprintf(f: *u8, fmt: String, a: i64, b: i64, c: i64) -> i32;
+extern fn system(cmd: String) -> i32;
+extern fn remove(path: String) -> i32;

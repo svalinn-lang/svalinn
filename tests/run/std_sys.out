@@ -1,0 +1,12 @@
+hello  world
+exit 0
+status 0 out=[x||y z]
+exit 127
+false exits 1
+AEGIS_TEST=42
+AEGIS_TEST: not found
+invalid input
+slept: true
+clock: true
+1027.41421356237
+true

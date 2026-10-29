@@ -1,0 +1,34 @@
+// Token dump driver: prints the same output as `aegisc --dump-tokens`.
+module LexerDriver;
+allow Console;
+allow Native;
+allow File.Read;
+
+import std.io;
+import std.mem;
+import lex;
+import err;
+
+unsafe fn main(argc: i32, argv: **u8) -> i32 {
+    if argc < 2 { println("usage: lexer <file.ag>"); return 1; }
+    add_file_name(argv[1]);
+    var len: i32 = 0;
+    let src = read_file(argv[1] as String, ref len);
+    if src == null { println("cannot open file"); return 1; }
+    var cnt: i32 = 0;
+    let t = lex_to_array(src, len, 0, ref cnt);
+    var i = 0;
+    while i < cnt {
+        let k = t[i].kind;
+        let ln = (t[i].line & 65535) as i64;
+        if k == TK_ID { printf("%lld ID %.*s\n", ln, t[i].len as i64, t[i].s as i64); }
+        else if k == TK_OP { printf("%lld OP %.*s\n", ln, t[i].len as i64, t[i].s as i64); }
+        else if k == TK_INT { printf("%lld INT %llu\n", ln, t[i].v as i64, 0); }
+        else if k == TK_FLOAT { printf("%lld FLOAT %s\n", ln, t[i].s as i64, 0); }
+        else if k == TK_CHAR { printf("%lld CHAR %llu\n", ln, t[i].v as i64, 0); }
+        else if k == TK_STR { printf("%lld STR %lld\n", ln, t[i].len as i64, 0); }
+        else { printf("%lld EOF\n", ln, 0, 0); }
+        i += 1;
+    }
+    return 0;
+}

@@ -1,0 +1,47 @@
+module Generics;
+allow Console;
+allow Native;
+
+import std.vec;
+
+fn sumAll(ref v: Vec<i32>) -> i32 {
+    var total = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        match v.get(i) {
+            Ok(x) => { total += x; }
+            Err(_) => { }
+        }
+        i += 1;
+    }
+    return total;
+}
+
+fn demo() -> Result<i32, IndexError> {
+    var v = Vec<i32>();
+    for i in 0..10 { v.push(i * i); }
+    println(v.len());
+    let third = v.get(3)?;
+    println(third);
+    v.set(0, 100)?;
+    println(sumAll(ref v));
+    let last = v.pop()?;
+    println(last);
+    let oops = v.get(99)?;
+    println(oops);
+    v.free();
+    return Ok(0);
+}
+
+fn main() -> i32 {
+    match demo() {
+        Ok(_) => { println("done"); }
+        Err(e) => { match e { IndexError.OutOfBounds => { println("out of bounds"); } IndexError.Empty => { println("empty"); } } }
+    }
+    var names = Vec<String>();
+    names.push("ada");
+    names.push("grace");
+    match names.get(1) { Ok(n) => { println(n); } Err(_) => { println("?"); } }
+    names.free();
+    return 0;
+}

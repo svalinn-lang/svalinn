@@ -1,0 +1,10 @@
+arg 1: [one]
+arg 2: [two words]
+arg 3: []
+name? hi Ada
+1 FIRST
+2 SECOND
+3 NO NEWLINE
+name? no name
+done after 3 lines
+done after 0 lines

@@ -1,0 +1,2230 @@
+// Optimizer (-O) for the self-hosted compiler: a port of the optimizer in aegisc.c.
+// Works on the typed AST right before code generation: constant folding, inlining, register promotion with
+// shared registers for disjoint scopes, value ranges (bounds-check elision), loop unrolling, fill-loop and
+// SSE2 vectorization, direct instruction selection, and a peephole pass over each function body.
+module Opt;
+
+import std.sys;
+import std.mem;
+import types;
+import ast;
+import gen;
+
+extern fn strncmp(a: *u8, b: *u8, n: u64) -> i32;
+extern fn strstr(h: *u8, n: *u8) -> *u8;
+extern fn strchr(s: *u8, c: i32) -> *u8;
+extern fn strcpy(d: *u8, s: *u8) -> *u8;
+extern fn memmove(d: *u8, s: *u8, n: u64) -> *u8;
+extern fn sscanf(s: *u8, fmt: String, a: i64, b: i64, c: i64) -> i32;
+extern fn open_memstream(bp: **u8, sz: *u64) -> *u8;
+extern fn atoi(s: *u8) -> i32;
+extern fn strfromd(buf: *u8, n: u64, fmt: String, v: f64) -> i32;
+extern fn strfromf(buf: *u8, n: u64, fmt: String, v: f32) -> i32;
+
+var optlvl: i32;
+var gp_busy: [6]i32;
+var gp_used: [6]i32;
+var olocs: [4096]*Local;
+var nolocs: i32;
+var ostamp: i32;
+var oloopw: i32;
+var f_has_xmm: i32;
+var opos: i32;
+var odecl: [4096]*Local;
+var nodecl: i32;
+var onreg: [65536]*Local;   // [register * 4096 + i]
+var o_cand: [4096]*Local;
+var scr_depth: i32;
+var fbase: i32;
+var need_fneg: i32;
+var no_froute: i32;
+var inl_depth: i32;
+var nonorm: i32;
+var lv_tmp: String = "rax";   // register used to load a ref slot
+var xl: [4096]*Local;
+var nxl: i32;
+var xscope: [512]i32;
+
+unsafe fn GREG(r: i32) -> String {
+    if r == 1 { return "rbx"; } if r == 2 { return "r12"; } if r == 3 { return "r13"; } if r == 4 { return "r14"; } if r == 5 { return "r15"; }
+    return "";
+}
+unsafe fn GREG32(r: i32) -> String {
+    if r == 1 { return "ebx"; } if r == 2 { return "r12d"; } if r == 3 { return "r13d"; } if r == 4 { return "r14d"; } if r == 5 { return "r15d"; }
+    return "";
+}
+unsafe fn GREG16(r: i32) -> String {
+    if r == 1 { return "bx"; } if r == 2 { return "r12w"; } if r == 3 { return "r13w"; } if r == 4 { return "r14w"; } if r == 5 { return "r15w"; }
+    return "";
+}
+unsafe fn GREG8(r: i32) -> String {
+    if r == 1 { return "bl"; } if r == 2 { return "r12b"; } if r == 3 { return "r13b"; } if r == 4 { return "r14b"; } if r == 5 { return "r15b"; }
+    return "";
+}
+unsafe fn SCR(i: i32) -> String {
+    if i == 0 { return "r8"; } if i == 1 { return "r9"; } if i == 2 { return "r10"; } return "r11";
+}
+unsafe fn G(r: i32) -> i64 { return GREG(r) as i64; }
+
+unsafe fn is_scalar(t: *Type) -> bool {
+    return t.kind == TY_INT || t.kind == TY_ENUM || t.kind == TY_BOOL || t.kind == TY_PTR || t.kind == TY_STR || t.kind == TY_FLOAT;
+}
+unsafe fn is_intlike(t: *Type) -> bool {
+    return t.kind == TY_INT || t.kind == TY_ENUM || t.kind == TY_BOOL || t.kind == TY_PTR || t.kind == TY_STR;
+}
+unsafe fn imm32(v: i64) -> bool { return v >= 0 - 2147483648 && v <= 2147483647; }
+
+unsafe fn oa_note(l: *Local) {
+    if l == null || l.is_global != 0 { return; }
+    if l.seen != ostamp {
+        l.seen = ostamp; l.uses = 0; l.addr_taken = 0; l.reg = 0; l.has_range = 0; l.is_cst = 0; l.nasg = 0; l.ifirst = 0; l.ilast = 1 << 30;
+        if nolocs < 4096 { olocs[nolocs] = l; nolocs += 1; }
+    }
+}
+
+// wrap to the type's width, keep the canonical sign/zero extension
+unsafe fn fold_norm(v: i64, t: *Type) -> i64 {
+    if t.kind == TY_BOOL { if v != 0 { return 1; } return 0; }
+    if t.size == 1 { if t.sign != 0 { return (v as i8) as i64; } return (v as u8) as i64; }
+    if t.size == 2 { if t.sign != 0 { return (v as i16) as i64; } return (v as u16) as i64; }
+    if t.size == 4 { if t.sign != 0 { return (v as i32) as i64; } return (v as u32) as i64; }
+    return v;
+}
+
+// value of a float constant node
+unsafe fn fconst_val(e: *Expr, ref v: f64) -> bool {
+    if e.ty == null || !is_float(e.ty) { return false; }
+    if e.kind == E_INT && e.cls == 0 {
+        if e.ty.size == 4 { v = (e.ival as f32) as f64; } else { v = e.ival as f64; }
+        return true;
+    }
+    if e.kind == E_FLOAT && e.sval != null {
+        if e.ty.size == 4 { v = strtof(e.sval, null) as f64; } else { v = strtod(e.sval, null); }
+        return true;
+    }
+    return false;
+}
+unsafe fn set_fconst(e: *Expr, v: f64) {
+    var b: [64]u8;
+    if e.ty.size == 4 { strfromf(&b[0], 64, "%.9g", v as f32); } else { strfromd(&b[0], 64, "%.17g", v); }
+    e.kind = E_FLOAT;
+    e.sval = dup_n(&b[0], strlen(&b[0]) as i32);
+    e.cls = 0;
+    e.a = null;
+    e.b = null;
+}
+
+// constant folding (in place)
+unsafe fn fold(e: *Expr) {
+    if e == null { return; }
+    if e.kind == E_VAR && e.lv != null && e.lv.is_cst != 0 && e.lv.seen == ostamp {
+        e.kind = E_INT; e.ival = e.lv.cval; e.cls = 0; e.lv = null;
+        return;
+    }
+    if (e.kind == E_REF || (e.kind == E_UN && e.op == O_ADDR)) && e.a.kind == E_VAR { return; }   // places stay places
+    fold(e.a);
+    fold(e.b);
+    var p = e.args;
+    while p != null { fold(p); p = p.next; }
+    if e.kind == E_CAST && e.ty != null && is_float(e.ty) && e.a.kind == E_INT && e.a.cls == 0 && is_int(e.a.ty) && (e.a.ty.sign != 0 || e.a.ival >= 0)
+        && e.a.ival > 0 - 9007199254740992 && e.a.ival < 9007199254740992 {
+        // exact as a float constant
+        e.kind = E_INT; e.ival = e.a.ival; e.cls = 0;
+        return;
+    }
+    if e.ty != null && is_float(e.ty) {
+        // exact IEEE arithmetic on constants, same rounding as the hardware
+        var a: f64 = 0.0;
+        var b: f64 = 0.0;
+        var r: f64 = 0.0;
+        let f32 = e.ty.size == 4;
+        if e.kind == E_BIN && e.op >= O_ADD && e.op <= O_DIV && fconst_val(e.a, ref a) && fconst_val(e.b, ref b) && same(e.a.ty, e.ty) && same(e.b.ty, e.ty) {
+            if f32 {
+                let x = a as f32;
+                let y = b as f32;
+                var z: f32 = 0.0;
+                if e.op == O_ADD { z = x + y; } else if e.op == O_SUB { z = x - y; } else if e.op == O_MUL { z = x * y; } else { z = x / y; }
+                r = z as f64;
+            } else {
+                if e.op == O_ADD { r = a + b; } else if e.op == O_SUB { r = a - b; } else if e.op == O_MUL { r = a * b; } else { r = a / b; }
+            }
+            if r == r { set_fconst(e, r); }
+        } else if e.kind == E_UN && e.op == O_NEG && fconst_val(e.a, ref a) && same(e.a.ty, e.ty) { set_fconst(e, 0.0 - a); }
+        else if e.kind == E_CAST && fconst_val(e.a, ref a) {
+            if f32 { r = (a as f32) as f64; } else { r = a; }
+            if r == r { set_fconst(e, r); }
+        }
+        return;
+    }
+    if e.ty == null || (!is_int(e.ty) && e.ty.kind != TY_BOOL) { return; }
+    if e.kind == E_UN && e.a.kind == E_INT && is_int(e.a.ty) && (e.op == O_NEG || e.op == O_BNOT) {
+        var v = e.a.ival;
+        if e.op == O_NEG { v = ((0 as u64) - (v as u64)) as i64; } else { v = ~v; }
+        e.kind = E_INT; e.ival = fold_norm(v, e.ty); e.cls = 0;
+        return;
+    }
+    if e.kind == E_UN && e.op == O_NOT && e.a.kind == E_BOOL {
+        e.kind = E_BOOL;
+        if e.a.ival != 0 { e.ival = 0; } else { e.ival = 1; }
+        return;
+    }
+    if e.kind != E_BIN || e.a.kind != E_INT || e.b.kind != E_INT || !is_int(e.a.ty) || !is_int(e.b.ty) { return; }
+    let a = e.a.ival as u64;
+    let b = e.b.ival as u64;
+    let sa = e.a.ival;
+    let sb = e.b.ival;
+    var r: i64 = 0;
+    let sg = e.a.ty.sign != 0;
+    var cmp = false;
+    let op = e.op;
+    if op == O_ADD { r = (a + b) as i64; }
+    else if op == O_SUB { r = (a - b) as i64; }
+    else if op == O_MUL { r = (a * b) as i64; }
+    else if op == O_DIV || op == O_MOD {
+        if b == 0 || (sg && sb == 0 - 1) { return; }
+        if sg { if op == O_DIV { r = sa / sb; } else { r = sa % sb; } }
+        else { if op == O_DIV { r = (a / b) as i64; } else { r = (a % b) as i64; } }
+    }
+    else if op == O_AND { r = (a & b) as i64; }
+    else if op == O_OR { r = (a | b) as i64; }
+    else if op == O_XOR { r = (a ^ b) as i64; }
+    else if op == O_SHL { r = (a << (b & 63)) as i64; }
+    else if op == O_SHR { if sg { r = sa >> (sb & 63); } else { r = (a >> (b & 63)) as i64; } }
+    else if op >= O_EQ && op <= O_GE {
+        cmp = true;
+        var t = false;
+        if op == O_EQ { t = a == b; }
+        else if op == O_NE { t = a != b; }
+        else if op == O_LT { if sg { t = sa < sb; } else { t = a < b; } }
+        else if op == O_LE { if sg { t = sa <= sb; } else { t = a <= b; } }
+        else if op == O_GT { if sg { t = sa > sb; } else { t = a > b; } }
+        else { if sg { t = sa >= sb; } else { t = a >= b; } }
+        if t { r = 1; } else { r = 0; }
+    }
+    else { return; }
+    if cmp { e.kind = E_BOOL; e.ival = r; return; }
+    e.kind = E_INT; e.ival = fold_norm(r, e.ty); e.cls = 0;
+}
+
+unsafe fn oa_expr(e: *Expr) {
+    if e == null { return; }
+    if e.kind == E_VAR && e.lv != null && e.lv.is_global == 0 { oa_note(e.lv); e.lv.uses += oloopw; }
+    if e.kind == E_UN && e.op == O_ADDR && e.a.kind == E_VAR && e.a.lv != null { oa_note(e.a.lv); e.a.lv.addr_taken = 1; }
+    if e.kind == E_REF && e.a.kind == E_VAR && e.a.lv != null && e.a.lv.is_ref == 0 { oa_note(e.a.lv); e.a.lv.addr_taken = 1; }
+    oa_expr(e.a);
+    oa_expr(e.b);
+    var p = e.args;
+    while p != null { oa_expr(p); p = p.next; }
+}
+// 8-byte slot
+unsafe fn mk_bound_local(s: *Stmt) -> *Local {
+    let l = zalloc(sizeof(Local)) as *Local;
+    l.name = "for.bound" as *u8;
+    if s.e2.ty.sign != 0 { l.ty = ty_i64; } else { l.ty = ty_u64; }
+    l.off = s.slot1;
+    return l;
+}
+unsafe fn odeclare(l: *Local) {
+    l.ifirst = opos;
+    if nodecl < 4096 { odecl[nodecl] = l; nodecl += 1; }
+}
+unsafe fn oscope_end(mark: i32) {
+    var i = mark;
+    while i < nodecl { odecl[i].ilast = opos; i += 1; }
+    nodecl = mark;
+}
+// the bound is an immutable 8-byte local: compare against it directly
+unsafe fn for_bound_var(s: *Stmt) -> bool {
+    let b = s.e2;
+    return b.kind == E_VAR && b.lv != null && b.lv.is_global == 0 && b.lv.is_mut == 0 && b.lv.is_ref == 0 && b.lv.ty.size == 8;
+}
+unsafe fn cimm_bound(s: *Stmt) -> bool {
+    return s.e2.kind == E_INT && s.e2.ival >= 0 - 2147483647 && s.e2.ival <= 2147483647;
+}
+unsafe fn oa_stmt(s: *Stmt) {
+    if s == null { return; }
+    opos += 1;
+    let k = s.kind;
+    if k == S_BLOCK {
+        let mark = nodecl;
+        var c = s.list;
+        while c != null { oa_stmt(c); c = c.next; }
+        opos += 1;
+        oscope_end(mark);
+    }
+    else if k == S_LET {
+        fold(s.e); oa_expr(s.e); oa_note(s.lv); s.lv.uses += oloopw; odeclare(s.lv);
+        if s.is_mut == 0 && s.e != null && s.e.kind == E_INT && s.e.cls == 0 && is_int(s.lv.ty) && s.lv.dflag == 0 { s.lv.is_cst = 1; s.lv.cval = s.e.ival; }
+    }
+    else if k == S_ASSIGN {
+        fold(s.e); fold(s.e2); oa_expr(s.e); oa_expr(s.e2);
+        if s.e.kind == E_VAR && s.e.lv != null { oa_note(s.e.lv); s.e.lv.nasg += 1; }
+    }
+    else if k == S_EXPR || k == S_RET { fold(s.e); oa_expr(s.e); }
+    else if k == S_IF { fold(s.e); oa_expr(s.e); oa_stmt(s.body); oa_stmt(s.els); }
+    else if k == S_WHILE {
+        let w = oloopw;
+        if oloopw < (1 << 20) { oloopw *= 8; }
+        fold(s.e); oa_expr(s.e); oa_stmt(s.body);
+        oloopw = w;
+    }
+    else if k == S_FOR {
+        let w = oloopw;
+        fold(s.e); fold(s.e2); oa_expr(s.e); oa_expr(s.e2);
+        if oloopw < (1 << 20) { oloopw *= 8; }
+        let mark = nodecl;
+        oa_note(s.lv); s.lv.uses += oloopw; odeclare(s.lv);
+        if s.is_range != 0 && !cimm_bound(s) && !for_bound_var(s) {
+            if s.bnd == null { s.bnd = mk_bound_local(s); }
+            s.bnd.seen = 0; oa_note(s.bnd); s.bnd.uses += oloopw; odeclare(s.bnd);
+        }
+        oa_stmt(s.body);
+        oloopw = w;
+        opos += 1;
+        oscope_end(mark);
+    }
+    else if k == S_MATCH {
+        fold(s.e); oa_expr(s.e);
+        var arm = s.list;
+        while arm != null {
+            let mark = nodecl;
+            if arm.lv != null { oa_note(arm.lv); odeclare(arm.lv); }
+            oa_stmt(arm.body);
+            opos += 1;
+            oscope_end(mark);
+            arm = arm.next;
+        }
+    }
+}
+
+unsafe fn opt_analyze(f: *Func) {
+    nolocs = 0; ostamp += 1; oloopw = 1; opos = 0; nodecl = 0; f_has_xmm = 0; f.nsaved = 0;
+    var i = 0;
+    while i < 6 { gp_busy[i] = 0; gp_used[i] = 0; i += 1; }
+    i = 0;
+    while i < f.nparams { oa_note(f.plocal[i]); f.plocal[i].uses += 1; i += 1; }
+    if f.is_ctor != 0 {
+        i = 0;
+        while i < f.cls.nf {
+            if f.cls.f[i].init != null { fold(f.cls.f[i].init); oa_expr(f.cls.f[i].init); }
+            i += 1;
+        }
+    }
+    oa_stmt(f.body);
+    var nc = 0;
+    i = 0;
+    while i < nolocs {
+        let l = olocs[i];
+        if l.addr_taken == 0 && l.dflag == 0 && l.uses >= 2 && (l.is_ref != 0 || is_scalar(l.ty)) { o_cand[nc] = l; nc += 1; }
+        i += 1;
+    }
+    i = 1;
+    while i < nc {
+        // most used (loop-weighted) first; stable
+        let l = o_cand[i];
+        var j = i - 1;
+        while j >= 0 && o_cand[j].uses < l.uses { o_cand[j + 1] = o_cand[j]; j -= 1; }
+        o_cand[j + 1] = l;
+        i += 1;
+    }
+    // registers are shared by locals whose scopes do not overlap
+    var non: [16]i32;
+    i = 0;
+    while i < 16 { non[i] = 0; i += 1; }
+    i = 0;
+    while i < nc {
+        let l = o_cand[i];
+        let fl = l.is_ref == 0 && is_float(l.ty);
+        var r = 1;
+        var rmax = 5;
+        if fl { r = 8; rmax = 15; }
+        while r <= rmax {
+            var ok = true;
+            var j = 0;
+            while j < non[r] && ok {
+                let o = onreg[r * 4096 + j];
+                if !(o.ilast < l.ifirst || l.ilast < o.ifirst) { ok = false; }
+                j += 1;
+            }
+            if ok && non[r] < 4096 {
+                onreg[r * 4096 + non[r]] = l;
+                non[r] += 1;
+                l.reg = r;
+                if fl { f_has_xmm = 1; }
+                else if gp_used[r] == 0 { f.saved[f.nsaved] = r; f.nsaved += 1; gp_busy[r] = 1; gp_used[r] = 1; }
+                break;
+            }
+            r += 1;
+        }
+        i += 1;
+    }
+}
+
+// register-aware access to locals; the value travels in rax like everywhere else
+unsafe fn load_var(l: *Local) {
+    if l.reg >= 8 {
+        if l.ty.size == 4 { emit1("movd eax, xmm%d", l.reg as i64); } else { emit1("movq rax, xmm%d", l.reg as i64); }
+    }
+    else if l.reg != 0 { emit1("mov rax, %s", G(l.reg)); }
+    else {
+        var m: [32]u8;
+        local_mem(l.off, &m[0]);
+        if l.is_ref != 0 { load(ty_u64, &m[0] as String); } else { load(l.ty, &m[0] as String); }
+    }
+}
+unsafe fn store_var(l: *Local) {
+    if l.reg >= 8 {
+        if l.ty.size == 4 { emit1("movd xmm%d, eax", l.reg as i64); } else { emit1("movq xmm%d, rax", l.reg as i64); }
+    }
+    else if l.reg != 0 { emit1("mov %s, rax", G(l.reg)); }
+    else if l.is_ref != 0 { store_local(ty_u64, l.off); } else { store_local(l.ty, l.off); }
+}
+// calls clobber all xmm registers: park promoted floats in their home slots
+unsafe fn xsave() {
+    if optlvl == 0 || f_has_xmm == 0 { return; }
+    var i = 0;
+    while i < nxl {
+        let l = xl[i];
+        if l.ty.size == 4 { emit2("movss DWORD PTR [rbp-%d], xmm%d", l.off as i64, l.reg as i64); }
+        else { emit2("movsd QWORD PTR [rbp-%d], xmm%d", l.off as i64, l.reg as i64); }
+        i += 1;
+    }
+}
+unsafe fn xrestore() {
+    if optlvl == 0 || f_has_xmm == 0 { return; }
+    var i = 0;
+    while i < nxl {
+        let l = xl[i];
+        if l.ty.size == 4 { emit2("movss xmm%d, DWORD PTR [rbp-%d]", l.reg as i64, l.off as i64); }
+        else { emit2("movsd xmm%d, QWORD PTR [rbp-%d]", l.reg as i64, l.off as i64); }
+        i += 1;
+    }
+}
+unsafe fn xlive(l: *Local) { if l.reg >= 8 && nxl < 4096 { xl[nxl] = l; nxl += 1; } }
+
+// ---- instruction selection helpers ----
+
+// survives calls
+unsafe fn tmp_gp() -> i32 {
+    var r = 1;
+    while r <= 5 {
+        if gp_busy[r] == 0 { gp_busy[r] = 1; gp_used[r] = 1; return r; }
+        r += 1;
+    }
+    return 0;
+}
+
+// could evaluating e call a function (clobbering scratch registers)?
+unsafe fn has_call(e: *Expr) -> bool {
+    if e == null { return false; }
+    if e.kind == E_CALL {
+        if e.builtin == 7 || e.builtin == 8 || e.builtin == 9 { return has_call(e.args); }   // take(p), s.len(), cstr: inline
+        let b = try_inline(e);
+        if b != null { return has_call(b); }
+        if optlvl != 0 && e.callee != null && e.callee.is_extern != 0 && strcmp(e.callee.name, "sqrt" as *u8) == 0 && e.nargs == 1 && e.ty.size == 8 && fbase < 7 { return has_call(e.args); }
+    }
+    let k = e.kind;
+    if k == E_CALL || k == E_AWAIT || k == E_TRY || k == E_OK || k == E_ERR || k == E_TOIFACE || k == E_MCALL { return true; }
+    if has_call(e.a) || has_call(e.b) { return true; }
+    var p = e.args;
+    while p != null { if has_call(p) { return true; } p = p.next; }
+    return false;
+}
+
+// ---- inlining: calls to small functions whose body is a single 'return expr' are replaced by that
+// expression with the parameters substituted (a ref parameter becomes the place passed by the caller) ----
+
+// can this callee expression be copied into a caller?
+unsafe fn inl_nodes(e: *Expr, f: *Func, ref n: i32) -> bool {
+    if e == null { return true; }
+    n += 1;
+    if n > 40 { return false; }
+    let k = e.kind;
+    if k == E_INT || k == E_FLOAT || k == E_BOOL || k == E_ENUMVAL || k == E_STR { }
+    else if k == E_VAR { if e.lv == null { return false; } }
+    else if k == E_BIN || k == E_CAST || k == E_FIELD || k == E_INDEX { }
+    else if k == E_UN { if e.op == O_ADDR { return false; } }
+    else if k == E_CALL {
+        if e.builtin != 0 || e.callee == null || e.callee == f || e.tmp != 0 || e.dflag != 0 || e.callee.is_async != 0 || e.callee.ifc != null { return false; }
+        var p = e.args;
+        while p != null {
+            if p.kind == E_REF && !(p.a.kind == E_VAR && p.a.lv.is_ref != 0) {
+                var x = p.a;
+                while x.kind == E_FIELD || x.kind == E_INDEX { x = x.a; }
+                if x.kind == E_VAR && x.lv.is_ref == 0 && x.lv.is_global == 0 { return false; }   // would take the address of a parameter
+            }
+            p = p.next;
+        }
+    }
+    else if k == E_REF { }
+    else { return false; }
+    if k == E_VAR || k == E_REF {
+        if k == E_REF && !inl_nodes(e.a, f, ref n) { return false; }
+        return true;
+    }
+    if !inl_nodes(e.a, f, ref n) || !inl_nodes(e.b, f, ref n) { return false; }
+    var q = e.args;
+    while q != null { if !inl_nodes(q, f, ref n) { return false; } q = q.next; }
+    return true;
+}
+unsafe fn inl_body(f: *Func) -> *Expr {
+    if f.inl_state != 0 { if f.inl_state == 1 { return f.inl_body; } return null; }
+    f.inl_state = 2;
+    if f.is_extern != 0 || f.ifc != null || f.is_async != 0 || f.is_ctor != 0 || f.is_dtor != 0 || f.body == null || is_agg(f.ret) || f.ret.kind == TY_VOID || f.nparams > 6 { return null; }
+    var i = 0;
+    while i < f.nparams { if f.pref[i] == 0 && (is_agg(f.pty[i]) || has_drop(f.pty[i])) { return null; } i += 1; }
+    if has_drop(f.ret) { return null; }
+    var b = f.body;
+    while b.kind == S_BLOCK && b.n == 1 && b.list.kind == S_BLOCK { b = b.list; }   // unsafe { return ...; }
+    if b.kind != S_BLOCK || b.n != 1 || b.list.kind != S_RET || b.list.e == null || b.list.temps != null { return null; }
+    var n = 0;
+    let e = b.list.e;
+    if !inl_nodes(e, f, ref n) { return null; }
+    f.inl_state = 1;
+    f.inl_body = e;
+    return e;
+}
+// shallow copy of a node with its own (unlinked) 'next'
+unsafe fn ecopy(e: *Expr) -> *Expr {
+    let c = zalloc(sizeof(Expr)) as *Expr;
+    memcpy(c as *u8, e as *u8, sizeof(Expr));
+    c.next = null;
+    return c;
+}
+unsafe fn inl_clone(e: *Expr, f: *Func, call: *Expr) -> *Expr {
+    if e == null { return null; }
+    if e.kind == E_VAR {
+        var i = 0;
+        while i < f.nparams {
+            if e.lv == f.plocal[i] {
+                let a = nth_arg(call, i);
+                if f.pref[i] != 0 { return a.a; }
+                return a;
+            }
+            i += 1;
+        }
+    }
+    let c = ecopy(e);
+    c.inl = null; c.inl_done = 0;
+    c.a = inl_clone(e.a, f, call);
+    c.b = inl_clone(e.b, f, call);
+    if e.nargs != 0 {
+        c.args = null;
+        var last: *Expr = null;
+        var p = e.args;
+        while p != null {
+            var q = inl_clone(p, f, call);
+            if p.kind == E_VAR && inl_is_param(f, p.lv) { q = ecopy(q); }   // the caller's own argument node: link a copy
+            if last == null { c.args = q; } else { last.next = q; }
+            last = q;
+            p = p.next;
+        }
+    }
+    return c;
+}
+unsafe fn inl_is_param(f: *Func, l: *Local) -> bool {
+    var i = 0;
+    while i < f.nparams { if f.plocal[i] == l { return true; } i += 1; }
+    return false;
+}
+// fine to evaluate more than once
+unsafe fn cheap_arg(a: *Expr, pref: i32) -> bool {
+    var t: [96]u8;
+    if pref != 0 { let x = a.a; return lv_nocode(x) || lv_static(x); }
+    return simple_int(a, &t[0]) || (a.ty != null && is_float(a.ty) && fsimple(a, null));
+}
+unsafe fn count_uses(e: *Expr, l: *Local) -> i32 {
+    if e == null { return 0; }
+    var n = 0;
+    if e.kind == E_VAR && e.lv == l { n = 1; }
+    n += count_uses(e.a, l) + count_uses(e.b, l);
+    var p = e.args;
+    while p != null { n += count_uses(p, l); p = p.next; }
+    return n;
+}
+unsafe fn try_inline(e: *Expr) -> *Expr {
+    if optlvl == 0 || e.kind != E_CALL || e.builtin != 0 || e.callee == null { return null; }
+    if e.inl_done != 0 { return e.inl; }
+    e.inl_done = 1;
+    if inl_depth > 4 || e.dflag != 0 || e.tmp != 0 { return null; }
+    let f = e.callee;
+    let body = inl_body(f);
+    if body == null || e.nargs != f.nparams { return null; }
+    var i = 0;
+    var a = e.args;
+    while a != null {
+        if has_call(a) || a.move != 0 || a.dflag != 0 { return null; }
+        if f.pref[i] != 0 && a.kind != E_REF { return null; }
+        if f.pref[i] != 0 && !same(a.a.ty, f.pty[i]) { return null; }
+        let u = count_uses(body, f.plocal[i]);
+        if u != 1 && !cheap_arg(a, f.pref[i]) { return null; }   // evaluated more than once, or not at all (keep its traps)
+        i += 1;
+        a = a.next;
+    }
+    e.inl = inl_clone(body, f, e);
+    fold(e.inl);
+    return e.inl;
+}
+
+unsafe fn regvar(e: *Expr) -> i32 {
+    if e.kind == E_VAR && e.lv != null && e.lv.reg != 0 && e.lv.reg < 8 && e.lv.is_ref == 0 { return e.lv.reg; }
+    return 0;
+}
+// a cheap integer expression that can be an instruction operand directly: immediate, register variable or 8-byte stack slot
+unsafe fn simple_int(e: *Expr, buf: *u8) -> bool {
+    if optlvl == 0 || e.ty == null || !is_intlike(e.ty) { return false; }
+    if e.kind == E_INT || e.kind == E_BOOL || e.kind == E_ENUMVAL {
+        if e.kind == E_INT && e.cls == 2 { strcpy(buf, "0" as *u8); return true; }   // null
+        if !imm32(e.ival) { return false; }
+        snprintf(buf, 48, "%lld", e.ival, 0, 0);
+        return true;
+    }
+    if regvar(e) != 0 { strcpy(buf, GREG(regvar(e)) as *u8); return true; }
+    if e.kind == E_VAR && e.lv != null && e.lv.is_global == 0 && e.lv.is_ref == 0 && e.lv.reg == 0 && e.ty.size == 8 && !is_agg(e.ty) {
+        snprintf(buf, 48, "QWORD PTR [rbp-%d]", e.lv.off as i64, 0, 0);
+        return true;
+    }
+    return false;
+}
+// condition code for a comparison, optionally negated
+unsafe fn cc_of(op: i32, u: bool, neg: bool) -> String {
+    let i = op - O_EQ;
+    if neg {
+        if u { if i == 0 { return "ne"; } if i == 1 { return "e"; } if i == 2 { return "ae"; } if i == 3 { return "a"; } if i == 4 { return "be"; } return "b"; }
+        if i == 0 { return "ne"; } if i == 1 { return "e"; } if i == 2 { return "ge"; } if i == 3 { return "g"; } if i == 4 { return "le"; } return "l";
+    }
+    if u { if i == 0 { return "e"; } if i == 1 { return "ne"; } if i == 2 { return "b"; } if i == 3 { return "be"; } if i == 4 { return "a"; } return "ae"; }
+    if i == 0 { return "e"; } if i == 1 { return "ne"; } if i == 2 { return "l"; } if i == 3 { return "le"; } if i == 4 { return "g"; } return "ge";
+}
+unsafe fn log2_exact(v: i64) -> i32 {
+    if v <= 0 || (v & (v - 1)) != 0 { return 0 - 1; }
+    var k = 0;
+    while ((1 as i64) << (k as i64)) != v { k += 1; }
+    return k;
+}
+// canonical form of a register variable after arithmetic
+unsafe fn norm_reg(t: *Type, r: i32) {
+    if t.kind != TY_INT && t.kind != TY_ENUM { return; }
+    if t.size == 1 { if t.sign != 0 { emit2("movsx %s, %s", G(r), GREG8(r) as i64); } else { emit2("movzx %s, %s", GREG32(r) as i64, GREG8(r) as i64); } }
+    else if t.size == 2 { if t.sign != 0 { emit2("movsx %s, %s", G(r), GREG16(r) as i64); } else { emit2("movzx %s, %s", GREG32(r) as i64, GREG16(r) as i64); } }
+    else if t.size == 4 { if t.sign != 0 { emit2("movsxd %s, %s", G(r), GREG32(r) as i64); } else { emit2("mov %s, %s", GREG32(r) as i64, GREG32(r) as i64); } }
+}
+// second operand of a binary operation: an operand string, using a scratch register or the stack when needed
+unsafe fn gen_rhs(b: *Expr, rb: *u8) {
+    if simple_int(b, rb) { return; }
+    var t = 0;
+    if !has_call(b) && scr_depth < 4 {
+        let sr = SCR(scr_depth);
+        scr_depth += 1;
+        emit1("mov %s, rax", sr as i64); gen_expr(b); emit("mov rcx, rax"); emit1("mov rax, %s", sr as i64);
+        scr_depth -= 1;
+    } else {
+        t = tmp_gp();
+        if t != 0 { emit1("mov %s, rax", G(t)); gen_expr(b); emit("mov rcx, rax"); emit1("mov rax, %s", G(t)); gp_busy[t] = 0; }
+        else { gpush("rax"); gen_expr(b); emit("mov rcx, rax"); gpop("rax"); }
+    }
+    strcpy(rb, "rcx" as *u8);
+}
+// integer binary operation, left in rax, right operand rb: result in rax
+unsafe fn int_binop(op: i32, t: *Type, rt0: *Type, rb: *u8, b: *Expr) {
+    var rt = rt0;
+    if nonorm != 0 { rt = ty_i64; }
+    nonorm = 0;
+    var iv: i64 = 0;
+    let isimm = b != null && (b.kind == E_INT || b.kind == E_BOOL || b.kind == E_ENUMVAL) && imm32(b.ival);
+    if isimm { iv = b.ival; }
+    let R = rb as i64;
+    if op == O_ADD { emit1("add rax, %s", R); norm(rt); }
+    else if op == O_SUB { emit1("sub rax, %s", R); norm(rt); }
+    else if op == O_MUL {
+        if isimm && log2_exact(iv) >= 0 { if iv > 1 { emit1("shl rax, %d", log2_exact(iv) as i64); } }
+        else if isimm { emit1("imul rax, rax, %lld", iv); } else { emit1("imul rax, %s", R); }
+        norm(rt);
+    }
+    else if op == O_DIV || op == O_MOD {
+        var k = 0 - 1;
+        if isimm { k = log2_exact(iv); }
+        if k >= 0 {
+            // power of two
+            if t.sign == 0 {
+                if op == O_DIV { if k != 0 { emit1("shr rax, %d", k as i64); } }
+                else if k < 31 { emit1("and eax, %lld", iv - 1); }
+                else { emit1("mov rcx, %lld", iv - 1); emit("and rax, rcx"); }
+            }
+            else if op == O_DIV {
+                if k != 0 { emit("mov rcx, rax"); emit("sar rcx, 63"); emit1("shr rcx, %d", (64 - k) as i64); emit("add rax, rcx"); emit1("sar rax, %d", k as i64); }
+            }
+            else if k == 0 { emit("xor eax, eax"); }
+            else { emit("mov rcx, rax"); emit("sar rcx, 63"); emit1("shr rcx, %d", (64 - k) as i64); emit("add rcx, rax"); emit1("and rcx, %lld", 0 - iv); emit("sub rax, rcx"); }
+            norm(rt);
+            return;
+        }
+        if strcmp(rb, "rcx" as *u8) != 0 { emit1("mov rcx, %s", R); }
+        if t.sign != 0 { emit("cqo"); emit("idiv rcx"); } else { emit("xor edx, edx"); emit("div rcx"); }
+        if op == O_MOD { emit("mov rax, rdx"); }
+        norm(rt);
+    }
+    else if op == O_AND { emit1("and rax, %s", R); }
+    else if op == O_OR { emit1("or rax, %s", R); }
+    else if op == O_XOR { emit1("xor rax, %s", R); }
+    else if op == O_SHL {
+        if isimm { emit1("shl rax, %lld", iv & 63); }
+        else { if strcmp(rb, "rcx" as *u8) != 0 { emit1("mov rcx, %s", R); } emit("shl rax, cl"); }
+        norm(rt);
+    }
+    else if op == O_SHR {
+        if isimm { if t.sign != 0 { emit1("sar rax, %lld", iv & 63); } else { emit1("shr rax, %lld", iv & 63); } }
+        else {
+            if strcmp(rb, "rcx" as *u8) != 0 { emit1("mov rcx, %s", R); }
+            if t.sign != 0 { emit("sar rax, cl"); } else { emit("shr rax, cl"); }
+        }
+    }
+    else { emit1("cmp rax, %s", R); emit1("set%s al", cc_of(op, is_unsigned_cmp(t), false) as i64); emit("movzx eax, al"); }
+}
+
+// value range of an integer expression (no wrap-around possible inside the range); false = unknown
+unsafe fn irange(e: *Expr, ref lo: i64, ref hi: i64) -> bool {
+    if e == null || e.ty == null || !is_int(e.ty) { return false; }
+    let LIM: i64 = 1099511627776;
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var c: i64 = 0;
+    var d: i64 = 0;
+    let k = e.kind;
+    if k == E_INT { if e.cls != 0 { return false; } lo = e.ival; hi = e.ival; return true; }
+    else if k == E_VAR { if e.lv == null || e.lv.has_range == 0 { return false; } lo = e.lv.lo; hi = e.lv.hi; return true; }
+    else if k == E_CAST { if !is_int(e.a.ty) || !irange(e.a, ref lo, ref hi) { return false; } }
+    else if k == E_BIN {
+        if !irange(e.a, ref a, ref b) { return false; }
+        if e.op == O_MOD || e.op == O_DIV || e.op == O_AND || e.op == O_SHR {
+            if e.b.kind != E_INT || e.b.ival <= 0 { return false; }
+            let m = e.b.ival;
+            if e.op == O_MOD {
+                if a >= 0 { lo = 0; } else { lo = 0 - (m - 1); }
+                if b < 0 { hi = 0; } else if b < m - 1 && a >= 0 { hi = b; } else { hi = m - 1; }
+            }
+            else if e.op == O_DIV { lo = a / m; hi = b / m; }
+            else if e.op == O_AND { if a < 0 { return false; } lo = 0; if b < m { hi = b; } else { hi = m; } }
+            else { if a < 0 || m > 62 { return false; } lo = a >> m; hi = b >> m; }
+        } else {
+            if !irange(e.b, ref c, ref d) { return false; }
+            if a < 0 - LIM || b > LIM || c < 0 - LIM || d > LIM { return false; }
+            if e.op == O_ADD { lo = a + c; hi = b + d; }
+            else if e.op == O_SUB { lo = a - d; hi = b - c; }
+            else if e.op == O_MUL {
+                if a < 0 - 1048576 || b > 1048576 || c < 0 - 1048576 || d > 1048576 { return false; }
+                let p0 = a * c;
+                let p1 = a * d;
+                let p2 = b * c;
+                let p3 = b * d;
+                lo = p0; hi = p0;
+                if p1 < lo { lo = p1; } if p1 > hi { hi = p1; }
+                if p2 < lo { lo = p2; } if p2 > hi { hi = p2; }
+                if p3 < lo { lo = p3; } if p3 > hi { hi = p3; }
+            } else { return false; }
+        }
+    }
+    else { return false; }
+    // the result must fit the type, otherwise the operation wrapped
+    let t = e.ty;
+    if t.sign == 0 && lo < 0 { return false; }
+    if t.size < 8 {
+        var mx: i64 = 0;
+        var mn: i64 = 0;
+        if t.sign != 0 { mx = ((1 as i64) << ((t.size * 8 - 1) as i64)) - 1; mn = 0 - mx - 1; } else { mx = ((1 as i64) << ((t.size * 8) as i64)) - 1; mn = 0; }
+        if lo < mn || hi > mx { return false; }
+    }
+    return true;
+}
+unsafe fn in_bounds(ix: *Expr, n: i64) -> bool {
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    return optlvl != 0 && irange(ix, ref lo, ref hi) && lo >= 0 && hi < n;
+}
+
+// ---- addresses as x86 memory operands ----
+extern fn sprintf(buf: *u8, fmt: String, a: i64, b: i64, c: i64, d: i64) -> i32;
+struct Addr { base: [64]u8; idx: [8]u8; scale: i32; disp: i64; }
+
+unsafe fn emit4(fmt: String, a: i64, b: i64, c: i64, d: i64) {
+    var buf: [512]u8;
+    sprintf(&buf[0], fmt, a, b, c, d);
+    fprintf(out, "\t%s\n", &buf[0] as i64, 0, 0);
+}
+unsafe fn ptr_kw(size: i32) -> String {
+    if size == 1 { return "BYTE"; } if size == 2 { return "WORD"; } if size == 4 { return "DWORD"; } return "QWORD";
+}
+unsafe fn sized_reg(r: i32, size: i32) -> String {
+    if size == 1 { return GREG8(r); } if size == 2 { return GREG16(r); } if size == 4 { return GREG32(r); } return GREG(r);
+}
+unsafe fn sized_rdx(size: i32) -> String {
+    if size == 1 { return "dl"; } if size == 2 { return "dx"; } if size == 4 { return "edx"; } return "rdx";
+}
+unsafe fn sized_rax(size: i32) -> String {
+    if size == 1 { return "al"; } if size == 2 { return "ax"; } if size == 4 { return "eax"; } return "rax";
+}
+unsafe fn addr_str(a: *Addr, buf: *u8) {
+    var n = sprintf(buf, "[%s", &a.base[0] as i64, 0, 0, 0);
+    if a.idx[0] != 0 { n += sprintf(&buf[n], "+%s*%d", &a.idx[0] as i64, a.scale as i64, 0, 0); }
+    if a.disp > 0 { n += sprintf(&buf[n], "+%lld", a.disp, 0, 0, 0); }
+    else if a.disp < 0 { n += sprintf(&buf[n], "%lld", a.disp, 0, 0, 0); }
+    strcpy(&buf[n], "]" as *u8);
+}
+unsafe fn strip_rip(a: *Addr) {
+    // non-PIE: absolute address + index
+    if strncmp((&a.base[0]) as *u8, "rip+" as *u8, 4) == 0 { memmove(&a.base[0], &a.base[4], strlen(&a.base[0]) - 3); }
+}
+// base register holding a pointer value
+unsafe fn ptr_base(e: *Expr, a: *Addr, tmp: String) -> bool {
+    if regvar(e) != 0 { strcpy(&a.base[0], GREG(regvar(e)) as *u8); return true; }
+    var rb: [48]u8;
+    if simple_int(e, &rb[0]) { emit2("mov %s, %s", tmp as i64, &rb[0] as i64); strcpy(&a.base[0], tmp as *u8); return true; }
+    return false;
+}
+// Address of an lvalue without a pointer in rax. May clobber rax and rcx (never other registers, never calls)
+// unless 'any' is set, in which case arbitrary index code may run first. Returns false if the shape is not handled.
+unsafe fn lvaddr(e: *Expr, a: *Addr, any: bool) -> bool {
+    memset(a as *u8, 0, sizeof(Addr));
+    a.scale = 1;
+    let k = e.kind;
+    if k == E_VAR {
+        let l = e.lv;
+        if l.is_global != 0 { snprintf(&a.base[0], 64, "rip+ag_g_%s", l.name as i64, 0, 0); return true; }
+        if l.is_ref != 0 {
+            if l.reg != 0 { strcpy(&a.base[0], GREG(l.reg) as *u8); }
+            else { emit2("mov %s, QWORD PTR [rbp-%d]", lv_tmp as i64, l.off as i64); strcpy(&a.base[0], lv_tmp as *u8); }
+            return true;
+        }
+        if l.reg != 0 { return false; }
+        strcpy(&a.base[0], "rbp" as *u8);
+        a.disp = 0 - (l.off as i64);
+        return true;
+    }
+    if k == E_FIELD {
+        if e.a.ty.kind == TY_PTR {
+            if !ptr_base(e.a, a, "rax") { return false; }
+            a.disp = e.fld.off as i64;
+            return true;
+        }
+        if !lv_static(e.a) && !(e.a.kind == E_INDEX && (any || lv_cheap(e.a))) { return false; }
+        if !lvaddr(e.a, a, any) { return false; }
+        a.disp += e.fld.off as i64;
+        return true;
+    }
+    if k == E_UN {
+        if e.op != O_DEREF { return false; }
+        return ptr_base(e.a, a, "rax");
+    }
+    if k == E_INDEX {
+        let bt = e.a.ty;
+        var sz = e.ty.size;
+        let arr = bt.kind == TY_ARRAY;
+        if !arr && bt.kind != TY_PTR { return false; }
+        let ix = e.b;
+        if arr && !lv_static(e.a) { return false; }
+        var tb: [48]u8;
+        if !arr && regvar(e.a) == 0 && !simple_int(e.a, &tb[0]) { return false; }
+        if ix.kind == E_INT && ix.cls == 0 {
+            // constant index
+            if arr && (ix.ival as u64) >= (bt.n as u64) { emit("jmp .Ltrap"); }
+            if arr { if !lvaddr(e.a, a, false) { return false; } } else if !ptr_base(e.a, a, "rcx") { return false; }
+            a.disp += ix.ival * (sz as i64);
+            return true;
+        }
+        let ir = regvar(ix);
+        if ir == 0 && !any && has_call(ix) { return false; }
+        if ir == 0 && !any {
+            // only cheap index code allowed: nothing but rax/rcx may change
+            var t: [48]u8;
+            if !simple_int(ix, &t[0]) { return false; }
+        }
+        var idx: String = "rax";
+        if ir != 0 { idx = GREG(ir); }
+        if ir == 0 { gen_expr(ix); }
+        let checked = arr && !in_bounds(ix, bt.n);
+        if checked { emit2("cmp %s, %lld", idx as i64, bt.n); emit("jae .Ltrap"); }
+        if sz != 1 && sz != 2 && sz != 4 && sz != 8 { emit2("imul rax, %s, %d", idx as i64, sz as i64); idx = "rax"; sz = 1; }
+        if arr {
+            var b: Addr;
+            let sv = lv_tmp;
+            lv_tmp = "rcx";
+            let ok = lvaddr(e.a, &b, false);
+            lv_tmp = sv;
+            if !ok { return false; }
+            strip_rip(&b);
+            memcpy(a as *u8, &b as *u8, sizeof(Addr));
+        } else if !ptr_base(e.a, a, "rcx") { return false; }
+        strcpy(&a.idx[0], idx as *u8);
+        a.scale = sz;
+        return true;
+    }
+    return false;
+}
+// address needs no code (or only rax for a ref slot) and has no index register
+unsafe fn lv_static(e: *Expr) -> bool {
+    let k = e.kind;
+    if k == E_VAR { return e.lv.reg == 0 || e.lv.is_ref != 0; }
+    if k == E_FIELD { if e.a.ty.kind != TY_PTR { return lv_static(e.a); } return regvar(e.a) != 0; }
+    if k == E_INDEX { return e.a.ty.kind == TY_ARRAY && e.b.kind == E_INT && e.b.cls == 0 && lv_static(e.a); }
+    return false;
+}
+unsafe fn lv_cheap(e: *Expr) -> bool {
+    var t: [48]u8;
+    let k = e.kind;
+    if k == E_VAR { return e.lv.reg == 0 || e.lv.is_ref != 0; }
+    if k == E_FIELD { if e.a.ty.kind == TY_PTR { return regvar(e.a) != 0 || simple_int(e.a, &t[0]); } return lv_cheap(e.a); }
+    if k == E_UN { return e.op == O_DEREF && (regvar(e.a) != 0 || simple_int(e.a, &t[0])); }
+    if k == E_INDEX {
+        let bt = e.a.ty;
+        if bt.kind == TY_ARRAY { if !lv_static(e.a) { return false; } }
+        else if bt.kind == TY_PTR { if regvar(e.a) == 0 && !simple_int(e.a, &t[0]) { return false; } }
+        else { return false; }
+        return (e.b.kind == E_INT && e.b.cls == 0) || simple_int(e.b, &t[0]);
+    }
+    return false;
+}
+// any floating point (xmm) work inside?
+unsafe fn has_float(e: *Expr) -> bool {
+    if e == null { return false; }
+    if e.ty != null && is_float(e.ty) { return true; }
+    if e.kind == E_CAST && e.a.ty != null && is_float(e.a.ty) { return true; }
+    if has_float(e.a) || has_float(e.b) { return true; }
+    var p = e.args;
+    while p != null { if has_float(p) { return true; } p = p.next; }
+    return false;
+}
+// could raise a hardware divide error
+unsafe fn can_fpe(e: *Expr) -> bool {
+    if e == null { return false; }
+    if e.kind == E_BIN && (e.op == O_DIV || e.op == O_MOD) && e.ty != null && is_int(e.ty) && !(e.b.kind == E_INT && e.b.ival != 0 && e.b.ival != 0 - 1) { return true; }
+    if can_fpe(e.a) || can_fpe(e.b) { return true; }
+    var p = e.args;
+    while p != null { if can_fpe(p) { return true; } p = p.next; }
+    return false;
+}
+// lvaddr(e, a, true) will succeed; the index code touches only integer registers, no xmm, no calls
+unsafe fn lv_anyok(e: *Expr) -> bool {
+    var t: [48]u8;
+    let k = e.kind;
+    if k == E_VAR { return e.lv.is_global != 0 || e.lv.is_ref != 0 || e.lv.reg == 0; }
+    if k == E_FIELD {
+        if e.a.ty.kind == TY_PTR { return regvar(e.a) != 0 || simple_int(e.a, &t[0]); }
+        return lv_static(e.a) || (e.a.kind == E_INDEX && lv_anyok(e.a));
+    }
+    if k == E_UN { return e.op == O_DEREF && (regvar(e.a) != 0 || simple_int(e.a, &t[0])); }
+    if k == E_INDEX {
+        let bt = e.a.ty;
+        if bt.kind == TY_ARRAY { if !lv_static(e.a) { return false; } }
+        else if bt.kind == TY_PTR { if regvar(e.a) == 0 && !simple_int(e.a, &t[0]) { return false; } }
+        else { return false; }
+        return !has_call(e.b) && !has_float(e.b);
+    }
+    return false;
+}
+unsafe fn is_sqrt_call(e: *Expr) -> bool {
+    return e.callee != null && e.callee.is_extern != 0 && strcmp(e.callee.name, "sqrt" as *u8) == 0 && e.nargs == 1 && e.ty.size == 8;
+}
+// kinds gen_fexpr handles itself (everything else goes through rax)
+unsafe fn fnative(e: *Expr) -> bool {
+    let k = e.kind;
+    if k == E_FLOAT || k == E_INT || k == E_VAR || k == E_FIELD || k == E_INDEX || k == E_BIN || k == E_CAST { return true; }
+    if k == E_UN { return e.op == O_NEG || e.op == O_DEREF; }
+    if k == E_CALL { return is_sqrt_call(e) || try_inline(e) != null; }
+    return false;
+}
+unsafe fn lvaddr_must(e: *Expr, a: *Addr) { if !lvaddr(e, a, false) { printf("internal error: lvaddr\n", 0, 0, 0); exit(3); } }
+unsafe fn lvaddr_any(e: *Expr, a: *Addr) { if !lvaddr(e, a, true) { printf("internal error: lvaddr(any)\n", 0, 0, 0); exit(3); } }
+// address operand with no code at all
+unsafe fn lv_nocode(e: *Expr) -> bool {
+    let k = e.kind;
+    if k == E_VAR { if e.lv.is_ref != 0 { return e.lv.reg != 0; } return e.lv.reg == 0; }
+    if k == E_FIELD { if e.a.ty.kind != TY_PTR { return lv_nocode(e.a); } return regvar(e.a) != 0; }
+    if k == E_INDEX {
+        if e.a.ty.kind != TY_ARRAY || !lv_nocode(e.a) { return false; }
+        if e.b.kind == E_INT && e.b.cls == 0 { return (e.b.ival as u64) < (e.a.ty.n as u64); }
+        return regvar(e.b) != 0 && in_bounds(e.b, e.a.ty.n);
+    }
+    return false;
+}
+// operand for the second source of an SSE instruction; buf == null only checks
+unsafe fn fsimple(e: *Expr, buf: *u8) -> bool {
+    let f32 = e.ty.size == 4;
+    var kw: String = "QWORD";
+    if f32 { kw = "DWORD"; }
+    if e.kind == E_FLOAT || (e.kind == E_INT && is_float(e.ty)) {
+        if buf != null {
+            var tx: [40]u8;
+            var t = e.sval;
+            if e.kind == E_INT { snprintf(&tx[0], 40, "%lld", e.ival, 0, 0); t = &tx[0]; }
+            var is32 = 0;
+            if f32 { is32 = 1; }
+            sprintf(buf, "%s PTR [rip+.LF%d]", kw as i64, add_fconst(t, is32) as i64, 0, 0);
+        }
+        return true;
+    }
+    if e.kind == E_VAR && e.lv.reg >= 8 { if buf != null { sprintf(buf, "xmm%d", e.lv.reg as i64, 0, 0, 0); } return true; }
+    if (e.kind == E_VAR || e.kind == E_FIELD || e.kind == E_INDEX) && lv_nocode(e) {
+        if buf != null {
+            var a: Addr;
+            var m: [96]u8;
+            lvaddr_must(e, &a);
+            addr_str(&a, &m[0]);
+            sprintf(buf, "%s PTR %s", kw as i64, &m[0] as i64, 0, 0);
+        }
+        return true;
+    }
+    return false;
+}
+unsafe fn fop(op: i32, f32: bool, k: i32, src: *u8) {
+    var mn: String = "div";
+    if op == O_ADD { mn = "add"; } else if op == O_SUB { mn = "sub"; } else if op == O_MUL { mn = "mul"; }
+    var sx: String = "sd";
+    if f32 { sx = "ss"; }
+    emit4("%s%s xmm%d, %s", mn as i64, sx as i64, k as i64, src as i64);
+}
+unsafe fn is_ftwo(e: *Expr) -> bool {
+    return (e.kind == E_INT && e.ival == 2 && e.cls == 0) || (e.kind == E_FLOAT && e.sval != null && strtod(e.sval, null) == 2.0);
+}
+unsafe fn movs(f32: bool) -> String { if f32 { return "movss"; } return "movsd"; }
+unsafe fn fkw(f32: bool) -> String { if f32 { return "DWORD"; } return "QWORD"; }
+unsafe fn is_memref(R: *Expr) -> bool {
+    return R.kind == E_INDEX || R.kind == E_FIELD || (R.kind == E_UN && R.op == O_DEREF) || (R.kind == E_VAR && R.lv.reg == 0);
+}
+unsafe fn gen_fexpr(e: *Expr, k: i32) {
+    let f32 = e.ty.size == 4;
+    var src: [160]u8;
+    let ek = e.kind;
+    if ek == E_FLOAT || ek == E_INT {
+        fsimple(e, &src[0]);
+        emit3("%s xmm%d, %s", movs(f32) as i64, k as i64, &src[0] as i64);
+        return;
+    }
+    if ek == E_VAR && e.lv.reg >= 8 { emit2("movaps xmm%d, xmm%d", k as i64, e.lv.reg as i64); return; }
+    if ek == E_VAR || ek == E_FIELD || ek == E_INDEX {
+        var a: Addr;
+        var m: [96]u8;
+        let fb = fbase;
+        fbase = k;   // index code may use xmm<k> and up
+        let ok = lvaddr(e, &a, true);
+        fbase = fb;
+        if ok {
+            addr_str(&a, &m[0]);
+            emit4("%s xmm%d, %s PTR %s", movs(f32) as i64, k as i64, fkw(f32) as i64, &m[0] as i64);
+            return;
+        }
+    }
+    else if ek == E_UN {
+        if e.op == O_NEG {
+            gen_fexpr(e.a, k);
+            need_fneg = 1;
+            if f32 { emit1("xorps xmm%d, XMMWORD PTR [rip+.Lfneg32]", k as i64); } else { emit1("xorpd xmm%d, XMMWORD PTR [rip+.Lfneg64]", k as i64); }
+            return;
+        }
+        if e.op == O_DEREF {
+            var a: Addr;
+            var m: [96]u8;
+            let fb = fbase;
+            fbase = k;
+            let ok = lvaddr(e, &a, true);
+            fbase = fb;
+            if ok {
+                addr_str(&a, &m[0]);
+                emit4("%s xmm%d, %s PTR %s", movs(f32) as i64, k as i64, fkw(f32) as i64, &m[0] as i64);
+                return;
+            }
+        }
+    }
+    else if ek == E_CAST {
+        let from = e.a.ty;
+        if is_float(from) {
+            gen_fexpr(e.a, k);
+            if from.size != e.ty.size { if f32 { emit2("cvtsd2ss xmm%d, xmm%d", k as i64, k as i64); } else { emit2("cvtss2sd xmm%d, xmm%d", k as i64, k as i64); } }
+            return;
+        }
+        let fb = fbase;
+        fbase = k;
+        gen_expr(e.a);
+        fbase = fb;
+        var cv: String = "cvtsi2sd";
+        if f32 { cv = "cvtsi2ss"; }
+        emit2("pxor xmm%d, xmm%d", k as i64, k as i64);
+        if from.size == 8 && from.sign == 0 {
+            let L1 = newlbl();
+            let L2 = newlbl();
+            emit("test rax, rax"); emit1("js .L%d", L1 as i64); emit2("%s xmm%d, rax", cv as i64, k as i64); emit1("jmp .L%d", L2 as i64);
+            place(L1); emit("mov rcx, rax"); emit("shr rcx, 1"); emit("and eax, 1"); emit("or rcx, rax"); emit2("%s xmm%d, rcx", cv as i64, k as i64);
+            if f32 { emit2("addss xmm%d, xmm%d", k as i64, k as i64); } else { emit2("addsd xmm%d, xmm%d", k as i64, k as i64); }
+            place(L2);
+        } else { emit2("%s xmm%d, rax", cv as i64, k as i64); }
+        return;
+    }
+    else if ek == E_CALL {
+        // sqrt intrinsic, inlined calls
+        if fnative(e) && e.callee.is_extern != 0 { gen_fexpr(e.args, k); emit2("sqrtsd xmm%d, xmm%d", k as i64, k as i64); return; }
+        let ib = try_inline(e);
+        if ib != null { inl_depth += 1; gen_fexpr(ib, k); inl_depth -= 1; return; }
+    }
+    else if ek == E_BIN && e.op >= O_ADD && e.op <= O_DIV {
+        let op = e.op;
+        var L = e.a;
+        var R = e.b;
+        if op == O_MUL && (is_ftwo(L) || is_ftwo(R)) {
+            // 2*x == x+x exactly
+            if is_ftwo(L) { gen_fexpr(R, k); } else { gen_fexpr(L, k); }
+            if f32 { emit2("addss xmm%d, xmm%d", k as i64, k as i64); } else { emit2("addsd xmm%d, xmm%d", k as i64, k as i64); }
+            return;
+        }
+        if (op == O_ADD || op == O_MUL) && fsimple(L, null) && !fsimple(R, null) && !has_call(R) { let t = L; L = R; R = t; }
+        gen_fexpr(L, k);
+        if fsimple(R, null) { fsimple(R, &src[0]); fop(op, f32, k, &src[0]); return; }
+        if is_memref(R) && lv_anyok(R) {
+            var a: Addr;
+            var m: [96]u8;
+            lvaddr_any(R, &a);
+            addr_str(&a, &m[0]);
+            sprintf(&src[0], "%s PTR %s", fkw(f32) as i64, &m[0] as i64, 0, 0);
+            fop(op, f32, k, &src[0]);
+            return;
+        }
+        if !has_call(R) && k < 6 { gen_fexpr(R, k + 1); sprintf(&src[0], "xmm%d", (k + 1) as i64, 0, 0, 0); fop(op, f32, k, &src[0]); return; }
+        let tg = tmp_gp();
+        var t = 7;
+        if k == 7 { t = 6; }
+        if tg != 0 {
+            // keep the left value in a callee-saved register across the call
+            if f32 { emit2("movd %s, xmm%d", GREG32(tg) as i64, k as i64); } else { emit2("movq %s, xmm%d", G(tg), k as i64); }
+            gen_fexpr(R, k);
+            if f32 { emit2("movd xmm%d, %s", t as i64, GREG32(tg) as i64); } else { emit2("movq xmm%d, %s", t as i64, G(tg)); }
+            gp_busy[tg] = 0;
+            sprintf(&src[0], "xmm%d", k as i64, 0, 0, 0);
+            fop(op, f32, t, &src[0]);
+            emit2("movaps xmm%d, xmm%d", k as i64, t as i64);
+            return;
+        }
+        // spill the left value across a call
+        emit("sub rsp, 16");
+        push_cnt += 2;
+        if f32 { emit1("movss DWORD PTR [rsp], xmm%d", k as i64); } else { emit1("movsd QWORD PTR [rsp], xmm%d", k as i64); }
+        gen_fexpr(R, k);
+        emit3("%s xmm%d, %s PTR [rsp]", movs(f32) as i64, t as i64, fkw(f32) as i64);
+        sprintf(&src[0], "xmm%d", k as i64, 0, 0, 0);
+        fop(op, f32, t, &src[0]);
+        emit2("movaps xmm%d, xmm%d", k as i64, t as i64);
+        emit("add rsp, 16");
+        push_cnt -= 2;
+        return;
+    }
+    // anything else produces its bits in rax
+    let fb = fbase;
+    fbase = k;
+    no_froute = 1;
+    gen_expr(e);
+    fbase = fb;
+    if f32 { emit1("movd xmm%d, eax", k as i64); } else { emit1("movq xmm%d, rax", k as i64); }
+}
+unsafe fn reads_xreg(e: *Expr, r: i32) -> bool {
+    if e == null { return false; }
+    if e.kind == E_VAR && e.lv != null && e.lv.reg == r && e.lv.is_ref == 0 { return true; }
+    if reads_xreg(e.a, r) || reads_xreg(e.b, r) { return true; }
+    var p = e.args;
+    while p != null { if reads_xreg(p, r) { return true; } p = p.next; }
+    return false;
+}
+// float expression straight into register variable xmm<dst> (no copy through xmm0); call-free expressions only
+unsafe fn gen_fexpr_to(e: *Expr, dst: i32) {
+    let f32 = e.ty.size == 4;
+    var src: [160]u8;
+    if fsimple(e, null) {
+        fsimple(e, &src[0]);
+        if src[0] == 'x' { if atoi(&src[3]) != dst { emit2("movaps xmm%d, %s", dst as i64, &src[0] as i64); } }
+        else { emit3("%s xmm%d, %s", movs(f32) as i64, dst as i64, &src[0] as i64); }
+        return;
+    }
+    if !has_call(e) && e.kind == E_BIN && e.op >= O_ADD && e.op <= O_DIV && !is_ftwo(e.a) && !is_ftwo(e.b) && fnative(e.a) {
+        var L = e.a;
+        var R = e.b;
+        let op = e.op;
+        if (op == O_ADD || op == O_MUL) && (fsimple(L, null) || reads_xreg(R, dst)) && !reads_xreg(L, dst) && fnative(R) { let t = L; L = R; R = t; }
+        if !reads_xreg(R, dst) {
+            if fsimple(R, null) { gen_fexpr_to(L, dst); fsimple(R, &src[0]); fop(op, f32, dst, &src[0]); return; }
+            if is_memref(R) && lv_anyok(R) {
+                var a: Addr;
+                var m: [96]u8;
+                gen_fexpr_to(L, dst);
+                lvaddr_any(R, &a);
+                addr_str(&a, &m[0]);
+                sprintf(&src[0], "%s PTR %s", fkw(f32) as i64, &m[0] as i64, 0, 0);
+                fop(op, f32, dst, &src[0]);
+                return;
+            }
+            gen_fexpr_to(L, dst);
+            gen_fexpr(R, 0);
+            fop(op, f32, dst, "xmm0" as *u8);
+            return;
+        }
+    }
+    gen_fexpr(e, 0);
+    emit1("movaps xmm%d, xmm0", dst as i64);
+}
+// float comparison: L in xmm<k>, R in xmm<k+1>
+unsafe fn fcmp_operands(L: *Expr, R: *Expr, k: i32) {
+    gen_fexpr(L, k);
+    if !has_call(R) && k < 6 { gen_fexpr(R, k + 1); return; }
+    let f32 = L.ty.size == 4;
+    emit("sub rsp, 16");
+    push_cnt += 2;
+    if f32 { emit1("movss DWORD PTR [rsp], xmm%d", k as i64); } else { emit1("movsd QWORD PTR [rsp], xmm%d", k as i64); }
+    gen_fexpr(R, k + 1);
+    emit3("%s xmm%d, %s PTR [rsp]", movs(f32) as i64, k as i64, fkw(f32) as i64);
+    emit("add rsp, 16");
+    push_cnt -= 2;
+}
+unsafe fn fjump(op: i32, L: i32, when: bool) {
+    if op == O_EQ || op == O_NE {
+        if (op == O_EQ) == when { let Ls = newlbl(); emit1("jp .L%d", Ls as i64); emit1("je .L%d", L as i64); place(Ls); }
+        else { emit1("jne .L%d", L as i64); emit1("jp .L%d", L as i64); }
+        return;
+    }
+    let eq = op == O_LE || op == O_GE;
+    if when { if eq { emit1("jae .L%d", L as i64); } else { emit1("ja .L%d", L as i64); } }
+    else { if eq { emit1("jb .L%d", L as i64); } else { emit1("jbe .L%d", L as i64); } }
+}
+// NaN compares false (except !=)
+unsafe fn fbranch(e: *Expr, L: i32, when: bool) {
+    let k = fbase;
+    let f32 = e.a.ty.size == 4;
+    var uc: String = "ucomisd";
+    if f32 { uc = "ucomiss"; }
+    let op = e.op;
+    var src: [160]u8;
+    // one side needs no code: compare a register with it directly (X > Y / X >= Y / X == Y)
+    var X: *Expr = null;
+    var Y: *Expr = null;
+    if op == O_GT || op == O_GE || op == O_EQ || op == O_NE { if fsimple(e.b, null) { X = e.a; Y = e.b; } }
+    if op == O_LT || op == O_LE || op == O_EQ || op == O_NE { if X == null && fsimple(e.a, null) { X = e.b; Y = e.a; } }
+    if X != null {
+        var xr = k;
+        if X.kind == E_VAR && X.lv.reg >= 8 { xr = X.lv.reg; }
+        if xr == k { gen_fexpr(X, k); }
+        fsimple(Y, &src[0]);
+        emit3("%s xmm%d, %s", uc as i64, xr as i64, &src[0] as i64);
+        fjump(op, L, when);
+        return;
+    }
+    fcmp_operands(e.a, e.b, k);
+    if op == O_EQ || op == O_NE {
+        emit3("%s xmm%d, xmm%d", uc as i64, k as i64, (k + 1) as i64);
+        fjump(op, L, when);
+        return;
+    }
+    let swap = op == O_LT || op == O_LE;
+    if swap { emit3("%s xmm%d, xmm%d", uc as i64, (k + 1) as i64, k as i64); } else { emit3("%s xmm%d, xmm%d", uc as i64, k as i64, (k + 1) as i64); }
+    fjump(op, L, when);
+}
+unsafe fn fcmp_value(e: *Expr) {
+    let k = fbase;
+    let f32 = e.a.ty.size == 4;
+    var uc: String = "ucomisd";
+    if f32 { uc = "ucomiss"; }
+    fcmp_operands(e.a, e.b, k);
+    let op = e.op;
+    let K = k as i64;
+    let K1 = (k + 1) as i64;
+    if op == O_EQ { emit3("%s xmm%d, xmm%d", uc as i64, K, K1); emit("sete al"); emit("setnp cl"); emit("and al, cl"); }
+    else if op == O_NE { emit3("%s xmm%d, xmm%d", uc as i64, K, K1); emit("setne al"); emit("setp cl"); emit("or al, cl"); }
+    else if op == O_LT { emit3("%s xmm%d, xmm%d", uc as i64, K1, K); emit("seta al"); }
+    else if op == O_LE { emit3("%s xmm%d, xmm%d", uc as i64, K1, K); emit("setae al"); }
+    else if op == O_GT { emit3("%s xmm%d, xmm%d", uc as i64, K, K1); emit("seta al"); }
+    else { emit3("%s xmm%d, xmm%d", uc as i64, K, K1); emit("setae al"); }
+    emit("movzx eax, al");
+}
+// jump to L when e's truth value equals 'when'
+unsafe fn gen_branch(e: *Expr, L: i32, when: bool) {
+    if e.kind == E_BOOL { if (e.ival != 0) == when { emit1("jmp .L%d", L as i64); } return; }
+    if e.kind == E_UN && e.op == O_NOT { gen_branch(e.a, L, !when); return; }
+    if e.kind == E_BIN && (e.op == O_LAND || e.op == O_LOR) {
+        let both = (e.op == O_LAND) == !when;   // LAND jumping on false / LOR jumping on true: either side decides
+        if both { gen_branch(e.a, L, when); gen_branch(e.b, L, when); }
+        else { let Ls = newlbl(); gen_branch(e.a, Ls, !when); gen_branch(e.b, L, when); place(Ls); }
+        return;
+    }
+    if e.kind == E_BIN && e.op >= O_EQ && e.op <= O_GE && is_intlike(e.a.ty) {
+        var rb: [48]u8;
+        let lr = regvar(e.a);
+        let z = e.b.kind == E_INT && e.b.ival == 0;
+        let bimm = (e.b.kind == E_INT || e.b.kind == E_BOOL || e.b.kind == E_ENUMVAL) && imm32(e.b.ival);
+        let ak = e.a.kind;
+        if lr != 0 && z { emit2("test %s, %s", G(lr), G(lr)); }
+        else if lr != 0 && simple_int(e.b, &rb[0]) { emit2("cmp %s, %s", G(lr), &rb[0] as i64); }
+        else if bimm && e.a.ty.size <= 8 && (ak == E_VAR || ak == E_FIELD || ak == E_INDEX || (ak == E_UN && e.a.op == O_DEREF)) && regvar(e.a) == 0 && lv_nocode(e.a) {
+            var a: Addr;
+            var m: [96]u8;
+            let sz = e.a.ty.size;
+            lvaddr_must(e.a, &a);
+            addr_str(&a, &m[0]);
+            var v = e.b.ival;
+            if sz == 1 { v = v & 255; } else if sz == 2 { v = v & 65535; } else if sz == 4 { v = (v as i32) as i64; }
+            emit3("cmp %s PTR %s, %lld", ptr_kw(sz) as i64, &m[0] as i64, v);
+        }
+        else {
+            gen_expr(e.a);
+            if z { emit("test rax, rax"); } else { gen_rhs(e.b, &rb[0]); emit1("cmp rax, %s", &rb[0] as i64); }
+        }
+        emit2("j%s .L%d", cc_of(e.op, is_unsigned_cmp(e.a.ty), !when) as i64, L as i64);
+        return;
+    }
+    if e.kind == E_BIN && e.op >= O_EQ && e.op <= O_GE && is_float(e.a.ty) && fbase < 6 { fbranch(e, L, when); return; }
+    if regvar(e) != 0 {
+        emit2("test %s, %s", G(regvar(e)), G(regvar(e)));
+        if when { emit1("jnz .L%d", L as i64); } else { emit1("jz .L%d", L as i64); }
+        return;
+    }
+    if e.ty != null && e.ty.kind == TY_BOOL && lv_nocode(e) {
+        var a: Addr;
+        var m: [96]u8;
+        lvaddr_must(e, &a);
+        addr_str(&a, &m[0]);
+        emit1("cmp BYTE PTR %s, 0", &m[0] as i64);
+        if when { emit1("jne .L%d", L as i64); } else { emit1("je .L%d", L as i64); }
+        return;
+    }
+    gen_expr(e);
+    emit("test rax, rax");
+    if when { emit1("jnz .L%d", L as i64); } else { emit1("jz .L%d", L as i64); }
+}
+
+// ---- calls ----
+// argument loadable with one instruction
+unsafe fn arg_simple(a: *Expr, pt: *Type, pref: i32, buf: *u8, ref kind: i32) -> bool {
+    var ad: Addr;
+    var m: [160]u8;
+    if a.move != 0 || a.dflag != 0 || a.copy != 0 { return false; }   // ownership bookkeeping happens in gen_expr
+    if pref != 0 || is_agg(pt) {
+        // address of a place
+        var x: *Expr = a;
+        if pref != 0 { if a.kind == E_REF { x = a.a; } else { x = null; } }
+        if x == null || !lv_nocode(x) { return false; }
+        lvaddr_must(x, &ad);
+        addr_str(&ad, buf);
+        kind = 1;
+        return true;
+    }
+    if is_float(pt) {
+        if a.kind == E_VAR && a.lv.reg >= 8 {
+            sprintf(buf, "xmm%d", a.lv.reg as i64, 0, 0, 0);
+            if pt.size == 4 { kind = 3; } else { kind = 2; }
+            return true;
+        }
+        if !fsimple(a, null) { return false; }
+        fsimple(a, &m[0]);
+        strcpy(buf, &m[0]);
+        if pt.size == 4 { kind = 5; } else { kind = 4; }
+        return true;
+    }
+    if simple_int(a, buf) { kind = 0; return true; }
+    if a.kind == E_BIN && (a.op == O_ADD || a.op == O_SUB) && regvar(a.a) != 0 && a.b.kind == E_INT && a.b.cls == 0 && imm32(a.b.ival) && imm32(0 - a.b.ival) && is_int(a.ty) {
+        var lo: i64 = 0;
+        var hi: i64 = 0;
+        if a.ty.size == 8 || irange(a, ref lo, ref hi) {
+            var d = a.b.ival;
+            if a.op == O_SUB { d = 0 - d; }
+            sprintf(buf, "[%s%+lld]", G(regvar(a.a)), d, 0, 0);
+            kind = 1;
+            return true;
+        }
+    }
+    return false;
+}
+var ca_simple: [2048]i32;
+var ca_kind: [2048]i32;
+var ca_pushed: [2048]i32;
+var ca_buf: [262144]u8;
+var ca_sp: i32;
+unsafe fn gen_call_opt(e: *Expr) -> bool {
+    let f = e.callee;
+    let n = e.nargs;
+    var hid = 0;
+    if f.is_async == 0 && is_agg(f.ret) { hid = 1; }
+    if f.ifc != null || e.builtin == 3 || n + hid > 6 || n > 8 { return false; }
+    var i = 0;
+    if f.is_extern != 0 {
+        if is_float(f.ret) { return false; }
+        while i < n { if is_float(f.pty[i]) { return false; } i += 1; }
+    }
+    // per-call scratch (calls nest through argument evaluation)
+    let base = ca_sp;
+    ca_sp += 8;
+    i = 0;
+    var a = e.args;
+    while i < n {
+        var kd = 0;
+        if arg_simple(a, f.pty[i], f.pref[i], &ca_buf[(base + i) * 128], ref kd) { ca_simple[base + i] = 1; } else { ca_simple[base + i] = 0; }
+        ca_kind[base + i] = kd;
+        ca_pushed[base + i] = 0;
+        i += 1;
+        a = a.next;
+    }
+    i = n - 1;
+    while i >= 0 {
+        // complex arguments, right to left as always
+        if ca_simple[base + i] == 0 {
+            let x = nth_arg(e, i);
+            let dest = i + hid;
+            var later = false;
+            if x.kind == E_REF { gen_addr(x.a); } else { gen_expr(x); }
+            var j = 0;
+            while j < i { if ca_simple[base + j] == 0 && has_call(nth_arg(e, j)) { later = true; } j += 1; }
+            if !later && (strcmp((R64(dest)) as *u8, "rdi" as *u8) == 0 || strcmp((R64(dest)) as *u8, "rsi" as *u8) == 0) { emit1("mov %s, rax", R64(dest) as i64); }   // nothing call-free touches rdi/rsi
+            else { gpush("rax"); ca_pushed[base + i] = 1; }
+        }
+        i -= 1;
+    }
+    i = 0;
+    while i < n { if ca_pushed[base + i] != 0 { gpop(R64(i + hid)); } i += 1; }
+    i = 0;
+    while i < n {
+        if ca_simple[base + i] != 0 {
+            let d = R64(i + hid) as i64;
+            let d32 = R32(i + hid) as i64;
+            let sb = &ca_buf[(base + i) * 128];
+            let kd = ca_kind[base + i];
+            if kd == 0 { if strcmp(sb, "0" as *u8) == 0 { emit2("xor %s, %s", d32, d32); } else { emit2("mov %s, %s", d, sb as i64); } }
+            else if kd == 1 { emit2("lea %s, %s", d, sb as i64); }
+            else if kd == 2 { emit2("movq %s, %s", d, sb as i64); }
+            else if kd == 3 { emit2("movd %s, %s", d32, sb as i64); }
+            else if kd == 4 { emit2("mov %s, %s", d, sb as i64); }
+            else if kd == 5 { emit2("mov %s, %s", d32, sb as i64); }
+        }
+        i += 1;
+    }
+    ca_sp = base;
+    if hid != 0 { emit1("lea rdi, [rbp-%d]", e.tmp as i64); }
+    if f.is_extern != 0 { emit("xor eax, eax"); }
+    let pad = push_cnt & 1;
+    if pad != 0 { emit("sub rsp, 8"); }
+    xsave();
+    if f.is_async != 0 { emit1("call ag__spawn_%s", S(mangle(f.name))); }
+    else if f.is_extern != 0 { emit1("call %s", S(mangle(f.name))); }
+    else { emit1("call ag_%s", S(mangle(f.name))); }
+    xrestore();
+    if pad != 0 { emit("add rsp, 8"); }
+    if f.is_extern != 0 { norm(f.ret); }
+    if f.is_async != 0 { emit1("mov QWORD PTR [rbp-%d], rax", e.tmp as i64); emit1("lea rax, [rbp-%d]", e.tmp as i64); }
+    return true;
+}
+
+// ---- assignments ----
+// float assignments in xmm registers
+unsafe fn gen_fassign(s: *Stmt) -> bool {
+    let x = s.e;
+    let v = s.e2;
+    let f32 = x.ty.size == 4;
+    let mv = movs(f32) as i64;
+    let kw = fkw(f32) as i64;
+    let compound = v.kind == E_BIN && v.a == x && v.op >= O_ADD && v.op <= O_DIV;
+    var val = v;
+    if compound { val = v.b; }
+    var src: [160]u8;
+    if x.kind == E_VAR && x.lv.reg >= 8 {
+        let r = x.lv.reg;
+        if compound {
+            if fsimple(val, null) { fsimple(val, &src[0]); fop(v.op, f32, r, &src[0]); }
+            else { gen_fexpr(val, 0); fop(v.op, f32, r, "xmm0" as *u8); }
+        } else if fsimple(val, null) {
+            fsimple(val, &src[0]);
+            if src[0] == 'x' { emit2("movaps xmm%d, %s", r as i64, &src[0] as i64); } else { emit3("%s xmm%d, %s", mv, r as i64, &src[0] as i64); }
+        }
+        else { gen_fexpr_to(val, r); }
+        return true;
+    }
+    if x.kind == E_VAR && x.lv.reg != 0 { return false; }
+    var a: Addr;
+    var m: [96]u8;
+    if !lv_cheap(x) {
+        // value first, then the address (index code leaves xmm0 alone)
+        if !lv_anyok(x) || has_call(val) || can_fpe(val) { return false; }
+        if compound && fsimple(val, null) {
+            fsimple(val, &src[0]);
+            lvaddr_any(x, &a);
+            addr_str(&a, &m[0]);
+            emit3("%s xmm1, %s PTR %s", mv, kw, &m[0] as i64);
+            fop(v.op, f32, 1, &src[0]);
+            emit3("%s %s PTR %s, xmm1", mv, kw, &m[0] as i64);
+            return true;
+        }
+        gen_fexpr(val, 0);
+        lvaddr_any(x, &a);
+        addr_str(&a, &m[0]);
+    } else {
+        gen_fexpr(val, 0);
+        lvaddr_must(x, &a);
+        addr_str(&a, &m[0]);
+    }
+    if compound {
+        emit3("%s xmm1, %s PTR %s", mv, kw, &m[0] as i64);
+        fop(v.op, f32, 1, "xmm0" as *u8);
+        emit3("%s %s PTR %s, xmm1", mv, kw, &m[0] as i64);
+    }
+    else { emit3("%s %s PTR %s, xmm0", mv, kw, &m[0] as i64); }
+    return true;
+}
+unsafe fn reads_greg(e: *Expr, r: i32) -> bool {
+    if e == null { return false; }
+    if e.kind == E_VAR && e.lv != null && e.lv.reg == r { return true; }
+    if reads_greg(e.a, r) || reads_greg(e.b, r) { return true; }
+    var p = e.args;
+    while p != null { if reads_greg(p, r) { return true; } p = p.next; }
+    return false;
+}
+unsafe fn arith_mn(op: i32) -> String {
+    if op == O_ADD { return "add"; } if op == O_SUB { return "sub"; } if op == O_MUL { return "imul"; }
+    if op == O_AND { return "and"; } if op == O_OR { return "or"; } if op == O_XOR { return "xor"; }
+    return "";
+}
+// integer expression straight into register variable r
+unsafe fn gen_int_to(e: *Expr, r: i32) {
+    var rb: [48]u8;
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    if simple_int(e, &rb[0]) {
+        if strcmp(&rb[0], "0" as *u8) == 0 { emit2("xor %s, %s", GREG32(r) as i64, GREG32(r) as i64); }
+        else if strcmp(&rb[0], (GREG(r)) as *u8) != 0 { emit2("mov %s, %s", G(r), &rb[0] as i64); }
+        return;
+    }
+    if e.kind == E_BIN && is_int(e.ty) && is_int(e.a.ty) && (e.op == O_ADD || e.op == O_SUB || e.op == O_AND || e.op == O_OR || e.op == O_XOR || e.op == O_MUL) {
+        var L = e.a;
+        var R = e.b;
+        let op = e.op;
+        let nn = e.ty.size == 8 || irange(e, ref lo, ref hi);
+        let comm = op != O_SUB;
+        if comm && simple_int(L, &rb[0]) && !simple_int(R, &rb[0]) && !has_call(R) { let t = L; L = R; R = t; }
+        if simple_int(R, &rb[0]) && !reads_greg(R, r) {
+            let lr = regvar(L);
+            let imm = R.kind == E_INT && R.cls == 0 && imm32(R.ival);
+            if lr != 0 && imm && imm32(0 - R.ival) && (op == O_ADD || op == O_SUB) && nn {
+                var d = R.ival;
+                if op == O_SUB { d = 0 - d; }
+                emit3("lea %s, [%s%+lld]", G(r), G(lr), d);
+                return;
+            }
+            if op == O_MUL && imm {
+                if lr != 0 { emit3("imul %s, %s, %lld", G(r), G(lr), R.ival); }
+                else { gen_int_to(L, r); emit3("imul %s, %s, %lld", G(r), G(r), R.ival); }
+                if !nn { norm_reg(e.ty, r); }
+                return;
+            }
+            gen_int_to(L, r);
+            emit3("%s %s, %s", arith_mn(op) as i64, G(r), &rb[0] as i64);
+            if !nn && op != O_AND && op != O_OR && op != O_XOR { norm_reg(e.ty, r); }
+            return;
+        }
+    }
+    gen_expr(e);
+    emit1("mov %s, rax", G(r));
+}
+
+// ---- facts from loop conditions: inside 'while x < y' x cannot be the type's maximum, so x += 1 cannot wrap ----
+var fact_l: [64]*Local;
+var fact_lower: [64]i32;
+var fact_v: [64]i64;
+var nfacts: i32;
+unsafe fn stmt_assigns(s: *Stmt, l: *Local) -> bool {
+    if s == null { return false; }
+    if (s.kind == S_ASSIGN && s.e.kind == E_VAR && s.e.lv == l) || (s.kind == S_LET && s.lv == l) { return true; }
+    if stmt_assigns(s.body, l) || stmt_assigns(s.els, l) { return true; }
+    var c = s.list;
+    while c != null { if stmt_assigns(c, l) { return true; } c = c.next; }
+    return false;
+}
+unsafe fn facts_kill(l: *Local) {
+    var i = 0;
+    while i < nfacts { if fact_l[i] == l { fact_l[i] = null; } i += 1; }
+}
+unsafe fn facts_kill_assigned(s: *Stmt) {
+    var i = 0;
+    while i < nfacts { if fact_l[i] != null && stmt_assigns(s, fact_l[i]) { fact_l[i] = null; } i += 1; }
+}
+unsafe fn ty_limits(t: *Type, ref mn: i64, ref mx: i64) -> bool {
+    if t.kind != TY_INT || (t.size == 8 && t.sign == 0) { return false; }
+    if t.size == 8 { mn = 0 - 9223372036854775807 - 1; mx = 9223372036854775807; return true; }
+    let b = (t.size * 8) as i64;
+    if t.sign != 0 { mx = ((1 as i64) << (b - 1)) - 1; mn = 0 - mx - 1; } else { mn = 0; mx = ((1 as i64) << b) - 1; }
+    return true;
+}
+unsafe fn fact_add(l: *Local, lower: i32, v: i64) {
+    if nfacts < 64 { fact_l[nfacts] = l; fact_lower[nfacts] = lower; fact_v[nfacts] = v; nfacts += 1; }
+}
+unsafe fn fact_get(l: *Local, lower: i32, ref v: i64) -> bool {
+    var found = false;
+    var i = 0;
+    while i < nfacts {
+        if fact_l[i] == l && fact_lower[i] == lower {
+            if !found || (lower != 0 && fact_v[i] > v) || (lower == 0 && fact_v[i] < v) { v = fact_v[i]; }
+            found = true;
+        }
+        i += 1;
+    }
+    return found;
+}
+// conditions known true at the start of a loop body
+unsafe fn facts_from(e: *Expr) {
+    if e.kind == E_BIN && e.op == O_LAND { facts_from(e.a); facts_from(e.b); return; }
+    if e.kind != E_BIN || e.op < O_LT || e.op > O_GE || e.a.ty == null || e.a.ty.kind != TY_INT { return; }
+    var A = e.a;
+    var B = e.b;
+    let strict = e.op == O_LT || e.op == O_GT;
+    if e.op == O_GT || e.op == O_GE { A = e.b; B = e.a; }   // now A < B or A <= B
+    var mn: i64 = 0;
+    var mx: i64 = 0;
+    if !ty_limits(e.a.ty, ref mn, ref mx) { return; }
+    let ak = A.kind == E_INT && A.cls == 0;
+    let bk = B.kind == E_INT && B.cls == 0;
+    if regvar(A) != 0 {
+        if bk { if strict { fact_add(A.lv, 0, B.ival - 1); } else { fact_add(A.lv, 0, B.ival); } }
+        else if strict { fact_add(A.lv, 0, mx - 1); }
+    }
+    if regvar(B) != 0 {
+        if ak { if strict { fact_add(B.lv, 1, A.ival + 1); } else { fact_add(B.lv, 1, A.ival); } }
+        else if strict { fact_add(B.lv, 1, mn + 1); }
+    }
+}
+// integer assignments without the push/pop dance; false = not handled
+unsafe fn gen_assign_opt(s: *Stmt) -> bool {
+    let x = s.e;
+    let v = s.e2;
+    let t = x.ty;
+    var rb: [48]u8;
+    if is_float(t) { return gen_fassign(s); }
+    if !is_intlike(t) { return false; }
+    let compound = v.kind == E_BIN && v.a == x && v.op >= O_ADD && v.op <= O_SHR;
+    let r = regvar(x);
+    let lop = compound && (v.op == O_ADD || v.op == O_SUB || v.op == O_AND || v.op == O_OR || v.op == O_XOR);
+    if r != 0 {
+        if lop && simple_int(v.b, &rb[0]) {
+            emit3("%s %s, %s", arith_mn(v.op) as i64, G(r), &rb[0] as i64);
+            if v.op <= O_SUB {
+                var lim: i64 = 0;
+                var mn2: i64 = 0;
+                var mx2: i64 = 0;
+                var c: i64 = 0 - 1;
+                if v.b.kind == E_INT && v.b.cls == 0 { c = v.b.ival; }
+                var safe = c > 0 && c < 4294967296 && ty_limits(v.ty, ref mn2, ref mx2);
+                if safe {
+                    if v.op == O_ADD { safe = fact_get(x.lv, 0, ref lim) && lim <= mx2 - c; }
+                    else { safe = fact_get(x.lv, 1, ref lim) && lim >= mn2 + c; }
+                }
+                if !safe { norm_reg(v.ty, r); }
+            }
+            return true;
+        }
+        if simple_int(v, &rb[0]) {
+            if strcmp(&rb[0], "0" as *u8) == 0 { emit2("xor %s, %s", GREG32(r) as i64, GREG32(r) as i64); } else { emit2("mov %s, %s", G(r), &rb[0] as i64); }
+            return true;
+        }
+        gen_int_to(v, r);
+        return true;
+    }
+    if x.kind == E_VAR && x.lv.reg != 0 { return false; }
+    var a: Addr;
+    var m: [96]u8;
+    let sz = t.size;
+    if lop {
+        // op [mem], value
+        let ir = regvar(v.b);
+        if v.b.kind == E_INT && imm32(v.b.ival) {
+            if !lvaddr(x, &a, true) { return false; }
+            addr_str(&a, &m[0]);
+            emit4("%s %s PTR %s, %lld", arith_mn(v.op) as i64, ptr_kw(sz) as i64, &m[0] as i64, v.b.ival);
+            return true;
+        }
+        if ir != 0 {
+            if !lvaddr(x, &a, true) { return false; }
+            addr_str(&a, &m[0]);
+            emit4("%s %s PTR %s, %s", arith_mn(v.op) as i64, ptr_kw(sz) as i64, &m[0] as i64, sized_reg(ir, sz) as i64);
+            return true;
+        }
+        if !lv_cheap(x) { return false; }
+        gen_expr(v.b);
+        emit("mov rdx, rax");
+        lvaddr_must(x, &a);
+        addr_str(&a, &m[0]);
+        emit4("%s %s PTR %s, %s", arith_mn(v.op) as i64, ptr_kw(sz) as i64, &m[0] as i64, sized_rdx(sz) as i64);
+        return true;
+    }
+    let ir = regvar(v);
+    if (v.kind == E_INT || v.kind == E_BOOL || v.kind == E_ENUMVAL) && imm32(v.ival) {
+        if !lvaddr(x, &a, true) { return false; }
+        addr_str(&a, &m[0]);
+        var iv = v.ival;
+        if sz == 1 { iv = iv & 255; } else if sz == 2 { iv = iv & 65535; }
+        emit3("mov %s PTR %s, %lld", ptr_kw(sz) as i64, &m[0] as i64, iv);
+        return true;
+    }
+    if ir != 0 {
+        if !lvaddr(x, &a, true) { return false; }
+        addr_str(&a, &m[0]);
+        emit3("mov %s PTR %s, %s", ptr_kw(sz) as i64, &m[0] as i64, sized_reg(ir, sz) as i64);
+        return true;
+    }
+    if !lv_cheap(x) { return false; }
+    if lv_nocode(x) {
+        gen_expr(v);
+        lvaddr_must(x, &a);
+        addr_str(&a, &m[0]);
+        emit3("mov %s PTR %s, %s", ptr_kw(sz) as i64, &m[0] as i64, sized_rax(sz) as i64);
+        return true;
+    }
+    gen_expr(v);
+    emit("mov rdx, rax");
+    lvaddr_must(x, &a);
+    addr_str(&a, &m[0]);
+    emit3("mov %s PTR %s, %s", ptr_kw(sz) as i64, &m[0] as i64, sized_rdx(sz) as i64);
+    return true;
+}
+
+// ---- full unrolling of short constant-trip loops: each copy sees the loop variable as a constant ----
+var unroll_bad: i32;
+// node count; flags shapes that cannot be cloned
+unsafe fn ucount(e: *Expr, v: *Local) -> i32 {
+    if e == null { return 0; }
+    let k = e.kind;
+    if e.tmp != 0 || e.dflag != 0 || e.move != 0 || k == E_AWAIT || k == E_TRY || k == E_OK || k == E_ERR || k == E_TOIFACE { unroll_bad = 1; }
+    if (k == E_REF || (k == E_UN && e.op == O_ADDR)) && e.a.kind == E_VAR && e.a.lv == v { unroll_bad = 1; }
+    var n = 1 + ucount(e.a, v) + ucount(e.b, v);
+    var p = e.args;
+    while p != null { n += ucount(p, v); p = p.next; }
+    return n;
+}
+unsafe fn scount(s: *Stmt, v: *Local) -> i32 {
+    if s == null { return 0; }
+    if s.temps != null || s.kind == S_MATCH || (s.kind == S_LET && s.lv.dflag != 0) { unroll_bad = 1; }
+    if s.kind == S_FOR && s.is_range == 0 { unroll_bad = 1; }
+    var n = 1 + ucount(s.e, v) + ucount(s.e2, v) + scount(s.body, v) + scount(s.els, v);
+    var c = s.list;
+    while c != null { n += scount(c, v); c = c.next; }
+    return n;
+}
+unsafe fn uclone(e: *Expr, v: *Local, k: i64) -> *Expr {
+    if e == null { return null; }
+    let c = ecopy(e);
+    c.inl = null;
+    c.inl_done = 0;
+    if e.kind == E_VAR && e.lv == v { c.kind = E_INT; c.ival = k; c.cls = 0; c.lv = null; return c; }
+    c.a = uclone(e.a, v, k);
+    c.b = uclone(e.b, v, k);
+    if e.nargs != 0 {
+        c.args = null;
+        var last: *Expr = null;
+        var p = e.args;
+        while p != null {
+            let q = uclone(p, v, k);
+            if last == null { c.args = q; } else { last.next = q; }
+            last = q;
+            p = p.next;
+        }
+    }
+    return c;
+}
+unsafe fn sclone(s: *Stmt, v: *Local, k: i64) -> *Stmt {
+    if s == null { return null; }
+    let c = zalloc(sizeof(Stmt)) as *Stmt;
+    memcpy(c as *u8, s as *u8, sizeof(Stmt));
+    c.next = null;
+    c.e = uclone(s.e, v, k);
+    if s.kind == S_ASSIGN && s.e2.kind == E_BIN && s.e2.a == s.e {
+        // compound assignment keeps its shared target node
+        c.e2 = ecopy(s.e2);
+        c.e2.a = c.e;
+        c.e2.b = uclone(s.e2.b, v, k);
+    } else { c.e2 = uclone(s.e2, v, k); }
+    fold(c.e);
+    fold(c.e2);
+    c.body = sclone(s.body, v, k);
+    c.els = sclone(s.els, v, k);
+    if s.list != null {
+        c.list = null;
+        var last: *Stmt = null;
+        var p = s.list;
+        while p != null {
+            let q = sclone(p, v, k);
+            if last == null { c.list = q; } else { last.next = q; }
+            last = q;
+            p = p.next;
+        }
+    }
+    return c;
+}
+unsafe fn gen_unrolled(s: *Stmt, Lb: i32) -> bool {
+    if s.e.kind != E_INT || s.e2.kind != E_INT || s.e.cls != 0 || s.e2.cls != 0 { return false; }
+    let lo = s.e.ival;
+    let hi = s.e2.ival;
+    if hi - lo < 1 || hi - lo > 16 { return false; }
+    unroll_bad = 0;
+    let n = scount(s.body, s.lv);
+    if unroll_bad != 0 || (n as i64) * (hi - lo) > 900 { return false; }
+    var k = lo;
+    while k < hi {
+        let b = sclone(s.body, s.lv, k);
+        let Lc = newlbl();
+        loop_push(Lb, Lc);
+        gen_stmt(b);
+        loop_sp -= 1;
+        place(Lc);
+        k += 1;
+    }
+    place(Lb);
+    return true;
+}
+
+// ---- loop vectorization (SSE2, 2 x f64 or 4 x f32) ----
+// for v in s..e { A[v + inv] (op)= <elementwise float expression of B[v + inv'], loop-invariant scalars>; ... }
+// Every array element is touched at most once per iteration at the same index, so packed execution gives exactly the
+// scalar results. A runtime check proves all indices are in bounds first; otherwise (and for the tail) the ordinary
+// scalar loop runs and traps at the right iteration.
+var vst_arr: [3]*Local;
+var vst_inv: [3]*Expr;
+var nvst: i32;
+var vw: i32;
+var vinvx: [4]*Expr;
+var nvinv: i32;
+var vlv: *Local;
+var vty: *Type;
+unsafe fn VSREG(i: i32) -> String { if i == 0 { return "rsi"; } if i == 1 { return "rdi"; } return "rdx"; }
+unsafe fn expr_eq(a: *Expr, b: *Expr) -> bool {
+    if a == null || b == null || a == b { return a == b; }
+    if a.kind == E_FLOAT && b.kind == E_FLOAT { return same(a.ty, b.ty) && strcmp(a.sval, b.sval) == 0; }
+    if a.kind != b.kind || a.op != b.op || a.ty == null || b.ty == null || !same(a.ty, b.ty) || a.nargs != 0 || b.nargs != 0 { return false; }
+    if a.kind == E_INT && (a.ival != b.ival || a.cls != b.cls) { return false; }
+    if a.kind == E_VAR && a.lv != b.lv { return false; }
+    if a.kind == E_FIELD && a.fld != b.fld { return false; }
+    let k = a.kind;
+    if k != E_INT && k != E_VAR && k != E_BIN && k != E_UN && k != E_CAST && k != E_FIELD { return false; }
+    return expr_eq(a.a, b.a) && expr_eq(a.b, b.b);
+}
+unsafe fn uses_lv(e: *Expr, v: *Local) -> bool {
+    if e == null { return false; }
+    if e.kind == E_VAR && e.lv == v { return true; }
+    if uses_lv(e.a, v) || uses_lv(e.b, v) { return true; }
+    var p = e.args;
+    while p != null { if uses_lv(p, v) { return true; } p = p.next; }
+    return false;
+}
+// loop-invariant index offset: plain integer arithmetic, cannot trap
+unsafe fn vinv_int_ok(e: *Expr) -> bool {
+    if e == null { return true; }
+    let k = e.kind;
+    if k == E_INT { return e.cls == 0; }
+    if k == E_VAR { return e.lv != null && e.lv.is_ref == 0 && e.lv.ty.kind == TY_INT; }
+    if k == E_CAST { return is_int(e.a.ty) && vinv_int_ok(e.a); }
+    if k == E_BIN {
+        let op = e.op;
+        return (op == O_ADD || op == O_SUB || op == O_MUL || op == O_AND || op == O_OR || op == O_XOR || op == O_SHL) && vinv_int_ok(e.a) && vinv_int_ok(e.b);
+    }
+    return false;
+}
+// loop-invariant float operand: scalars and arithmetic only (no loads that could trap, no calls)
+unsafe fn vinv_f_ok(e: *Expr) -> bool {
+    if e == null { return true; }
+    let k = e.kind;
+    if k == E_INT || k == E_FLOAT { return true; }
+    if k == E_VAR { return e.lv != null && (e.lv.is_ref == 0 || !is_agg(e.lv.ty)) && is_scalar(e.lv.ty); }
+    if k == E_CAST { return vinv_int_ok(e.a) || (is_float(e.a.ty) && vinv_f_ok(e.a)); }
+    if k == E_BIN { return e.op >= O_ADD && e.op <= O_DIV && vinv_f_ok(e.a) && vinv_f_ok(e.b); }
+    if k == E_UN { return e.op == O_NEG && vinv_f_ok(e.a); }
+    return false;
+}
+// x = A[v + inv]: index of its stream (added if new), -1 if not a stream access
+unsafe fn vstream_of(x: *Expr) -> i32 {
+    if x.kind != E_INDEX || x.a.kind != E_VAR || x.a.ty.kind != TY_ARRAY || !same(x.ty, vty) || x.a.ty.n > 2147483647 { return 0 - 1; }
+    let ix = x.b;
+    var inv: *Expr = null;
+    if ix.ty == null || ix.ty.size != 8 { return 0 - 1; }
+    if ix.kind == E_VAR && ix.lv == vlv { inv = null; }
+    else if ix.kind == E_BIN && ix.op == O_ADD && ix.a.kind == E_VAR && ix.a.lv == vlv && !uses_lv(ix.b, vlv) { inv = ix.b; }
+    else if ix.kind == E_BIN && ix.op == O_ADD && ix.b.kind == E_VAR && ix.b.lv == vlv && !uses_lv(ix.a, vlv) { inv = ix.a; }
+    else { return 0 - 1; }
+    if !vinv_int_ok(inv) { return 0 - 1; }
+    let arr = x.a.lv;
+    var i = 0;
+    while i < nvst { if vst_arr[i] == arr && expr_eq(vst_inv[i], inv) { return i; } i += 1; }
+    if nvst >= 3 { return 0 - 1; }
+    vst_arr[nvst] = arr;
+    vst_inv[nvst] = inv;
+    nvst += 1;
+    return nvst - 1;
+}
+// vectorizable at register level k (0-3)?
+unsafe fn vexpr_check(e: *Expr, k: i32) -> bool {
+    if k > 3 { return false; }
+    if !uses_lv(e, vlv) {
+        if !is_float(e.ty) || !vinv_f_ok(e) { return false; }
+        var i = 0;
+        while i < nvinv { if expr_eq(vinvx[i], e) { return true; } i += 1; }
+        if nvinv >= 4 { return false; }
+        vinvx[nvinv] = e;
+        nvinv += 1;
+        return true;
+    }
+    if e.kind == E_INDEX { return vstream_of(e) >= 0; }
+    if e.kind == E_BIN && e.op >= O_ADD && e.op <= O_DIV && same(e.ty, vty) { return vexpr_check(e.a, k) && vexpr_check(e.b, k + 1); }
+    return false;
+}
+unsafe fn vinv_idx(e: *Expr) -> i32 {
+    var i = 0;
+    while i < nvinv { if expr_eq(vinvx[i], e) { return i; } i += 1; }
+    return 0 - 1;
+}
+unsafe fn vsx() -> String { if vw == 2 { return "pd"; } return "ps"; }
+unsafe fn vmov() -> String { if vw == 2 { return "movupd"; } return "movups"; }
+unsafe fn vop_mn(op: i32) -> String {
+    if op == O_ADD { return "add"; } if op == O_SUB { return "sub"; } if op == O_MUL { return "mul"; } return "div";
+}
+unsafe fn gen_vexpr(e: *Expr, k: i32) {
+    var b = 0 - 1;
+    if !uses_lv(e, vlv) { b = vinv_idx(e); }
+    if b >= 0 { emit2("movaps xmm%d, xmm%d", k as i64, (7 - b) as i64); return; }
+    if e.kind == E_INDEX {
+        let si = vstream_of(e);
+        var m: [96]u8;
+        snprintf(&m[0], 96, "XMMWORD PTR [%s+%s*%d]", VSREG(si) as i64, G(vlv.reg), vty.size as i64);
+        emit3("%s xmm%d, %s", vmov() as i64, k as i64, &m[0] as i64);
+        return;
+    }
+    var L = e.a;
+    var R = e.b;
+    if (e.op == O_ADD || e.op == O_MUL) && !uses_lv(L, vlv) && uses_lv(R, vlv) { L = e.b; R = e.a; }   // invariant on the right
+    gen_vexpr(L, k);
+    var rb = 0 - 1;
+    if !uses_lv(R, vlv) { rb = vinv_idx(R); }
+    if rb >= 0 { emit4("%s%s xmm%d, xmm%d", vop_mn(e.op) as i64, vsx() as i64, k as i64, (7 - rb) as i64); }
+    else { gen_vexpr(R, k + 1); emit4("%s%s xmm%d, xmm%d", vop_mn(e.op) as i64, vsx() as i64, k as i64, (k + 1) as i64); }
+}
+var vstmts: [8]*Stmt;
+var nvstmts: i32;
+unsafe fn vcollect(b: *Stmt) -> bool {
+    if b.kind == S_BLOCK {
+        var c = b.list;
+        while c != null { if !vcollect(c) { return false; } c = c.next; }
+        return true;
+    }
+    if b.kind != S_ASSIGN || b.temps != null || nvstmts >= 8 { return false; }
+    vstmts[nvstmts] = b;
+    nvstmts += 1;
+    return true;
+}
+unsafe fn is_vcompound(val: *Expr, x: *Expr) -> bool { return val.kind == E_BIN && val.a == x && val.op >= O_ADD && val.op <= O_DIV; }
+unsafe fn gen_vector_loop(s: *Stmt, bo: *u8, Lt: i32) -> bool {
+    let v = s.lv;
+    if v.reg == 0 || v.reg >= 8 || v.ty.size != 8 || s.body == null { return false; }
+    nvstmts = 0; nvst = 0; nvinv = 0; vlv = v; vty = null;
+    if !vcollect(s.body) || nvstmts == 0 { return false; }
+    var i = 0;
+    while i < nvstmts {
+        let st = vstmts[i];
+        let x = st.e;
+        let val = st.e2;
+        if x.ty == null || !is_float(x.ty) { return false; }
+        if vty == null { vty = x.ty; } else if !same(vty, x.ty) { return false; }
+        if vstream_of(x) < 0 { return false; }
+        if is_vcompound(val, x) { if !vexpr_check(val.b, 1) { return false; } }
+        else if !vexpr_check(val, 1) { return false; }
+        i += 1;
+    }
+    // aliasing: arrays reached through references may overlap anything; distinct named arrays never do
+    var anyref = false;
+    i = 0;
+    while i < nvst { if vst_arr[i].is_ref != 0 { anyref = true; } i += 1; }
+    i = 0;
+    while i < nvst {
+        var j = 0;
+        while j < nvst {
+            if i != j && (vst_arr[i] == vst_arr[j] || anyref) { return false; }   // two index forms into one (possibly the same) array
+            j += 1;
+        }
+        i += 1;
+    }
+    vw = 16 / vty.size;
+    let Lfail = Lt;
+    // streams: base pointers and the bounds proof
+    i = 0;
+    while i < nvst {
+        let arr = vst_arr[i];
+        let n = arr.ty.n;
+        let esz = vty.size;
+        if vst_inv[i] != null { gen_expr(vst_inv[i]); } else { emit("xor eax, eax"); }
+        emit1("lea rcx, [rax+%s]", G(v.reg));   // first index
+        emit("mov r11, rax"); emit1("add r11, %s", bo as i64); emit("sub r11, 1");   // last index
+        emit1("cmp rcx, %lld", n); emit1("jae .L%d", Lfail as i64);
+        emit1("cmp r11, %lld", n); emit1("jae .L%d", Lfail as i64);
+        emit("cmp rcx, r11"); emit1("ja .L%d", Lfail as i64);
+        if i == 0 { emit("sub r11, rcx"); emit1("cmp r11, %d", (vw - 1) as i64); emit1("jl .L%d", Lfail as i64); }
+        var a: Addr;
+        let tv = new_expr(E_VAR, 0);
+        tv.lv = arr;
+        tv.ty = arr.ty;
+        let sv = lv_tmp;
+        lv_tmp = "rcx";
+        let ok = lvaddr(tv, &a, false);
+        lv_tmp = sv;
+        if !ok { printf("internal error: vector base\n", 0, 0, 0); exit(3); }
+        strip_rip(&a);
+        var m: [96]u8;
+        strcpy(&a.idx[0], "rax" as *u8);
+        a.scale = esz;
+        addr_str(&a, &m[0]);
+        emit2("lea %s, %s", VSREG(i) as i64, &m[0] as i64);
+        i += 1;
+    }
+    i = 0;
+    while i < nvinv {
+        // broadcast loop-invariant scalars into xmm7, xmm6, ...
+        gen_fexpr(vinvx[i], 0);
+        emit1("movaps xmm%d, xmm0", (7 - i) as i64);
+        if vw == 2 { emit2("unpcklpd xmm%d, xmm%d", (7 - i) as i64, (7 - i) as i64); }
+        else { emit2("shufps xmm%d, xmm%d, 0", (7 - i) as i64, (7 - i) as i64); }
+        i += 1;
+    }
+    emit1("mov r11, %s", bo as i64);
+    emit1("sub r11, %d", (vw - 1) as i64);
+    let Lv = newlbl();
+    fprintf(out, "\t.p2align 4,,10\n", 0, 0, 0);
+    place(Lv);
+    i = 0;
+    while i < nvstmts {
+        let st = vstmts[i];
+        let x = st.e;
+        let val = st.e2;
+        let si = vstream_of(x);
+        var m: [96]u8;
+        snprintf(&m[0], 96, "XMMWORD PTR [%s+%s*%d]", VSREG(si) as i64, G(v.reg), vty.size as i64);
+        if is_vcompound(val, x) {
+            gen_vexpr(val.b, 1);
+            emit2("%s xmm0, %s", vmov() as i64, &m[0] as i64);
+            emit2("%s%s xmm0, xmm1", vop_mn(val.op) as i64, vsx() as i64);
+        } else { gen_vexpr(val, 0); }
+        emit2("%s %s, xmm0", vmov() as i64, &m[0] as i64);
+        i += 1;
+    }
+    emit2("add %s, %d", G(v.reg), vw as i64);
+    emit1("cmp %s, r11", G(v.reg));
+    if v.ty.sign != 0 { emit1("jl .L%d", Lv as i64); } else { emit1("jb .L%d", Lv as i64); }
+    return true;
+}
+// for i in A..B { arr[i] = constant; } with a fixed-size array and constant in-bounds limits: a block fill
+unsafe fn gen_fill_loop(s: *Stmt) -> bool {
+    var b = s.body;
+    while b != null && b.kind == S_BLOCK && b.n == 1 { b = b.list; }
+    if b == null || b.kind != S_ASSIGN || b.temps != null || s.e.kind != E_INT || s.e2.kind != E_INT { return false; }
+    let x = b.e;
+    let v = b.e2;
+    if x.kind != E_INDEX || x.a.ty.kind != TY_ARRAY || x.b.kind != E_VAR || x.b.lv != s.lv || !lv_static(x.a) { return false; }
+    let fzero = is_float(x.ty) && ((v.kind == E_INT && v.ival == 0) || (v.kind == E_FLOAT && strchr(v.sval, '-' as i32) == null && strtod(v.sval, null) == 0.0));
+    var val: i64 = 0;
+    if fzero { val = 0; }
+    else if !(v.kind == E_INT || v.kind == E_BOOL || v.kind == E_ENUMVAL) || v.cls == 2 || !is_intlike(x.ty) { return false; }
+    else { val = v.ival; }
+    let lo = s.e.ival;
+    let hi = s.e2.ival;
+    let n = x.a.ty.n;
+    let sz = x.ty.size;
+    if lo < 0 || hi > n || hi - lo < 16 { return false; }
+    var pat: i64 = 0;
+    if sz == 1 { pat = val & 255; } else if val == 0 { pat = 0; } else if sz == 8 { pat = val; } else { return false; }
+    var a: Addr;
+    var m: [96]u8;
+    if !lvaddr(x.a, &a, false) { return false; }
+    a.disp += lo * (sz as i64);
+    addr_str(&a, &m[0]);
+    emit1("lea rdi, %s", &m[0] as i64);
+    if sz == 8 && pat != 0 { emit1("mov rax, %lld", pat); emit1("mov rcx, %lld", hi - lo); emit("rep stosq"); }
+    else {
+        if pat != 0 { emit1("mov eax, %lld", pat); } else { emit("xor eax, eax"); }
+        emit1("mov rcx, %lld", (hi - lo) * (sz as i64));
+        emit("rep stosb");
+    }
+    return true;
+}
+unsafe fn gen_for_opt(s: *Stmt, Lt: i32, Lc: i32, Lb: i32) {
+    if gen_fill_loop(s) || gen_unrolled(s, Lb) { return; }
+    let v = s.lv;
+    let bd = s.bnd;
+    let Lbody = newlbl();
+    var ib: [48]u8;
+    if v.reg != 0 && v.reg < 8 && simple_int(s.e, &ib[0]) {
+        if strcmp(&ib[0], "0" as *u8) == 0 { emit2("xor %s, %s", GREG32(v.reg) as i64, GREG32(v.reg) as i64); } else { emit2("mov %s, %s", G(v.reg), &ib[0] as i64); }
+    }
+    else { gen_expr(s.e); store_var(v); }
+    let cimm = cimm_bound(s);
+    let bvar = !cimm && for_bound_var(s);
+    if !cimm && !bvar {
+        if bd.reg != 0 && bd.reg < 8 && simple_int(s.e2, &ib[0]) { emit2("mov %s, %s", G(bd.reg), &ib[0] as i64); }
+        else { gen_expr(s.e2); store_var(bd); }
+    }
+    v.has_range = 0;
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    if cimm && irange(s.e, ref lo, ref hi) && lo <= s.e2.ival - 1 { v.has_range = 1; v.lo = lo; v.hi = s.e2.ival - 1; }
+    var bo: [48]u8;
+    if cimm { snprintf(&bo[0], 48, "%lld", s.e2.ival, 0, 0); }
+    else if bvar {
+        let b = s.e2.lv;
+        if b.reg != 0 { snprintf(&bo[0], 48, "%s", G(b.reg), 0, 0); } else { snprintf(&bo[0], 48, "QWORD PTR [rbp-%d]", b.off as i64, 0, 0); }
+    }
+    else if bd.reg != 0 { snprintf(&bo[0], 48, "%s", G(bd.reg), 0, 0); }
+    else { snprintf(&bo[0], 48, "QWORD PTR [rbp-%d]", bd.off as i64, 0, 0); }
+    gen_vector_loop(s, &bo[0], Lt);
+    emit1("jmp .L%d", Lt as i64);
+    fprintf(out, "\t.p2align 4,,10\n", 0, 0, 0);
+    place(Lbody);
+    loop_push(Lb, Lc);
+    gen_stmt(s.body);
+    loop_sp -= 1;
+    place(Lc);
+    // i < bound held before the increment, so i + 1 cannot overflow: no re-normalisation needed
+    if v.reg != 0 { emit1("add %s, 1", G(v.reg)); } else { load_var(v); emit("add rax, 1"); store_var(v); }
+    place(Lt);
+    var vo: [48]u8;
+    if v.reg != 0 { snprintf(&vo[0], 48, "%s", G(v.reg), 0, 0); } else { load_var(v); snprintf(&vo[0], 48, "rax", 0, 0, 0); }
+    emit2("cmp %s, %s", &vo[0] as i64, &bo[0] as i64);
+    if v.ty.sign != 0 { emit1("jl .L%d", Lbody as i64); } else { emit1("jb .L%d", Lbody as i64); }
+    place(Lb);
+}
+
+// ---- peephole pass over a function body (text, one instruction per line) ----
+// 0-15 for general registers, -1 otherwise
+unsafe fn reg_family(op: *u8) -> i32 {
+    let names = "rax eax ax al rbx ebx bx bl rcx ecx cx cl rdx edx dx dl rsi esi si sil rdi edi di dil rbp ebp bp bpl rsp esp sp spl r8 r8d r8w r8b r9 r9d r9w r9b r10 r10d r10w r10b r11 r11d r11w r11b r12 r12d r12w r12b r13 r13d r13w r13b r14 r14d r14w r14b r15 r15d r15w r15b";
+    let p = names as *u8;
+    var i = 0;
+    var w = 0;
+    while p[i] != 0 {
+        var j = 0;
+        while p[i + j] != 0 && p[i + j] != ' ' && op[j] == p[i + j] { j += 1; }
+        if op[j] == 0 && (p[i + j] == 0 || p[i + j] == ' ') { return w / 4; }
+        while p[i] != 0 && p[i] != ' ' { i += 1; }
+        if p[i] == ' ' { i += 1; }
+        w += 1;
+    }
+    return 0 - 1;
+}
+unsafe fn reg64_name(r: i32) -> String {
+    if r == 0 { return "rax"; } if r == 1 { return "rbx"; } if r == 2 { return "rcx"; } if r == 3 { return "rdx"; }
+    if r == 4 { return "rsi"; } if r == 5 { return "rdi"; } if r == 6 { return "rbp"; } if r == 7 { return "rsp"; }
+    if r == 8 { return "r8"; } if r == 9 { return "r9"; } if r == 10 { return "r10"; } if r == 11 { return "r11"; }
+    if r == 12 { return "r12"; } if r == 13 { return "r13"; } if r == 14 { return "r14"; } return "r15";
+}
+var chk_reg: [16]i32;
+var chk_n: [16]i64;
+unsafe fn chk_reset() { var i = 0; while i < 16 { chk_reg[i] = 0; i += 1; } }
+unsafe fn sw(a: *u8, b: String) -> bool { return strncmp(a, b as *u8, b.len() as u64) == 0; }
+unsafe fn seq2(a: *u8, b: String) -> bool { return strcmp(a, b as *u8) == 0; }
+// registers an instruction may write (by text): first operand, plus implicit ones
+unsafe fn chk_clobber(l: *u8) {
+    var mn: [16]u8;
+    var op: [24]u8;
+    // "\t<mnemonic> <operands>"
+    var i = 1;
+    var k = 0;
+    while l[i] != 0 && l[i] != ' ' && l[i] != '\t' && k < 15 { mn[k] = l[i]; k += 1; i += 1; }
+    mn[k] = 0;
+    if k == 0 { return; }
+    let M = &mn[0];
+    if seq2(M, "cmp") || seq2(M, "test") || seq2(M, "ucomisd") || seq2(M, "ucomiss") || mn[0] == 'j' || seq2(M, "push") { return; }
+    if seq2(M, "call") || sw(M, "rep") || seq2(M, "syscall") || seq2(M, "cqo") || seq2(M, "idiv") || seq2(M, "div")
+        || seq2(M, "mul") || seq2(M, "xchg") || seq2(M, "leave") || seq2(M, "cpuid") { chk_reset(); return; }
+    while l[i] == ' ' || l[i] == '\t' { i += 1; }
+    k = 0;
+    while l[i] != 0 && l[i] != ',' && l[i] != ' ' && k < 23 { op[k] = l[i]; k += 1; i += 1; }
+    op[k] = 0;
+    let O = &op[0];
+    let r = reg_family(O);
+    if r >= 0 { chk_reg[r] = 0; }
+    else if sw(O, "QWORD") || sw(O, "DWORD") || sw(O, "WORD") || sw(O, "BYTE") || sw(O, "XMMWORD") { return; }   // memory destination
+    else if !sw(O, "xmm") { chk_reset(); }   // unknown: forget everything
+}
+// "\tcmp REG, N" -> register family and N
+unsafe fn parse_cmp_imm(l: *u8, ref r: i32, ref nn: i64) -> bool {
+    if !sw(l, "\tcmp ") { return false; }
+    var rg: [8]u8;
+    var i = 5;
+    var k = 0;
+    while ((l[i] >= 'a' && l[i] <= 'z') || (l[i] >= '0' && l[i] <= '9')) && k < 7 { rg[k] = l[i]; k += 1; i += 1; }
+    rg[k] = 0;
+    if k == 0 || l[i] != ',' || l[i + 1] != ' ' { return false; }
+    i += 2;
+    var neg = false;
+    if l[i] == '-' { neg = true; i += 1; } else if l[i] == '+' { i += 1; }
+    if l[i] < '0' || l[i] > '9' { return false; }
+    var v: i64 = 0;
+    while l[i] >= '0' && l[i] <= '9' { v = v * 10 + ((l[i] - '0') as i64); i += 1; }
+    if neg { v = 0 - v; }
+    let f = reg_family(&rg[0]);
+    if f < 0 || !seq2(&rg[0], reg64_name(f)) { return false; }
+    r = f;
+    nn = v;
+    return true;
+}
+var ph_ln: [262144]*u8;
+unsafe fn peephole(buf: *u8, retl: i32, epi: *u8) {
+    var rj: [32]u8;
+    snprintf(&rj[0], 32, "\tjmp .L%d", retl as i64, 0, 0);
+    var n = 0;
+    var p = buf;
+    while p[0] != 0 {
+        var q = strchr(p, 10);
+        if q == null { q = &p[strlen(p)]; }
+        if n < 262144 { ph_ln[n] = p; n += 1; }
+        if q[0] != 0 { q[0] = 0; p = &q[1]; } else { p = q; }
+    }
+    var dead = false;
+    var i = 0;
+    while i < n {
+        let l = ph_ln[i];
+        if l[0] != 9 {
+            // label
+            dead = false;
+            chk_reset();
+            fprintf(out, "%s\n", l as i64, 0, 0);
+            i += 1;
+            continue;
+        }
+        if l[1] == '.' { fprintf(out, "%s\n", l as i64, 0, 0); i += 1; continue; }   // directive
+        if dead { i += 1; continue; }   // unreachable after an unconditional jump
+        // cmp REG, N / jae .Ltrap already established on this path: drop the repeat
+        var r = 0;
+        var nn: i64 = 0;
+        if parse_cmp_imm(l, ref r, ref nn) && i + 1 < n && seq2(ph_ln[i + 1], "\tjae .Ltrap") {
+            if chk_reg[r] != 0 && chk_n[r] <= nn { i += 2; continue; }
+            chk_reg[r] = 1;
+            chk_n[r] = nn;
+            fprintf(out, "%s\n%s\n", l as i64, ph_ln[i + 1] as i64, 0);
+            i += 2;
+            continue;
+        }
+        chk_clobber(l);
+        if seq2(l, "\tpush rax") && i + 1 < n && sw(ph_ln[i + 1], "\tpop ") {
+            // push rax / pop X -> mov X, rax
+            let dst = &ph_ln[i + 1][5];
+            if !seq2(dst, "rax") { fprintf(out, "\tmov %s, rax\n", dst as i64, 0, 0); }
+            i += 2;
+            continue;
+        }
+        if sw(l, "\tjmp .L") && i + 1 < n {
+            // jump to one of the next labels (skipping dead code)
+            let tgt = &l[5];
+            let k = strlen(tgt);
+            var j = i + 1;
+            var hit = false;
+            while j < n && ph_ln[j][0] == 9 { j += 1; }
+            while j < n && ph_ln[j][0] != 9 {
+                if strncmp(ph_ln[j] as *u8, tgt as *u8, k) == 0 && ph_ln[j][k] == ':' && ph_ln[j][k + 1] == 0 { hit = true; }
+                j += 1;
+            }
+            if hit { dead = true; i += 1; continue; }
+        }
+        if epi != null && seq2(l, &rj[0] as String) { fprintf(out, "%s", epi as i64, 0, 0); dead = true; i += 1; continue; }   // return: duplicate the short epilogue
+        fprintf(out, "%s\n", l as i64, 0, 0);
+        if sw(l, "\tjmp ") || seq2(l, "\tret") { dead = true; }
+        i += 1;
+    }
+}

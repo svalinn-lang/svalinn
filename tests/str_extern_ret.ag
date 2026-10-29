@@ -1,0 +1,5 @@
+module A;
+allow Native;
+allow Unrestricted;
+extern fn getenv(n: String) -> String;
+fn main() -> i32 { unsafe { let v = getenv("HOME"); } return 0; }

@@ -1,0 +1,1 @@
+module A; allow Console; deny Console; fn main() -> i32 { return 0; }

@@ -1,0 +1,77 @@
+// Attacker: tries to get into another process three different ways. Note how many capabilities it must
+// declare before the compiler lets it even try (Process.Debug, Process.MemoryRead, File.Read).
+module Attacker;
+allow Console;
+allow Native;
+allow Process.Debug;
+allow Process.MemoryRead;
+allow File.Read;
+
+struct Iov { base: *u8; len: u64; }
+
+extern fn ptrace(req: i64, pid: i32, addr: i64, data: i64) -> i64;
+extern fn waitpid(pid: i32, status: *i32, opts: i32) -> i32;
+extern fn process_vm_readv(pid: i32, l: *Iov, lc: u64, r: *Iov, rc: u64, flags: u64) -> i64;
+extern fn fopen(path: String, mode: String) -> *u8;
+extern fn fseek(f: *u8, off: i64, whence: i32) -> i32;
+extern fn fread(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+extern fn fclose(f: *u8) -> i32;
+extern fn sprintf(buf: *u8, fmt: String, a: i64) -> i32;
+extern fn __errno_location() -> *i32;
+
+unsafe fn parse(s: *u8) -> i64 {
+    var v: i64 = 0;
+    var i = 0;
+    while s[i] >= '0' && s[i] <= '9' {
+        v = v * 10 + (s[i] - '0') as i64;
+        i += 1;
+    }
+    return v;
+}
+
+unsafe fn main(argc: i32, argv: **u8) -> i32 {
+    if argc < 3 { println("usage: attacker <pid> <address>"); return 2; }
+    let pid = parse(argv[1]) as i32;
+    let addr = parse(argv[2]);
+
+    // 1. ptrace attach
+    let r = ptrace(16, pid, 0, 0);
+    if r == -1 {
+        let en = *__errno_location();
+        print("ptrace_attach: DENIED errno="); println(en);
+    } else {
+        var status: i32 = 0;
+        waitpid(pid, &status, 0);
+        ptrace(17, pid, 0, 0);
+        println("ptrace_attach: OK");
+    }
+
+    // 2. process_vm_readv
+    var b1: [32]u8;
+    var li: Iov;
+    var ri: Iov;
+    li.base = &b1[0];
+    li.len = 16;
+    ri.base = addr as *u8;
+    ri.len = 16;
+    let n1 = process_vm_readv(pid, &li, 1, &ri, 1, 0);
+    if n1 == 16 { print("process_vm_readv: OK "); println(&b1[0] as String); }
+    else { let en = *__errno_location(); print("process_vm_readv: DENIED errno="); println(en); }
+
+    // 3. /proc/<pid>/mem
+    var pb: [64]u8;
+    var b2: [32]u8;
+    sprintf(&pb[0], "/proc/%lld/mem", pid as i64);
+    let f = fopen(&pb[0] as String, "rb");
+    if f == null {
+        let en = *__errno_location();
+        print("proc_mem: DENIED errno="); println(en);
+    } else {
+        fseek(f, addr, 0);
+        let n2 = fread(&b2[0], 1, 16, f);
+        fclose(f);
+        if n2 == 16 { print("proc_mem: OK "); println(&b2[0] as String); }
+        else { println("proc_mem: DENIED (read failed)"); }
+    }
+    return 0;
+}

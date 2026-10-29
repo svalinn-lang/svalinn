@@ -1,0 +1,3 @@
+tests/cls_let_field.ag:1:83: error: cannot assign to immutable value; declare it with 'var'
+    1 | module A; class P { public: let id: i32; ctor(i: i32) { this.id = i; } fn set() { this.id = 5; } } fn main() -> i32 { return 0; }
+      |                                                                                   ^

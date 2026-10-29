@@ -1,0 +1,80 @@
+module D;
+allow Console;
+
+class Res {
+    private:
+        var id: i32;
+    public:
+        ctor(id: i32) { this.id = id; print("open "); println(this.id); }
+        dtor { print("close "); println(this.id); }
+        fn get() -> i32 { return this.id; }
+}
+
+class Pair {
+    public:
+        var a: Res;
+        var b: Res;
+        ctor(x: i32, y: i32) { this.a = Res(x); this.b = Res(y); }
+        dtor { println("pair dtor"); }
+}
+
+fn make(id: i32) -> Res { return Res(id); }
+fn take(r: Res) { print("took "); println(r.get()); }
+fn passthrough(r: Res) -> Res { return r; }
+
+fn maybe(ok: bool) -> Result<Res, i32> {
+    if ok { return Ok(Res(50)); }
+    return Err(7);
+}
+fn chain(ok: bool) -> Result<i32, i32> {
+    let r = maybe(ok)?;
+    return Ok(r.get() + 1);
+}
+
+fn early(n: i32) -> i32 {
+    let a = Res(60);
+    if n > 0 {
+        let b = Res(61);
+        return n;
+    }
+    let c = Res(62);
+    return 0;
+}
+
+fn main() -> i32 {
+    println("-- scope");
+    {
+        let a = Res(1);
+        let b = Res(2);
+    }
+    println("-- temp");
+    println(make(3).get());
+    println("-- move into fn");
+    let m = Res(4);
+    take(m);
+    println("-- passthrough");
+    let p = passthrough(Res(5));
+    println(p.get());
+    println("-- reassign");
+    var v = Res(6);
+    v = Res(7);
+    println("-- loop");
+    for i in 0..3 {
+        let x = Res(10 + i);
+        if i == 1 { continue; }
+    }
+    println("-- result");
+    match maybe(true) { Ok(r) => { println(r.get()); } Err(e) => { println(e); } }
+    match maybe(true) { Ok(_) => { println("ignored"); } Err(e) => { println(e); } }
+    match chain(true) { Ok(x) => { println(x); } Err(e) => { println(e); } }
+    match chain(false) { Ok(x) => { println(x); } Err(e) => { println(e); } }
+    println("-- early return");
+    println(early(1));
+    println(early(0));
+    println("-- fields");
+    {
+        let pr = Pair(20, 21);
+    }
+    println("-- end");
+    return 0;
+}

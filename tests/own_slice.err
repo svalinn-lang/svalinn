@@ -1,0 +1,3 @@
+tests/own_slice.ag:1:117: error: argument: expected 'B', found 'D'
+    1 | module A; class B { public: var v: i32; dtor { } } class D : B { } fn f(b: B) { } fn main() -> i32 { let d = D(); f(d); return 0; }
+      |                                                                                                                     ^

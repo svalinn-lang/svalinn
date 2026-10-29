@@ -1,0 +1,27 @@
+module Edge.Sub;
+allow Console;
+allow Network.Http;
+deny Process.Inject;
+protect Process;
+enum Dir { N, S, E, W, }
+struct V { x: i32; y: i32, z: [4]*u8; p: **V }
+let K: usize = 0xFF;
+var g: i32;
+fn f(a: i32, ref b: [3]i32, c: *V) -> isize {
+    let n = - -5 + -'a' - -x * !y + ~z;
+    var q = a + b * c - d / e % f << 2 >> 1 & 3 | 4 ^ 5;
+    let w = a == b != c < d <= e > f >= g && h || i && j;
+    x <<= 2; y >>= 1; z += 1; z -= 2; z *= 3; z /= 4; z %= 5; z &= 6; z |= 7; z ^= 8;
+    let t = sizeof(V) as u64 as i32 + sizeof([2]i64) as i64;
+    let u = *p.next.val + &arr[i + 1].f[j];
+    foo(ref a, bar(1, 2)[3].x, "s\n\x01\"", 'a', '\\', true, false, null);
+    if a { } else if b { x = 1; } else { }
+    while !done { for i in 0..n { continue; } for e in arr { break; } }
+    match d { Dir.N => go(), Dir.S => { stop(); } _ => {} }
+    unsafe { *p = 1; }
+    { let inner = 1; }
+    return;
+}
+extern fn putchar(c: i32) -> i32;
+safe fn s() {}
+unsafe fn u(p: *i32) -> i32 { return *p; }

@@ -1,0 +1,1 @@
+module A; interface S { fn area() -> i64; } class R { public: fn area() -> i64 { return 1; } } fn show(s: S) { } fn main() -> i32 { let r = R(); show(r); return 0; }

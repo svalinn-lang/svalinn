@@ -1,0 +1,10 @@
+before aegis: index out of bounds
+exit 101
+before aegis: integer division by zero (or overflow)
+exit 101
+before aegis: stack overflow (or invalid memory access)
+exit 101
+before aegis: index out of bounds
+exit 101
+before aegis: panic: gave up
+exit 101

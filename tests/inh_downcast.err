@@ -1,0 +1,3 @@
+tests/inh_downcast.ag:1:128: error: argument: expected 'D', found 'B'
+    1 | module A; class B { public: var x: i32; } class D : B { public: var y: i32; } fn f(d: D) { } fn main() -> i32 { let b = B(); f(b); return 0; }
+      |                                                                                                                                ^

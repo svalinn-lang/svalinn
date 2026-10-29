@@ -1,0 +1,159 @@
+// std.fs - files.
+//   reading:  File.open, File.read_to_string, File.exists              need `allow File.Read;`
+//   writing:  File.create, File.append, File.write_string, File.remove  need `allow File.Write;`
+// A File closes itself when it goes out of scope (it is moved, never copied).
+module std.fs;
+
+import std.error;
+
+extern fn fopen(path: String, mode: String) -> *u8;
+extern fn fread(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+extern fn fwrite(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+extern fn fclose(f: *u8) -> i32;
+extern fn fflush(f: *u8) -> i32;
+extern fn fgetc(f: *u8) -> i32;
+extern fn ferror(f: *u8) -> i32;
+extern fn remove(path: String) -> i32;
+extern fn malloc(n: u64) -> *u8;
+extern fn realloc(p: *u8, n: u64) -> *u8;
+extern fn free(p: *u8);
+
+class File {
+    private:
+        var fp: *u8;
+
+        static fn open_mode(path: String, mode: String) -> Result<File, IOError> {
+            if path.len() == 0 { return Err(IOError.NotFound); }
+            var f = File();
+            unsafe {
+                f.fp = fopen(path, mode);
+                if f.fp == null { return Err(last_io_error()); }
+            }
+            return Ok(f);
+        }
+
+    public:
+        ctor() { }
+        dtor { this.close(); }
+
+        // an existing file, for reading
+        static fn open(path: String) -> Result<File, IOError> requires File.Read { return File.open_mode(path, "rb"); }
+        // a new, empty file (an existing one is truncated), for writing
+        static fn create(path: String) -> Result<File, IOError> requires File.Write { return File.open_mode(path, "wb"); }
+        // a file for writing at its end (created if missing)
+        static fn append(path: String) -> Result<File, IOError> requires File.Write { return File.open_mode(path, "ab"); }
+
+        fn is_open() -> bool { unsafe { return this.fp != null; } }
+
+        fn close() {
+            unsafe {
+                if this.fp != null { fclose(this.fp); }
+                this.fp = null;
+            }
+        }
+
+        // everything from the current position to the end
+        fn read_all() -> Result<String, IOError> {
+            unsafe {
+                if this.fp == null { return Err(IOError.Closed); }
+                var cap: i64 = 4096;
+                var n: i64 = 0;
+                var buf = malloc(cap as u64);
+                while true {
+                    if n == cap {
+                        cap = cap * 2;
+                        buf = realloc(buf, cap as u64);
+                    }
+                    let got = fread(buf + n, 1, (cap - n) as u64, this.fp) as i64;
+                    n += got;
+                    if got == 0 { break; }
+                }
+                if ferror(this.fp) != 0 { free(buf); return Err(IOError.Other); }
+                let s = rt_str_from_buf(buf, n);
+                free(buf);
+                return Ok(s);
+            }
+        }
+
+        // the next line without its line break; Err(EndOfFile) when nothing is left
+        fn read_line() -> Result<String, IOError> {
+            unsafe {
+                if this.fp == null { return Err(IOError.Closed); }
+                var cap: i64 = 128;
+                var n: i64 = 0;
+                var buf = malloc(cap as u64);
+                var c = fgetc(this.fp);
+                if c < 0 { free(buf); return Err(IOError.EndOfFile); }
+                while c >= 0 && c != 10 {
+                    if n == cap {
+                        cap = cap * 2;
+                        buf = realloc(buf, cap as u64);
+                    }
+                    *(buf + n) = c as u8;
+                    n += 1;
+                    c = fgetc(this.fp);
+                }
+                if n > 0 && *(buf + n - 1) == 13 { n -= 1; }   // Windows line ending
+                let s = rt_str_from_buf(buf, n);
+                free(buf);
+                return Ok(s);
+            }
+        }
+
+        fn write(s: String) -> Result<void, IOError> {
+            unsafe {
+                if this.fp == null { return Err(IOError.Closed); }
+                let n = s.len();
+                if n > 0 && fwrite(s as *u8, 1, n as u64, this.fp) != n as u64 { return Err(last_io_error()); }
+            }
+            return Ok();
+        }
+
+        fn write_line(s: String) -> Result<void, IOError> {
+            let r = this.write(s);
+            match r { Ok() => { } Err(e) => { return Err(e); } }
+            return this.write("\n");
+        }
+
+        // pushes buffered writes to the operating system
+        fn flush() -> Result<void, IOError> {
+            unsafe {
+                if this.fp == null { return Err(IOError.Closed); }
+                if fflush(this.fp) != 0 { return Err(last_io_error()); }
+            }
+            return Ok();
+        }
+
+        // the whole file as a String
+        static fn read_to_string(path: String) -> Result<String, IOError> requires File.Read {
+            let r = File.open_mode(path, "rb");
+            match r {
+                Ok(f) => { return f.read_all(); }
+                Err(e) => { return Err(e); }
+            }
+        }
+
+        // replaces the file's contents with s (creates the file if needed)
+        static fn write_string(path: String, s: String) -> Result<void, IOError> requires File.Write {
+            let r = File.open_mode(path, "wb");
+            match r {
+                Ok(f) => {
+                    let w = f.write(s);
+                    match w { Ok() => { } Err(e) => { return Err(e); } }
+                    return f.flush();
+                }
+                Err(e) => { return Err(e); }
+            }
+        }
+
+        static fn exists(path: String) -> bool requires File.Read {
+            let r = File.open_mode(path, "rb");
+            match r { Ok(f) => { return true; } Err(e) => { return false; } }
+        }
+
+        static fn remove(path: String) -> Result<void, IOError> requires File.Write {
+            if path.len() == 0 { return Err(IOError.NotFound); }
+            unsafe { if remove(path) != 0 { return Err(last_io_error()); } }
+            return Ok();
+        }
+}

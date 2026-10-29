@@ -1,0 +1,5 @@
+module T;
+allow Console;
+fn f() -> i32 { return 3; }
+const N = f();
+fn main() -> i32 { println(N); return 0; }

@@ -1,0 +1,34 @@
+// `aegisc --test`: every @test function runs in its own process; a panic or runtime error fails only that test
+module Calc;
+allow Console;
+
+fn add(a: i32, b: i32) -> i32 { return a + b; }
+@deprecated
+fn old_add(a: i32, b: i32) -> i32 { return add(a, b); }
+
+fn expect(ok: bool, what: String) { if !ok { panic("expectation failed: " + what); } }
+
+@test
+fn adds() { expect(add(2, 3) == 5, "2 + 3 == 5"); }
+
+@test
+fn strings() {
+    let s = "ab" + 1;
+    expect(s == "ab1", "concat");
+    expect(s.len() == 3, "len");
+}
+
+@test
+fn fails() { expect(add(1, 1) == 3, "1 + 1 == 3"); }
+
+@test
+fn crashes() {
+    var a: [2]i32;
+    let i = add(1, 1);
+    println(a[i]);
+}
+
+@test @deprecated
+fn uses_old() { expect(old_add(1, 2) == 3, "old_add"); }
+
+fn main() -> i32 { println(add(20, 22)); return 0; }

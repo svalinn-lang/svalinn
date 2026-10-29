@@ -1,0 +1,17 @@
+# build outputs (make clean removes them)
+/aegisc
+/selfhost/lexer
+/selfhost/parser
+/selfhost/semac
+/selfhost/aegisc1
+/selfhost/aegisc2
+/selfhost/aegisc1o
+/selfhost/aegisc2o
+/examples/*
+!/examples/*.ag
+*.s
+!/lib/rt/*.s
+*.o
+a.out
+*.bin
+__pycache__/

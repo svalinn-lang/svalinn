@@ -1,0 +1,3 @@
+tests/cap_requires2.ag:4:26: error: calling 'read_line' requires capability 'Console.Read' (add 'allow Console.Read;' to the module)
+    4 | fn main() -> i32 { match read_line() { Ok(s) => { } Err(e) => { } } return 0; }
+      |                          ^

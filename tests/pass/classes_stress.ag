@@ -1,0 +1,111 @@
+module Stress;
+allow Console;
+allow Native;
+
+struct Pair { a: i32; b: i64; }
+
+enum Err { Bad, Worse }
+
+class Inventory {
+    private:
+        var items: [4]i32;
+        var count: i32 = 0;
+        var origin: Pair;
+    public:
+        fn add(v: i32) -> Result<i32, Err> {
+            if this.count >= 4 { return Err(Err.Bad); }
+            this.items[this.count] = v;
+            this.count += 1;
+            return Ok(this.count);
+        }
+        fn total() -> i32 {
+            var s = 0;
+            for i in 0..this.count { s += this.items[i]; }
+            return s;
+        }
+        fn setOrigin(p: Pair) { this.origin = p; }
+        fn getOrigin() -> Pair { return this.origin; }
+        fn fill() -> Result<void, Err> {
+            this.add(1)?;
+            this.add(2)?;
+            this.add(3)?;
+            this.add(4)?;
+            this.add(5)?;
+            return Ok();
+        }
+}
+
+class Wrapper {
+    public:
+        var inv: Inventory;
+        var tag: i32 = 7;
+        fn size() -> i32 { return this.inv.total(); }
+}
+
+fn pairResult(ok: bool) -> Result<Pair, String> {
+    var p: Pair;
+    p.a = 5;
+    p.b = 9000000000;
+    if ok { return Ok(p); }
+    return Err("nope");
+}
+
+fn nested(n: i32) -> Result<Result<i32, String>, String> {
+    if n < 0 { return Err("outer"); }
+    if n == 0 { return Ok(Err("inner")); }
+    return Ok(Ok(n));
+}
+
+fn useNested(n: i32) -> Result<i32, String> {
+    let inner = nested(n)?;
+    let v = inner?;
+    return Ok(v * 3);
+}
+
+fn strOk(b: bool) -> Result<String, i32> {
+    if b { return Ok("hello"); }
+    return Err(404);
+}
+
+fn byval(w: Wrapper) -> i32 { return w.tag + w.size(); }
+
+unsafe fn viaPtr(p: *Inventory) -> i32 {
+    return p.total();
+}
+
+fn main() -> i32 {
+    var inv = Inventory();
+    inv.add(10);
+    inv.add(20);
+    println(inv.total());
+    let f = inv.fill();
+    match f {
+        Ok() => { println("filled"); }
+        Err(e) => { match e { Err.Bad => { println("bad"); } Err.Worse => { println("worse"); } } }
+    }
+    println(inv.total());
+
+    var q: Pair;
+    q.a = 3; q.b = 4;
+    inv.setOrigin(q);
+    println(inv.getOrigin().b);
+
+    var w = Wrapper();
+    w.inv.add(5);
+    w.inv.add(6);
+    println(w.size());
+    println(byval(w));
+
+    match pairResult(true) { Ok(p) => { println(p.b); } Err(e) => { println(e); } }
+    match pairResult(false) { Ok(p) => { println(p.b); } Err(e) => { println(e); } }
+
+    match useNested(4) { Ok(v) => { println(v); } Err(e) => { println(e); } }
+    match useNested(0) { Ok(v) => { println(v); } Err(e) => { println(e); } }
+    match useNested(0 - 1) { Ok(v) => { println(v); } Err(e) => { println(e); } }
+
+    match strOk(true) { Ok(s) => { println(s); } Err(c) => { println(c); } }
+    match strOk(false) { Ok(s) => { println(s); } Err(c) => { println(c); } }
+
+    unsafe { println(viaPtr(&inv)); }
+    return 0;
+}

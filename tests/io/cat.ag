@@ -1,0 +1,18 @@
+// command-line arguments and standard input: run by tests/io/run.sh
+module Cat;
+allow Console;
+import std.console;
+
+fn main(args: Vec<String>) {
+    for i in 1..args.len() { println("arg " + i + ": [" + args.item(i) + "]"); }
+    print("name? ");
+    match read_line() { Ok(name) => { println("hi " + name); } Err(e) => { println("no name"); } }
+    var n = 0;
+    while true {
+        match read_line() {
+            Ok(line) => { n += 1; println(str(n) + " " + line.trim().to_upper()); }
+            Err(e) => { break; }
+        }
+    }
+    eprintln("done after " + n + " lines");
+}

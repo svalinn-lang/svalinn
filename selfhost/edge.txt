@@ -1,0 +1,6 @@
+/* multi
+line */ let x = 0xFF_ff + 0b1010_1 + 1_000;  // trailing
+var c = '\n'; let d = '\x41'; let e = '\\'; let q = '\'';
+let s = "a\tb\"c\x41";
+x <<= 2; y >>= 3; a..b; f => g; h -> i; a != b; a <= b; a && b || c; z ^= 1; w %= 2;
+@test fn f() {}

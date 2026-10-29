@@ -1,0 +1,27 @@
+module Sieve;
+allow Console;
+
+var flags: [20000001]bool;
+
+fn main() -> i32 {
+    let n: i64 = 20000000;
+    var count: i64 = 0;
+    for rep in 0..5 {
+        for i in 0..n + 1 { flags[i] = true; }
+        count = 0;
+        var i: i64 = 2;
+        while i <= n {
+            if flags[i] {
+                count += 1;
+                var j = i * i;
+                while j <= n {
+                    flags[j] = false;
+                    j += i;
+                }
+            }
+            i += 1;
+        }
+    }
+    println(count);
+    return 0;
+}

@@ -1,0 +1,1 @@
+module A; fn main() -> i32 { match 1.5 { _ => { } } return 0; }

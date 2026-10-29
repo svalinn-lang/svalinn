@@ -1,0 +1,311 @@
+// Aegis type system for the self-hosted compiler: a port of the Type machinery in aegisc.c.
+module Types;
+
+import std.sys;
+import std.mem;
+import err;
+
+let TY_VOID: i32 = 0;
+let TY_BOOL: i32 = 1;
+let TY_INT: i32 = 2;
+let TY_STR: i32 = 3;
+let TY_PTR: i32 = 4;
+let TY_STRUCT: i32 = 5;
+let TY_ARRAY: i32 = 6;
+let TY_ENUM: i32 = 7;
+let TY_ILIT: i32 = 8;
+let TY_NULL: i32 = 9;
+let TY_RESULT: i32 = 10;
+let TY_RESPEND: i32 = 11;
+let TY_PARAM: i32 = 12;
+let TY_IFACE: i32 = 13;
+let TY_FLOAT: i32 = 14;
+let TY_FLIT: i32 = 15;
+let TY_TASK: i32 = 16;
+let IFACE_MSG: String = "interface type '%s' can only be used as a function parameter (it borrows the object)";
+
+struct Type {
+    kind: i32; size: i32; align: i32; sign: i32; is_char: i32;
+    n: i64;
+    elem: *Type; sd: *StructDef; ed: *EnumDef; err: *Type; ifc: *Iface;
+}
+struct FieldDef { name: *u8; ty: *Type; off: i32; is_mut: i32; vis: i32; init: *Expr; owner: *StructDef; }
+struct Generic { name: *u8; kind: i32; np: i32; start: i32; is_unsafe: i32; is_async: i32; line: i32; pn: [8]*u8; pc: [8]*u8; }
+struct StructDef { name: *u8; f: [64]FieldDef; nf: i32; done: i32; is_class: i32; ty: *Type; gen: *Generic; targs: [8]*Type; base: *StructDef; ifs: [16]*Iface; nifs: i32; line: i32; dtor: *Func; }
+// interface: methods are abstract Funcs; values are {object*, vtable*}
+struct Iface { name: *u8; ty: *Type; m: [64]*Func; nm: i32; }
+
+var ifaces: [64]*Iface;
+var nifaces: i32;
+struct EnumDef { name: *u8; vn: [128]*u8; nv: i32; ty: *Type; }
+
+var structs: [256]*StructDef;
+var nstructs: i32;
+var enums: [256]*EnumDef;
+var nenums: i32;
+
+var ty_void: *Type;
+var ty_bool: *Type;
+var ty_str: *Type;
+var ty_ilit: *Type;
+var ty_null: *Type;
+var ty_char: *Type;
+var ty_i8: *Type;
+var ty_i16: *Type;
+var ty_i32: *Type;
+var ty_i64: *Type;
+var ty_u8: *Type;
+var ty_u16: *Type;
+var ty_u32: *Type;
+var ty_u64: *Type;
+var ty_f32: *Type;
+var ty_f64: *Type;
+var ty_flit: *Type;
+
+unsafe fn mk_basic(kind: i32, size: i32, align: i32, sign: i32) -> *Type {
+    let t = zalloc(sizeof(Type)) as *Type;
+    t.kind = kind;
+    t.size = size;
+    t.align = align;
+    t.sign = sign;
+    return t;
+}
+
+unsafe fn types_init() {
+    ty_void = mk_basic(TY_VOID, 0, 1, 0);
+    ty_bool = mk_basic(TY_BOOL, 1, 1, 0);
+    ty_str = mk_basic(TY_STR, 8, 8, 0);
+    ty_ilit = mk_basic(TY_ILIT, 8, 8, 1);
+    ty_null = mk_basic(TY_NULL, 8, 8, 0);
+    ty_i8 = mk_basic(TY_INT, 1, 1, 1);
+    ty_i16 = mk_basic(TY_INT, 2, 2, 1);
+    ty_i32 = mk_basic(TY_INT, 4, 4, 1);
+    ty_i64 = mk_basic(TY_INT, 8, 8, 1);
+    ty_u8 = mk_basic(TY_INT, 1, 1, 0);
+    ty_u16 = mk_basic(TY_INT, 2, 2, 0);
+    ty_u32 = mk_basic(TY_INT, 4, 4, 0);
+    ty_u64 = mk_basic(TY_INT, 8, 8, 0);
+    ty_char = mk_basic(TY_INT, 1, 1, 0);
+    ty_char.is_char = 1;
+    ty_f32 = mk_basic(TY_FLOAT, 4, 4, 0);
+    ty_f64 = mk_basic(TY_FLOAT, 8, 8, 0);
+    ty_flit = mk_basic(TY_FLIT, 8, 8, 0);
+}
+
+unsafe fn mk_ptr(e: *Type) -> *Type {
+    let t = zalloc(sizeof(Type)) as *Type;
+    t.kind = TY_PTR;
+    t.size = 8;
+    t.align = 8;
+    t.elem = e;
+    return t;
+}
+
+unsafe fn mk_arr(e: *Type, n: i64) -> *Type {
+    let t = zalloc(sizeof(Type)) as *Type;
+    t.kind = TY_ARRAY;
+    t.elem = e;
+    t.n = n;
+    t.size = (e.size as i64 * n) as i32;
+    t.align = e.align;
+    return t;
+}
+
+unsafe fn is_int(t: *Type) -> bool { return t.kind == TY_INT; }
+unsafe fn is_float(t: *Type) -> bool { return t.kind == TY_FLOAT; }
+unsafe fn mk_result(t: *Type, e: *Type) -> *Type {
+    let r = zalloc(sizeof(Type)) as *Type;
+    var pl = t.size;
+    if e.size > pl { pl = e.size; }
+    r.kind = TY_RESULT;
+    r.elem = t;
+    r.err = e;
+    r.align = 8;
+    r.size = 8 + (pl + 7) / 8 * 8;
+    return r;
+}
+unsafe fn is_agg(t: *Type) -> bool { return t.kind == TY_STRUCT || t.kind == TY_ARRAY || t.kind == TY_RESULT || t.kind == TY_IFACE || t.kind == TY_TASK; }
+// handle of a running async call
+unsafe fn mk_task(e: *Type) -> *Type {
+    let t = zalloc(sizeof(Type)) as *Type;
+    t.kind = TY_TASK;
+    t.elem = e;
+    t.size = 8;
+    t.align = 8;
+    return t;
+}
+unsafe fn has_iface(t: *Type) -> bool {
+    if t.kind == TY_IFACE { return true; }
+    if t.kind == TY_PTR || t.kind == TY_ARRAY { return has_iface(t.elem); }
+    if t.kind == TY_RESULT { return has_iface(t.elem) || has_iface(t.err); }
+    return false;
+}
+unsafe fn find_iface(n: *u8) -> *Iface {
+    var i = 0;
+    while i < nifaces {
+        if strcmp(ifaces[i].name, n) == 0 { return ifaces[i]; }
+        i += 1;
+    }
+    return null;
+}
+// a is b or derives from b
+unsafe fn is_sub(a: *StructDef, b: *StructDef) -> bool {
+    var c = a;
+    while c != null {
+        if c == b { return true; }
+        c = c.base;
+    }
+    return false;
+}
+// values of this type own something and must be destroyed
+// moved, never copied: destructors and tasks (strings are copied by counting references)
+unsafe fn move_only(t: *Type) -> bool {
+    if t.kind == TY_TASK { return true; }
+    if t.kind == TY_ARRAY { return move_only(t.elem); }
+    if t.kind == TY_RESULT { return move_only(t.elem) || move_only(t.err); }
+    if t.kind == TY_STRUCT {
+        var c = t.sd;
+        while c != null {
+            if c.dtor != null { return true; }
+            c = c.base;
+        }
+        var i = 0;
+        while i < t.sd.nf {
+            if move_only(t.sd.f[i].ty) { return true; }
+            i += 1;
+        }
+    }
+    return false;
+}
+unsafe fn has_drop(t: *Type) -> bool {
+    if t.kind == TY_TASK || t.kind == TY_STR { return true; }   // dropping a task waits for it; strings are reference counted
+    if t.kind == TY_ARRAY { return has_drop(t.elem); }
+    if t.kind == TY_RESULT { return has_drop(t.elem) || has_drop(t.err); }
+    if t.kind == TY_STRUCT {
+        var c = t.sd;
+        while c != null {
+            if c.dtor != null { return true; }
+            c = c.base;
+        }
+        var i = 0;
+        while i < t.sd.nf {
+            if has_drop(t.sd.f[i].ty) { return true; }
+            i += 1;
+        }
+    }
+    return false;
+}
+unsafe fn implements(sd: *StructDef, ifc: *Iface) -> bool {
+    var c = sd;
+    while c != null {
+        var i = 0;
+        while i < c.nifs {
+            if c.ifs[i] == ifc { return true; }
+            i += 1;
+        }
+        c = c.base;
+    }
+    return false;
+}
+unsafe fn has_ptr(t: *Type) -> bool {
+    if t.kind == TY_PTR { return true; }
+    if t.kind == TY_RESULT { return has_ptr(t.elem) || has_ptr(t.err); }
+    return t.kind == TY_ARRAY && has_ptr(t.elem);
+}
+
+unsafe fn same(a: *Type, b: *Type) -> bool {
+    if a == b { return true; }
+    if a.kind != b.kind { return false; }
+    let k = a.kind;
+    if k == TY_INT { return a.size == b.size && a.sign == b.sign; }
+    if k == TY_FLOAT { return a.size == b.size; }
+    if k == TY_PTR { return same(a.elem, b.elem); }
+    if k == TY_ARRAY { return a.n == b.n && same(a.elem, b.elem); }
+    if k == TY_STRUCT { return a.sd == b.sd; }
+    if k == TY_ENUM { return a.ed == b.ed; }
+    if k == TY_RESULT { return same(a.elem, b.elem) && same(a.err, b.err); }
+    if k == TY_IFACE { return a.ifc == b.ifc; }
+    if k == TY_TASK { return same(a.elem, b.elem); }
+    return true;
+}
+
+unsafe fn sb_int(ref b: StrBuf, v: i64) {
+    var tmp: [24]u8;
+    snprintf(&tmp[0], 24, "%lld", v, 0, 0);
+    sb_cat_c(ref b, &tmp[0]);
+}
+
+unsafe fn tname_into(ref b: StrBuf, t: *Type) {
+    let k = t.kind;
+    if k == TY_VOID { sb_cat(ref b, "void"); }
+    else if k == TY_BOOL { sb_cat(ref b, "bool"); }
+    else if k == TY_STR { sb_cat(ref b, "String"); }
+    else if k == TY_ILIT { sb_cat(ref b, "integer literal"); }
+    else if k == TY_FLOAT { sb_cat(ref b, "f"); sb_int(ref b, (t.size * 8) as i64); }
+    else if k == TY_FLIT { sb_cat(ref b, "float literal"); }
+    else if k == TY_NULL { sb_cat(ref b, "null"); }
+    else if k == TY_INT {
+        if t.is_char != 0 { sb_cat(ref b, "char"); }
+        else {
+            if t.sign != 0 { sb_cat(ref b, "i"); } else { sb_cat(ref b, "u"); }
+            sb_int(ref b, (t.size * 8) as i64);
+        }
+    }
+    else if k == TY_PTR { sb_cat(ref b, "*"); tname_into(ref b, t.elem); }
+    else if k == TY_ARRAY {
+        sb_cat(ref b, "[");
+        sb_int(ref b, t.n);
+        sb_cat(ref b, "]");
+        tname_into(ref b, t.elem);
+    }
+    else if k == TY_STRUCT { sb_cat_c(ref b, t.sd.name); }
+    else if k == TY_ENUM { sb_cat_c(ref b, t.ed.name); }
+    else if k == TY_RESULT {
+        sb_cat(ref b, "Result<");
+        tname_into(ref b, t.elem);
+        sb_cat(ref b, ", ");
+        tname_into(ref b, t.err);
+        sb_cat(ref b, ">");
+    }
+    else if k == TY_PARAM { sb_cat(ref b, "type parameter"); }
+    else if k == TY_IFACE { sb_cat_c(ref b, t.ifc.name); }
+    else if k == TY_TASK { sb_cat(ref b, "Task<"); tname_into(ref b, t.elem); sb_cat(ref b, ">"); }
+    else if k == TY_RESPEND {
+        if t.n != 0 { sb_cat(ref b, "Err("); } else { sb_cat(ref b, "Ok("); }
+        tname_into(ref b, t.elem);
+        sb_cat(ref b, ")");
+    }
+}
+
+// type name as a NUL-terminated string, exactly as the C compiler prints it
+unsafe fn tname(t: *Type) -> *u8 {
+    var b: StrBuf;
+    sb_init(ref b);
+    tname_into(ref b, t);
+    return b.data;
+}
+
+unsafe fn find_struct(n: *u8) -> *StructDef {
+    var i = 0;
+    while i < nstructs {
+        if strcmp(structs[i].name, n) == 0 { return structs[i]; }
+        i += 1;
+    }
+    return null;
+}
+
+unsafe fn find_enum(n: *u8) -> *EnumDef {
+    var i = 0;
+    while i < nenums {
+        if strcmp(enums[i].name, n) == 0 { return enums[i]; }
+        i += 1;
+    }
+    return null;
+}
+
+unsafe fn need_complete(t: *Type, line: i32) {
+    if t.kind == TY_STRUCT && t.sd.done == 0 { dief(line, "struct '%s' is incomplete here", t.sd.name as i64, 0, 0); }
+    if t.kind == TY_ARRAY { need_complete(t.elem, line); }
+    if t.kind == TY_RESULT { need_complete(t.elem, line); need_complete(t.err, line); }
+    if t.kind == TY_TASK { need_complete(t.elem, line); }
+}

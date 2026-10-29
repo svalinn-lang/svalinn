@@ -1,0 +1,2 @@
+module A;
+fn main() -> i32 { var s = "ab"; s[0] = 65; return 0; }

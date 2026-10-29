@@ -1,0 +1,24 @@
+// Victim for the runtime protection test. The `//PROTECT` marker is replaced by `protect Process;`
+// in the protected variant, so the two programs differ in exactly one line.
+module Victim;
+allow Console;
+allow Native;
+//PROTECT
+
+extern fn getpid() -> i32;
+extern fn sleep(s: u32) -> u32;
+extern fn fflush(f: *u8) -> i32;
+
+let secret = "TOP-SECRET-42";
+
+fn main() -> i32 {
+    unsafe {
+        print("READY ");
+        print(getpid());
+        print(" ");
+        println(secret as u64);
+        fflush(null);
+        sleep(4);
+    }
+    return 0;
+}

@@ -1,0 +1,3 @@
+tests/main_args_bad.ag:3:4: error: main must be 'fn main() -> i32', 'fn main(args: Vec<String>) -> i32' or 'unsafe fn main(argc: i32, argv: **u8) -> i32'
+    3 | fn main(args: Vec<i64>) -> i32 { return 0; }
+      |    ^

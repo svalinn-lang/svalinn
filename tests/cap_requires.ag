@@ -1,0 +1,4 @@
+module A;
+allow Console;
+import std.fs;
+fn main() -> i32 { match File.read_to_string("x.txt") { Ok(s) => { println(s); } Err(e) => { } } return 0; }

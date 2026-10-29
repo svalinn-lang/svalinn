@@ -1,0 +1,3 @@
+tests/gen_fn_as_type.ag:1:71: error: 'id' is a generic function, not a type
+    1 | module A; fn id<T>(a: T) -> T { return a; } fn main() -> i32 { let x: id<i32>; return 0; }
+      |                                                                       ^

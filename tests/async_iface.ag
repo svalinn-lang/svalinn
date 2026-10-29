@@ -1,0 +1,1 @@
+module A; interface S { fn a() -> i32; } async fn f(s: S) { } fn main() -> i32 { return 0; }

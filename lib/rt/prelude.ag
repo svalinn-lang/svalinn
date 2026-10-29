@@ -1,0 +1,279 @@
+// The Aegis runtime prelude: part of every program. Code in this file is trusted by the compiler: it may call
+// extern functions without the program's capabilities, `*u8 as String` is a raw reinterpretation here (elsewhere
+// it copies), and String parameters of these functions are borrowed (the caller keeps ownership).
+//
+// String layout: a String is a pointer to NUL-terminated UTF-8 bytes, or null (the empty string). Unless null,
+// a 16-byte header precedes the bytes: [-16] reference count (-1 = immortal literal), [-8] length in bytes.
+// Copying a String increments the count, dropping decrements it and frees the memory at zero.
+module rt.prelude;
+
+extern fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern fn exit(code: i32);
+extern fn strlen(s: *u8) -> u64;
+extern fn fflush(f: *u8) -> i32;
+extern fn malloc(n: u64) -> *u8;
+extern fn free(p: *u8);
+extern fn memcpy(d: *u8, s: *u8, n: u64) -> *u8;
+extern fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
+extern fn snprintf(buf: *u8, n: u64, fmt: String, a: i64, b: i64, c: i64) -> i32;
+extern fn strfromd(buf: *u8, n: u64, fmt: String, v: f64) -> i32;
+extern fn strtod(s: *u8, end: *u8) -> f64;
+
+// stops the program: prints the message to stderr and exits with code 101
+fn panic(msg: String) {
+    unsafe {
+        fflush(null);
+        let m = "aegis: panic: ";
+        write(2, m as *u8, rt_str_len(m) as u64);
+        write(2, msg as *u8, rt_str_len(msg) as u64);
+        write(2, "\n" as *u8, 1);
+        exit(101);
+    }
+}
+
+// errors of String.parse_int() / String.parse_float()
+enum ParseError { Empty, Invalid, Overflow }
+
+// ---- string runtime (called by compiled code) ----
+
+// bytes of a new string of length n (reference count 1, NUL-terminated); the caller fills them
+unsafe fn rt_str_new(n: i64) -> *u8 {
+    unsafe {
+        let h = malloc((n + 17) as u64) as *i64;
+        if h == null { panic("out of memory"); }
+        *h = 1;
+        *(h + 1) = n;
+        let d = (h + 2) as *u8;
+        *(d + n) = 0;
+        return d;
+    }
+}
+fn rt_str_len(s: String) -> i64 {
+    unsafe {
+        let p = s as *i64;
+        if p == null { return 0; }
+        return *(p - 1);
+    }
+}
+unsafe fn rt_str_from_buf(p: *u8, n: i64) -> String {
+    if n == 0 { return ""; }
+    unsafe {
+        let d = rt_str_new(n);
+        memcpy(d, p, n as u64);
+        return d as String;
+    }
+}
+// `p as String` outside the runtime: copies a C string
+unsafe fn rt_str_from_c(p: *u8) -> String {
+    unsafe {
+        if p == null { return ""; }
+        return rt_str_from_buf(p, strlen(p) as i64);
+    }
+}
+fn rt_str_concat(a: String, b: String) -> String {
+    let la = rt_str_len(a);
+    let lb = rt_str_len(b);
+    if lb == 0 { return a; }
+    if la == 0 { return b; }
+    unsafe {
+        let d = rt_str_new(la + lb);
+        memcpy(d, a as *u8, la as u64);
+        memcpy(d + la, b as *u8, lb as u64);
+        return d as String;
+    }
+}
+// -1, 0 or 1: byte-wise order, a prefix sorts first
+fn rt_str_cmp(a: String, b: String) -> i32 {
+    let la = rt_str_len(a);
+    let lb = rt_str_len(b);
+    var n = la;
+    if lb < n { n = lb; }
+    if n > 0 {
+        unsafe {
+            if (a as *u8) == (b as *u8) && la == lb { return 0; }
+            let c = memcmp(a as *u8, b as *u8, n as u64);
+            if c < 0 { return -1; }
+            if c > 0 { return 1; }
+        }
+    }
+    if la < lb { return -1; }
+    if la > lb { return 1; }
+    return 0;
+}
+fn rt_str_from_i64(v: i64) -> String {
+    var b: [32]u8;
+    unsafe {
+        let n = snprintf(&b[0], 32, "%lld", v, 0, 0);
+        return rt_str_from_buf(&b[0], n as i64);
+    }
+}
+fn rt_str_from_u64(v: u64) -> String {
+    var b: [32]u8;
+    unsafe {
+        let n = snprintf(&b[0], 32, "%llu", v as i64, 0, 0);
+        return rt_str_from_buf(&b[0], n as i64);
+    }
+}
+// same digits as println
+fn rt_str_from_f64(v: f64) -> String {
+    var b: [64]u8;
+    unsafe {
+        let n = strfromd(&b[0], 64, "%.15g", v);
+        return rt_str_from_buf(&b[0], n as i64);
+    }
+}
+fn rt_str_from_bool(v: bool) -> String {
+    if v { return "true"; }
+    return "false";
+}
+fn rt_str_from_char(c: u8) -> String {
+    unsafe {
+        let d = rt_str_new(1);
+        *d = c;
+        return d as String;
+    }
+}
+
+// ---- String methods: s.name(args) calls str_name(s, args) ----
+
+fn str_is_empty(s: String) -> bool { return rt_str_len(s) == 0; }
+
+// the bytes [from, to); panics when the range is outside the string
+fn str_slice(s: String, from: i64, to: i64) -> String {
+    let n = rt_str_len(s);
+    if from < 0 || to < from || to > n { panic("String.slice: range out of bounds"); }
+    if from == 0 && to == n { return s; }
+    unsafe { return rt_str_from_buf((s as *u8) + from, to - from); }
+}
+// first byte index of sub at or after start, or -1
+fn str_find_from(s: String, sub: String, start: i64) -> i64 {
+    let n = rt_str_len(s);
+    let m = rt_str_len(sub);
+    var i = start;
+    if i < 0 { i = 0; }
+    if m == 0 { if i <= n { return i; } return -1; }
+    unsafe {
+        let p = s as *u8;
+        let q = sub as *u8;
+        while i + m <= n {
+            if *(p + i) == *q && memcmp(p + i, q, m as u64) == 0 { return i; }
+            i += 1;
+        }
+    }
+    return -1;
+}
+fn str_find(s: String, sub: String) -> i64 { return str_find_from(s, sub, 0); }
+fn str_contains(s: String, sub: String) -> bool { return str_find_from(s, sub, 0) >= 0; }
+fn str_starts_with(s: String, p: String) -> bool {
+    let m = rt_str_len(p);
+    if m > rt_str_len(s) { return false; }
+    if m == 0 { return true; }
+    unsafe { return memcmp(s as *u8, p as *u8, m as u64) == 0; }
+}
+fn str_ends_with(s: String, p: String) -> bool {
+    let n = rt_str_len(s);
+    let m = rt_str_len(p);
+    if m > n { return false; }
+    if m == 0 { return true; }
+    unsafe { return memcmp((s as *u8) + (n - m), p as *u8, m as u64) == 0; }
+}
+fn rt_ascii_map(s: String, upper: bool) -> String {
+    let n = rt_str_len(s);
+    if n == 0 { return ""; }
+    unsafe {
+        let d = rt_str_new(n);
+        let p = s as *u8;
+        var i: i64 = 0;
+        while i < n {
+            var c = *(p + i);
+            if upper && c >= 97 && c <= 122 { c -= 32; }
+            if !upper && c >= 65 && c <= 90 { c += 32; }
+            *(d + i) = c;
+            i += 1;
+        }
+        return d as String;
+    }
+}
+fn str_to_upper(s: String) -> String { return rt_ascii_map(s, true); }
+fn str_to_lower(s: String) -> String { return rt_ascii_map(s, false); }
+fn rt_is_space(c: u8) -> bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12; }
+// without leading and trailing ASCII whitespace
+fn str_trim(s: String) -> String {
+    let n = rt_str_len(s);
+    var a: i64 = 0;
+    var b = n;
+    unsafe {
+        let p = s as *u8;
+        while a < b && rt_is_space(*(p + a)) { a += 1; }
+        while b > a && rt_is_space(*(p + b - 1)) { b -= 1; }
+    }
+    return str_slice(s, a, b);
+}
+// every occurrence of from replaced by to
+fn str_replace(s: String, from: String, to: String) -> String {
+    let m = rt_str_len(from);
+    if m == 0 { return s; }
+    var out = "";
+    var start: i64 = 0;
+    var at = str_find_from(s, from, 0);
+    if at < 0 { return s; }
+    while at >= 0 {
+        out = rt_str_concat(rt_str_concat(out, str_slice(s, start, at)), to);
+        start = at + m;
+        at = str_find_from(s, from, start);
+    }
+    return rt_str_concat(out, str_slice(s, start, rt_str_len(s)));
+}
+fn str_repeat(s: String, count: i64) -> String {
+    let n = rt_str_len(s);
+    if count <= 0 || n == 0 { return ""; }
+    if count == 1 { return s; }
+    unsafe {
+        let d = rt_str_new(n * count);
+        var i: i64 = 0;
+        while i < count { memcpy(d + i * n, s as *u8, n as u64); i += 1; }
+        return d as String;
+    }
+}
+// the byte at i as a one-character string; panics when i is out of range
+fn str_char_at(s: String, i: i64) -> String {
+    if i < 0 || i >= rt_str_len(s) { panic("String.char_at: index out of bounds"); }
+    unsafe { return rt_str_from_buf((s as *u8) + i, 1); }
+}
+// decimal integer with an optional sign
+fn str_parse_int(s: String) -> Result<i64, ParseError> {
+    let n = rt_str_len(s);
+    if n == 0 { return Err(ParseError.Empty); }
+    var i: i64 = 0;
+    var neg = false;
+    var v: u64 = 0;
+    unsafe {
+        let p = s as *u8;
+        if *p == 45 || *p == 43 { neg = *p == 45; i = 1; }
+        if i == n { return Err(ParseError.Invalid); }
+        while i < n {
+            let c = *(p + i);
+            if c < 48 || c > 57 { return Err(ParseError.Invalid); }
+            let d = (c - 48) as u64;
+            if v > (9223372036854775808 - d) / 10 { return Err(ParseError.Overflow); }
+            v = v * 10 + d;
+            i += 1;
+        }
+    }
+    if neg { return Ok((0 - v) as i64); }
+    if v > 9223372036854775807 { return Err(ParseError.Overflow); }
+    return Ok(v as i64);
+}
+// decimal or scientific notation (also inf / nan), the whole string must be the number
+fn str_parse_float(s: String) -> Result<f64, ParseError> {
+    let n = rt_str_len(s);
+    if n == 0 { return Err(ParseError.Empty); }
+    unsafe {
+        let p = s as *u8;
+        if rt_is_space(*p) { return Err(ParseError.Invalid); }
+        var end: *u8 = null;
+        let v = strtod(p, (&end) as *u8);
+        if end != p + n { return Err(ParseError.Invalid); }
+        return Ok(v);
+    }
+}

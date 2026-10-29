@@ -1,0 +1,8 @@
+module T;
+allow Console;
+class C { public: fn size() -> i64 { return 0; } }
+fn main() -> i32 {
+    let c = C();
+    for x in c { println(x); }
+    return 0;
+}

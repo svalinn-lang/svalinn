@@ -1,0 +1,1 @@
+module A; class B { public: ctor() { super(); } } fn main() -> i32 { return 0; }

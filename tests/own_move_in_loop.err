@@ -1,0 +1,3 @@
+tests/own_move_in_loop.ag:1:123: error: cannot move 'r' inside a loop (it is declared outside the loop)
+    1 | module A; class R { public: var x: i32; dtor { } } fn take(r: R) { } fn main() -> i32 { let r = R(); for i in 0..2 { take(r); } return 0; }
+      |                                                                                                                           ^

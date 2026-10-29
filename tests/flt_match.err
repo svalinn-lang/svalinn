@@ -1,0 +1,3 @@
+tests/flt_match.ag:1:30: error: cannot match on 'f64'
+    1 | module A; fn main() -> i32 { match 1.5 { _ => { } } return 0; }
+      |                              ^

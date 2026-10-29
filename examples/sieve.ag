@@ -1,0 +1,26 @@
+module Sieve;
+allow Console;
+
+let LIMIT: i32 = 50;
+var counter: i32 = 0;
+let greeting = "primes below 50:";
+
+var flags: [50]bool;
+
+fn mark(n: i32) {
+    var j = n * n;
+    while j < LIMIT { flags[j] = true; j += n; }
+}
+
+fn main() -> i32 {
+    println(greeting);
+    for i in 2..LIMIT {
+        if !flags[i] {
+            counter += 1;
+            println(i);
+            mark(i);
+        }
+    }
+    println(counter);
+    return 0;
+}

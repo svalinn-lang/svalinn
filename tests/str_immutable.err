@@ -1,0 +1,3 @@
+tests/str_immutable.ag:2:34: error: the bytes of a String cannot be changed (strings are immutable); build a new String instead
+    2 | fn main() -> i32 { var s = "ab"; s[0] = 65; return 0; }
+      |                                  ^

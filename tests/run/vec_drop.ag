@@ -1,0 +1,31 @@
+module D2;
+allow Console;
+allow Native;
+import std.vec;
+
+class Res {
+    private: var id: i32;
+    public:
+        ctor(id: i32) { this.id = id; }
+        dtor { print("close "); println(this.id); }
+        fn get() -> i32 { return this.id; }
+}
+
+fn build() -> Vec<Res> {
+    var v = Vec<Res>();
+    for i in 0..3 { v.push(Res(i)); }
+    return v;
+}
+
+fn main() -> i32 {
+    var outer = Vec<Vec<i32>>();
+    var inner = Vec<i32>();
+    inner.push(1);
+    inner.push(2);
+    outer.push(inner);
+    println(outer.len());
+    var rs = build();
+    match rs.pop() { Ok(r) => { print("popped "); println(r.get()); } Err(_) => { } }
+    println("end of main");
+    return 0;
+}

@@ -1,0 +1,53 @@
+module Spectral;
+allow Console;
+allow Native;
+
+import std.math;
+
+extern fn printf(fmt: String, x: f64) -> i32;
+
+var u: [2000]f64;
+var v: [2000]f64;
+var tmp: [2000]f64;
+
+fn a(i: i64, j: i64) -> f64 {
+    return 1.0 / (((i + j) * (i + j + 1) / 2 + i + 1) as f64);
+}
+
+fn mulAv(n: i64, ref x: [2000]f64, ref y: [2000]f64) {
+    for i in 0..n {
+        var s = 0.0;
+        for j in 0..n { s += a(i, j) * x[j]; }
+        y[i] = s;
+    }
+}
+
+fn mulAtv(n: i64, ref x: [2000]f64, ref y: [2000]f64) {
+    for i in 0..n {
+        var s = 0.0;
+        for j in 0..n { s += a(j, i) * x[j]; }
+        y[i] = s;
+    }
+}
+
+fn mulAtAv(n: i64, ref x: [2000]f64, ref y: [2000]f64) {
+    mulAv(n, ref x, ref tmp);
+    mulAtv(n, ref tmp, ref y);
+}
+
+fn main() -> i32 {
+    let n: i64 = 2000;
+    for i in 0..n { u[i] = 1.0; }
+    for i in 0..10 {
+        mulAtAv(n, ref u, ref v);
+        mulAtAv(n, ref v, ref u);
+    }
+    var vbv = 0.0;
+    var vv = 0.0;
+    for i in 0..n {
+        vbv += u[i] * v[i];
+        vv += v[i] * v[i];
+    }
+    unsafe { printf("%.9f\n", Math.sqrt(vbv / vv)); }
+    return 0;
+}

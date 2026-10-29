@@ -1,0 +1,9 @@
+module T;
+allow Console;
+allow Native;
+import std.vec;
+fn main() -> i32 {
+    var w = Vec<Vec<i32>>();
+    for v in w { println(v.len()); }
+    return 0;
+}

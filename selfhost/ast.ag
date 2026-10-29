@@ -1,0 +1,178 @@
+// AST for the self-hosted compiler: a port of the node structs in aegisc.c.
+module Ast;
+
+import std.mem;
+import types;
+
+let E_INT: i32 = 0;
+let E_BOOL: i32 = 1;
+let E_STR: i32 = 2;
+let E_VAR: i32 = 3;
+let E_CALL: i32 = 4;
+let E_BIN: i32 = 5;
+let E_UN: i32 = 6;
+let E_CAST: i32 = 7;
+let E_INDEX: i32 = 8;
+let E_FIELD: i32 = 9;
+let E_REF: i32 = 10;
+let E_ENUMVAL: i32 = 11;
+let E_SIZEOF: i32 = 12;
+let E_MCALL: i32 = 13;
+let E_OK: i32 = 14;
+let E_ERR: i32 = 15;
+let E_TRY: i32 = 16;
+let E_TOIFACE: i32 = 17;
+let E_FLOAT: i32 = 18;
+let E_AWAIT: i32 = 19;
+let E_SLIT: i32 = 20;    // struct literal: args are E_FINIT nodes
+let E_FINIT: i32 = 21;   // one field of a struct literal: name, value in a
+
+let O_ADD: i32 = 0;
+let O_SUB: i32 = 1;
+let O_MUL: i32 = 2;
+let O_DIV: i32 = 3;
+let O_MOD: i32 = 4;
+let O_AND: i32 = 5;
+let O_OR: i32 = 6;
+let O_XOR: i32 = 7;
+let O_SHL: i32 = 8;
+let O_SHR: i32 = 9;
+let O_EQ: i32 = 10;
+let O_NE: i32 = 11;
+let O_LT: i32 = 12;
+let O_LE: i32 = 13;
+let O_GT: i32 = 14;
+let O_GE: i32 = 15;
+let O_LAND: i32 = 16;
+let O_LOR: i32 = 17;
+let O_NEG: i32 = 18;
+let O_NOT: i32 = 19;
+let O_BNOT: i32 = 20;
+let O_DEREF: i32 = 21;
+let O_ADDR: i32 = 22;
+
+let S_LET: i32 = 0;
+let S_ASSIGN: i32 = 1;
+let S_EXPR: i32 = 2;
+let S_IF: i32 = 3;
+let S_WHILE: i32 = 4;
+let S_FOR: i32 = 5;
+let S_RET: i32 = 6;
+let S_BRK: i32 = 7;
+let S_CONT: i32 = 8;
+let S_BLOCK: i32 = 9;
+let S_MATCH: i32 = 10;
+let S_ARM: i32 = 11;
+
+struct Local {
+    name: *u8; ty: *Type;
+    off: i32; tmp: i32; is_ref: i32; is_mut: i32; is_global: i32; line: i32;
+    dflag: i32; moved: i32; loop: i32;   // dflag: drop-flag slot (alive)
+    init: *Expr;
+    // optimizer: register (1-5 GP, 8-15 xmm), weighted uses, known value range, constant, scope interval
+    reg: i32; uses: i32; addr_taken: i32; seen: i32; has_range: i32; is_cst: i32; nasg: i32; ifirst: i32; ilast: i32;
+    lo: i64; hi: i64; cval: i64;
+    is_const: i32;   // 'const' global: uses are replaced by its literal
+}
+
+// cls: 0 plain integer literal, 1 char literal, 2 null literal
+struct Expr {
+    kind: i32; line: i32; op: i32; neg: i32; cls: i32; nargs: i32; slen: i32; builtin: i32; tmp: i32; recv: i32;
+    ival: i64;
+    name: *u8; sval: *u8;
+    a: *Expr; b: *Expr; args: *Expr; next: *Expr;
+    ty: *Type; cty: *Type;
+    lv: *Local; fld: *FieldDef; callee: *Func;
+    move: i32; consumed: i32; dflag: i32; tnext: *Expr;   // ownership: moved-from variable / temporary taken over / drop flag
+    inl: *Expr; inl_done: i32;   // optimizer: inlined body of this call
+    copy: i32;   // the value of this place is copied (reference counts incremented)
+}
+
+struct Stmt {
+    kind: i32; line: i32; is_mut: i32; unsafe_blk: i32; is_range: i32; n: i32; slot1: i32;
+    name: *u8;
+    dty: *Type;
+    e: *Expr; e2: *Expr;
+    body: *Stmt; els: *Stmt; list: *Stmt; next: *Stmt;
+    lv: *Local;
+    temps: *Expr;      // temporaries with destructors created by this statement
+    init_store: i32;   // constructor: first assignment of a field (still zero, nothing to drop)
+    bnd: *Local;       // optimizer: for-loop bound
+}
+
+struct Func {
+    name: *u8;
+    line: i32; nparams: i32; is_unsafe: i32; is_extern: i32; frame: i32; retslot: i32;
+    pname: [16]*u8; pty: [16]*Type; pref: [16]i32; plocal: [16]*Local;
+    cls: *StructDef; is_ctor: i32; is_static: i32; is_method: i32; vis: i32;
+    ifc: *Iface; vt_idx: i32; is_dtor: i32; is_async: i32;
+    ret: *Type; body: *Stmt;
+    nsaved: i32; saved: [8]i32;   // optimizer: callee-saved registers used
+    inl_state: i32; inl_body: *Expr;   // optimizer: 1 = small enough to inline, 2 = not
+    borrow: i32;   // runtime prelude function: String parameters are borrowed, not owned
+    req: [8]*u8; nreq: i32;   // `requires A.B, C`: capabilities a caller must have
+    is_test: i32; is_deprecated: i32;   // @test, @deprecated
+}
+
+var funcs: [1024]*Func;
+var nfuncs: i32;
+var globals: [512]*Local;
+var nglobals: i32;
+var allow_caps: [64]*u8;
+var nallow: i32;
+var deny_caps: [64]*u8;
+var ndeny: i32;
+var mod_name: *u8;
+var protect_process: i32;
+
+unsafe fn vis_name(v: i32) -> String {
+    if v == 0 { return "public"; }
+    if v == 1 { return "private"; }
+    if v == 2 { return "protected"; }
+    return "internal";
+}
+unsafe fn vis_of(s: *u8) -> i32 {
+    var i = 0;
+    while i < 4 {
+        if strcmp(s, (vis_name(i)) as *u8) == 0 { return i; }
+        i += 1;
+    }
+    return 0 - 1;
+}
+
+unsafe fn new_expr(kind: i32, line: i32) -> *Expr {
+    let e = zalloc(sizeof(Expr)) as *Expr;
+    e.kind = kind;
+    e.line = line;
+    return e;
+}
+
+unsafe fn new_stmt(kind: i32, line: i32) -> *Stmt {
+    let s = zalloc(sizeof(Stmt)) as *Stmt;
+    s.kind = kind;
+    s.line = line;
+    return s;
+}
+
+unsafe fn add_arg(e: *Expr, a: *Expr) {
+    e.nargs += 1;
+    if e.args == null { e.args = a; return; }
+    var p = e.args;
+    while p.next != null { p = p.next; }
+    p.next = a;
+}
+
+unsafe fn add_child(s: *Stmt, c: *Stmt) {
+    s.n += 1;
+    if s.list == null { s.list = c; return; }
+    var p = s.list;
+    while p.next != null { p = p.next; }
+    p.next = c;
+}
+
+unsafe fn nth_arg(e: *Expr, i: i32) -> *Expr {
+    var p = e.args;
+    var k = 0;
+    while k < i { p = p.next; k += 1; }
+    return p;
+}

@@ -1,0 +1,54 @@
+// Strings through globals, interfaces, generics, Result and ?, async tasks, nested containers, 2D arrays
+module Edge;
+allow Console;
+import std.vec;
+
+var greeting: String = "hi";
+var counter: i32 = 0;
+
+interface Named { fn name() -> String; }
+class Dog : Named { private: var n: String; public: ctor(n: String) { this.n = n; } fn name() -> String { return "dog " + this.n; } }
+fn show(x: Named) { println(x.name()); }
+
+class Box<T> { public: var value: T; ctor(v: T) { this.value = v; } fn get() -> T { return this.value; } }
+fn max<T>(a: T, b: T) -> T { if a > b { return a; } return b; }
+
+fn tag(s: String) -> Result<String, String> {
+    if s.len() == 0 { return Err("empty"); }
+    return Ok("<" + s + ">");
+}
+fn wrap(s: String) -> Result<String, String> { let t = tag(s)?; return Ok(t + t); }
+
+async fn shout(s: String, n: i32) -> String {
+    var out = "";
+    for i in 0..n { out = out + s.to_upper(); yield_now(); }
+    return out;
+}
+
+fn main() -> i32 {
+    greeting = greeting + " there";
+    println(greeting);
+    let d = Dog("rex");
+    show(d);
+    let b = Box<String>("boxed");
+    let b2 = b;
+    println(b.get() + "/" + b2.get());
+    println(max("pear", "apple") + " " + max<String>("a", "b"));
+    match wrap("x") { Ok(v) => { println(v); } Err(e) => { println("err " + e); } }
+    match wrap("") { Ok(v) => { println(v); } Err(e) => { println("err " + e); } }
+    let t1 = shout("ab", 2);
+    let t2 = shout("c", 3);
+    println(await t1 + await t2);
+    var vs = Vec<Vec<String>>();
+    var inner = Vec<String>();
+    inner.push("deep");
+    vs.push(inner);
+    println(vs.len());
+    var grid: [2][2]String;
+    grid[1][0] = "g10";
+    let g2 = grid;
+    println(g2[1][0] + grid[1][0].len());
+    var e: String;
+    println("[" + e + "]" + e.len() + (e == ""));
+    return 0;
+}

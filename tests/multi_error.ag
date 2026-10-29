@@ -1,0 +1,9 @@
+module E;
+allow Console;
+fn f(x: i32) -> i32 {
+	let y = x + true;
+    return y;
+}
+fn g() -> bool { return 1 + "a"; }
+fn h() { let s = "abc"; s[0] = 1; }
+fn main() -> i32 { println(undefined_thing); return 0; }

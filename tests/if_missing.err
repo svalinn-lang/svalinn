@@ -1,0 +1,3 @@
+tests/if_missing.ag:1:51: error: class 'R' does not implement 'area' from interface 'S'
+    1 | module A; interface S { fn area() -> i64; } class R : S { public: fn other() {} } fn main() -> i32 { return 0; }
+      |                                                   ^

@@ -1,0 +1,3 @@
+tests/prelude_conflict.ag:3:11: error: 'strlen' is a runtime function (lib/rt/prelude.ag); declare it with the same signature or use another name
+    3 | extern fn strlen(s: String) -> i32;
+      |           ^
