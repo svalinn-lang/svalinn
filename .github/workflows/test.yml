@@ -1,0 +1,17 @@
+# Runs the whole test suite on every push and pull request.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y gcc make python3 valgrind
+      - name: make test
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee test.log
+          # the suite reports problems in words; fail the job on any of them
+          ! grep -E "MISMATCH|UNEXPECTED|FAIL|WRONG|MEMORY ERROR|CHANGED|[1-9][0-9]* failures" test.log
+          grep -q "ok BOOTSTRAP" test.log && grep -q "ok OPTIMIZED BOOTSTRAP" test.log
