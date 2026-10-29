@@ -12,6 +12,11 @@ var file_names: [64]*u8;
 var nfile_names: i32;
 var file_trusted: [64]i32;   // files of the runtime and the standard library: no capability checks inside
 var file_src: [32]*u8;       // source text of each file, for the excerpt under an error
+var file_mod: [64]*u8;       // the name each file gives itself with `module X;`
+var has_access: [64]i32;     // the file declares `allowAccess`
+var access_name: [1024]*u8;  // `allowAccess A, B;`: module names, with the file that lists them
+var access_file: [1024]i32;
+var naccess: i32;
 
 // errors are recoverable while one function is checked: die() jumps back to the checking loop
 var err_jb: [64]i64;

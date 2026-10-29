@@ -1,0 +1,12 @@
+module AccessTest;
+allow Console;
+import access.vault;
+
+// AccessTest is listed in the vault's allowAccess, so all of this compiles
+fn main() -> i32 {
+    var s = open_safe(100);
+    println(s.take(30));
+    let t = Safe(5);
+    println(t.take(1));
+    return 0;
+}

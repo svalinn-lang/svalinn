@@ -44,7 +44,7 @@ for 1.x. Every compiler change is made twice (C and self-hosted) and must keep t
 | 3 | Owning interface values (`Vec<Shape>`, interface fields and returns) | P0 | Language | Mixed collections are the core OOP and game case; impossible today | M | Not started: interface types are parameter-only |
 | 4 | Function values and closures | P0 | Language | Sort, callbacks and iterators need them; adding them later means a second API style | L | Not started: no `fn` types, no closure syntax |
 | 5 | Generic methods (`fn map<U>(...)` in a class) | P0 | Language | Collection APIs depend on them | M | Not started: methods take no type parameters |
-| 6 | `allowAccess` module permissions (spec) | P0 | Capabilities | Spec feature; semantics now decided (see Decisions) | S | Not started |
+| 6 | `allowAccess` module permissions (spec) | P0 | Capabilities | Spec feature; semantics now decided (see Decisions) | S | **Done**: `allowAccess A, B;` restricts calls to the module's functions, methods and constructors |
 | 7 | Fixed rules for `char`, UTF-8, `usize`/`isize` and integer overflow | P0 | Language | Cannot change after 1.0 without breaking programs | S | Partly: `usize`/`isize` exist and arithmetic wraps; missing 32-bit `char`, `s.chars()`, `checked_*`, `--overflow-checks` |
 | 8 | Normative language reference | P0 | Docs | 1.0 freezes what is written down | M | Not started |
 | 9 | `HashMap`, `HashSet`, sort, binary search, `Vec` insert/remove | P1 | Std library | Expected in every 1.0 standard library | M | Not started: `Vec` has push/pop/get/set/clear only |

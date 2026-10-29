@@ -1,0 +1,3 @@
+tests/access_method.svl:3:44: error: 'Safe.peek' is in module 'Vault', which allows access only from the modules listed in its 'allowAccess' (not from 'Shop')
+    3 | fn peek_from(ref s: Safe) -> i64 { return s.peek(); }
+      |                                            ^

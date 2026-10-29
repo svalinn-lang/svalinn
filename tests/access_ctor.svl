@@ -1,0 +1,3 @@
+module Thief;
+import access.vault;
+fn main() -> i32 { let s = Safe(); return 0; }

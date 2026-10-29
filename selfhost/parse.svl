@@ -1252,6 +1252,20 @@ unsafe fn parse_program() {
         if acceptkw("module") {
             let mn = parse_dotted();
             if !imp { mod_name = mn; }
+            file_mod[line >> 26] = mn;
+            expectop(";");
+        } else if acceptkw("allowAccess") {
+            // allowAccess A, B.C;
+            let fi = line >> 26;
+            has_access[fi] = 1;
+            var more = true;
+            while more {
+                if naccess >= 1024 { die(line, "too many 'allowAccess' entries"); }
+                access_name[naccess] = parse_dotted();
+                access_file[naccess] = fi;
+                naccess += 1;
+                more = acceptop(",");
+            }
             expectop(";");
         } else if acceptkw("import") {
             parse_dotted();
