@@ -276,6 +276,40 @@ unsafe fn gen_call(e: *Expr) {
     }
 }
 
+// checked_add/sub/mul: an Option in the call's temporary, None when the result does not fit
+unsafe fn gen_checked(e: *Expr) {
+    let t = e.args.ty;
+    let Ln = newlbl();
+    let Le = newlbl();
+    gen_expr(e.args);
+    gpush("rax");
+    gen_expr(e.args.next);
+    emit("mov rcx, rax");
+    gpop("rax");
+    var ins: String = "imul";
+    if e.op == O_ADD { ins = "add"; } else if e.op == O_SUB { ins = "sub"; }
+    if t.size == 8 {
+        // the flags tell: overflow (signed) or carry/borrow (unsigned)
+        if e.op == O_MUL && t.sign == 0 { emit("mul rcx"); } else { emit1("%s rax, rcx", ins as i64); }
+        if t.sign != 0 || e.op == O_MUL { emit1("jo .L%d", Ln as i64); } else { emit1("jc .L%d", Ln as i64); }
+    } else {
+        // the operands are extended to 64 bits, so the exact result is there: it must survive truncation
+        emit1("%s rax, rcx", ins as i64);
+        if t.size == 4 { if t.sign != 0 { emit("movsxd rdx, eax"); } else { emit("mov edx, eax"); } }
+        else if t.size == 2 { if t.sign != 0 { emit("movsx rdx, ax"); } else { emit("movzx edx, ax"); } }
+        else { if t.sign != 0 { emit("movsx rdx, al"); } else { emit("movzx edx, al"); } }
+        emit("cmp rdx, rax");
+        emit1("jne .L%d", Ln as i64);
+    }
+    store_local(t, e.tmp - 8);
+    emit1("mov QWORD PTR [rbp-%d], 0", e.tmp as i64);
+    emit1("jmp .L%d", Le as i64);
+    place(Ln);
+    emit1("mov QWORD PTR [rbp-%d], 1", e.tmp as i64);
+    place(Le);
+    emit1("lea rax, [rbp-%d]", e.tmp as i64);
+}
+
 unsafe fn gen_print(e: *Expr) {
     let a = e.args;
     let t = a.ty;
@@ -592,6 +626,7 @@ unsafe fn gen_expr0(e: *Expr) {
             emit("mov rax, QWORD PTR [rax-8]");
             place(L);
         }
+        else if e.builtin == 10 { gen_checked(e); }
         else if e.builtin == 9 {
             // String for C: never null
             gen_expr(e.args);
