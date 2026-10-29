@@ -660,6 +660,27 @@ unsafe fn check_call(e: *Expr) -> *Type {
         e.ty = ty_void;
         return e.ty;
     }
+    if f == null && (seq(e.name, lit("checked_add")) || seq(e.name, lit("checked_sub")) || seq(e.name, lit("checked_mul"))) {
+        // checked_add(a, b): Some(a + b), or None when the result does not fit the type (instead of wrapping)
+        if e.nargs != 2 { dief(e.line, "'%s' takes exactly two arguments", e.name as i64, 0, 0); }
+        let x = e.args;
+        let y = e.args.next;
+        var a = check_expr(x);
+        var b = check_expr(y);
+        if a.kind == TY_ILIT && b.kind == TY_ILIT { finalize(x); finalize(y); }
+        else if a.kind == TY_ILIT { expect_coerce(x, b, "argument"); }
+        else if b.kind == TY_ILIT { expect_coerce(y, a, "argument"); }
+        a = x.ty;
+        b = y.ty;
+        if !is_int(a) || a.is_char != 0 || !same(a, b) {
+            dief(e.line, "'%s' needs two integers of the same type, found '%s' and '%s'", e.name as i64, tname(a) as i64, tname(b) as i64);
+        }
+        e.builtin = 10;
+        if e.name[8] == 'a' { e.op = O_ADD; } else if e.name[8] == 's' { e.op = O_SUB; } else { e.op = O_MUL; }
+        e.ty = mk_option(a);
+        e.tmp = alloc_slot(16, 8);
+        return e.ty;
+    }
     if f == null && seq(e.name, lit("yield_now")) {
         // let other tasks run
         if e.nargs != 0 { die(e.line, "yield_now takes no arguments"); }

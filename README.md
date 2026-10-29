@@ -132,6 +132,11 @@ prints `test name ... ok/FAILED` and a summary, exit code 1 if anything failed.
 An index out of bounds, integer division by zero, stack overflow or `panic(msg)` flushes the program's output,
 prints one line (`svalinn: index out of bounds`, `svalinn: panic: msg`, ...) to stderr and exits with code 101.
 Destructors do not run. Integer arithmetic wraps around (two's complement), it never traps.
+`checked_add(a, b)`, `checked_sub` and `checked_mul` take two integers of the same type and return an
+`Option`: `None` when the exact result does not fit the type.
+
+    match checked_add(total, x) { Some(t) => { total = t; } None => { println("too big"); } }
+    fn sum(xs: [4]i32) -> Option<i32> { var t: i32 = 0; for x in xs { t = checked_add(t, x)?; } return Some(t); }
 
 ## Diagnostics
 Errors show file, line and column, the source line and a caret. The checker reports one error per function
@@ -254,7 +259,7 @@ dumps and every error message of the two compilers. Check by hand:
 `./svalinnc --dump-sema f.svl` vs `./selfhost/semac f.svl`.
 
 ## Tests (`make test`)
-examples; 111 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
+examples; 114 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
 output under `-O0`, `-O` and both compilers, each run under valgrind (no memory errors, no leaks); command line,
 stdin, runtime-error messages and the `--test` runner; the `protect Process` attack test; lexer/parser/checker/code
 generator identity between the compilers; both bootstraps; differential fuzzing of the optimizer; String fuzzing

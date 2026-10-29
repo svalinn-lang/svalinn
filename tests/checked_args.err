@@ -1,0 +1,3 @@
+tests/checked_args.svl:1:38: error: 'checked_mul' takes exactly two arguments
+    1 | module A; fn main() -> i32 { let c = checked_mul(1); return 0; }
+      |                                      ^

@@ -1,0 +1,1 @@
+module A; fn main() -> i32 { let c = checked_sub("a", "b"); return 0; }

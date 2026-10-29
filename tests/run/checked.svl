@@ -1,0 +1,67 @@
+module Checked;
+allow Console;
+
+fn show(o: Option<i64>) -> String { match o { Some(v) => { return "" + v; } None => { return "overflow"; } } }
+fn show32(o: Option<i32>) -> String { match o { Some(v) => { return "" + v; } None => { return "overflow"; } } }
+fn show8(o: Option<i8>) -> String { match o { Some(v) => { return "" + v; } None => { return "overflow"; } } }
+fn showu8(o: Option<u8>) -> String { match o { Some(v) => { return "" + v; } None => { return "overflow"; } } }
+fn showu16(o: Option<u16>) -> String { match o { Some(v) => { return "" + v; } None => { return "overflow"; } } }
+fn showu32(o: Option<u32>) -> String { match o { Some(v) => { return "" + v; } None => { return "overflow"; } } }
+fn showu64(o: Option<u64>) -> String { match o { Some(v) => { return "" + v; } None => { return "overflow"; } } }
+
+fn sum(xs: [4]i32) -> Option<i32> {
+    var total: i32 = 0;
+    for x in xs { total = checked_add(total, x)?; }
+    return Some(total);
+}
+
+fn main() -> i32 {
+    let big: i64 = 9223372036854775807;
+    let small: i64 = 0 - 9223372036854775807 - 1;
+    println(show(checked_add(big, 0)));
+    println(show(checked_add(big, 1)));
+    println(show(checked_sub(small, 1)));
+    println(show(checked_sub(small, 0 - 1)));
+    println(show(checked_mul(small, 0 - 1)));
+    let q: i64 = 4611686018427387904;
+    println(show(checked_mul(q, 2)));
+    println(show(checked_mul(0 - q, 2)));
+
+    let m: i32 = 2147483647;
+    println(show32(checked_add(m, 1)));
+    println(show32(checked_add(m, 0 - 1)));
+    println(show32(checked_mul(65536, 32768)));
+    println(show32(checked_mul(0 - 65536, 32768)));
+
+    let a: i8 = 100;
+    println(show8(checked_add(a, 27)));
+    println(show8(checked_add(a, 28)));
+    println(show8(checked_sub(0 - 100, a)));
+    println(show8(checked_mul(a, 2)));
+
+    let b: u8 = 200;
+    println(showu8(checked_add(b, 55)));
+    println(showu8(checked_add(b, 56)));
+    println(showu8(checked_sub(b, 201)));
+    let w: u16 = 256;
+    println(showu16(checked_mul(w, 255)));
+    println(showu16(checked_mul(w, 256)));
+    let c: u32 = 4294967295;
+    println(showu32(checked_add(c, 0)));
+    println(showu32(checked_add(c, 1)));
+    println(showu32(checked_mul(c, c)));
+    let d: u64 = 18446744073709551615;
+    println(showu64(checked_add(d, 1)));
+    let z: u64 = 0;
+    println(showu64(checked_sub(z, 1)));
+    let h: u64 = 4294967296;
+    println(showu64(checked_mul(h, 4294967295)));
+    println(showu64(checked_mul(h, 4294967296)));
+
+    var xs: [4]i32;
+    xs[0] = 1; xs[1] = 2; xs[2] = 3; xs[3] = 4;
+    println(show32(sum(xs)));
+    xs[0] = 2147483647; xs[1] = 0; xs[2] = 0; xs[3] = 1;
+    println(show32(sum(xs)));
+    return 0;
+}

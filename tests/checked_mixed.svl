@@ -1,0 +1,1 @@
+module A; fn main() -> i32 { let a: i32 = 1; let b: i64 = 2; let c = checked_add(a, b); return 0; }

@@ -1307,6 +1307,18 @@ static Type *check_expr(Expr *e) {
             if (pt->k != TY_PTR) die(e->line, "destroy needs a pointer, found '%s'", tname(pt));
             e->builtin = 5; return e->ty = &ty_void;
         }
+        if (!f && (!strcmp(e->name, "checked_add") || !strcmp(e->name, "checked_sub") || !strcmp(e->name, "checked_mul"))) {
+            /* checked_add(a, b): Some(a + b), or None when the result does not fit the type (instead of wrapping) */
+            if (e->nargs != 2) die(e->line, "'%s' takes exactly two arguments", e->name);
+            Type *a = check_expr(e->args[0]), *b = check_expr(e->args[1]);
+            if (a->k == TY_ILIT && b->k == TY_ILIT) { finalize(e->args[0]); finalize(e->args[1]); }
+            else if (a->k == TY_ILIT) expect_coerce(e->args[0], b, "argument");
+            else if (b->k == TY_ILIT) expect_coerce(e->args[1], a, "argument");
+            a = e->args[0]->ty; b = e->args[1]->ty;
+            if (!is_int(a) || a->is_char || !same(a, b)) die(e->line, "'%s' needs two integers of the same type, found '%s' and '%s'", e->name, tname(a), tname(b));
+            e->builtin = 10; e->op = e->name[8] == 'a' ? O_ADD : e->name[8] == 's' ? O_SUB : O_MUL;
+            e->ty = mk_option(a); e->tmp = alloc_slot(16, 8); return e->ty;
+        }
         if (!f && !strcmp(e->name, "yield_now")) {   /* let other tasks run */
             if (e->nargs != 0) die(e->line, "yield_now takes no arguments");
             uses_async = 1; e->builtin = 6; return e->ty = &ty_void;
@@ -2877,6 +2889,24 @@ static void gen_call(Expr *e) {
     if (ctor) emit("lea rax, [rbp-%d]", e->tmp);
     if (f->is_async) { emit("mov QWORD PTR [rbp-%d], rax", e->tmp); emit("lea rax, [rbp-%d]", e->tmp); }
 }
+static void gen_checked(Expr *e) {   /* checked_add/sub/mul: an Option in the call's temporary, None when the result does not fit */
+    Type *t = e->args[0]->ty; int Ln = newlbl(), Le = newlbl();
+    gen_expr(e->args[0]); gpush("rax"); gen_expr(e->args[1]); emit("mov rcx, rax"); gpop("rax");
+    const char *ins = e->op == O_ADD ? "add" : e->op == O_SUB ? "sub" : "imul";
+    if (t->size == 8) {   /* the flags tell: overflow (signed) or carry/borrow (unsigned) */
+        if (e->op == O_MUL && !t->sign) emit("mul rcx"); else emit("%s rax, rcx", ins);
+        emit(t->sign || e->op == O_MUL ? "jo .L%d" : "jc .L%d", Ln);
+    } else {   /* the operands are extended to 64 bits, so the exact result is there: it must survive truncation */
+        emit("%s rax, rcx", ins);
+        if (t->size == 4) emit(t->sign ? "movsxd rdx, eax" : "mov edx, eax");
+        else if (t->size == 2) emit(t->sign ? "movsx rdx, ax" : "movzx edx, ax");
+        else emit(t->sign ? "movsx rdx, al" : "movzx edx, al");
+        emit("cmp rdx, rax"); emit("jne .L%d", Ln);
+    }
+    store_local(t, e->tmp - 8); emit("mov QWORD PTR [rbp-%d], 0", e->tmp); emit("jmp .L%d", Le);
+    place(Ln); emit("mov QWORD PTR [rbp-%d], 1", e->tmp);
+    place(Le); emit("lea rax, [rbp-%d]", e->tmp);
+}
 static void gen_print(Expr *e) {
     Expr *a = e->args[0]; Type *t = a->ty; const char *fmt; gen_expr(a);
     if (t->k == TY_STR) { emit("mov rsi, rax"); emit("lea rcx, [rip+.Lempty]"); emit("test rsi, rsi"); emit("cmovz rsi, rcx"); fmt = "%s"; }
@@ -2953,6 +2983,7 @@ static void gen_expr0(Expr *e) {
         else if (e->builtin == 7) { gen_expr(e->args[0]); if (!is_agg(e->ty)) load(e->ty, "[rax]"); }   /* take(p): a raw move */
         else if (e->builtin == 8) { int L = newlbl(); gen_expr(e->args[0]); emit("test rax, rax"); emit("jz .L%d", L); emit("mov rax, QWORD PTR [rax-8]"); place(L); }   /* s.len() */
         else if (e->builtin == 9) { gen_expr(e->args[0]); emit("test rax, rax"); emit("lea rcx, [rip+.Lempty]"); emit("cmovz rax, rcx"); }   /* String for C: never null */
+        else if (e->builtin == 10) gen_checked(e);
         else gen_call(e);
         break;
     case E_OK: case E_ERR: {   /* build tag + payload in the expression's temporary */
