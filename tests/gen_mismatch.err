@@ -1,3 +1,3 @@
-tests/gen_mismatch.ag:1:97: error: argument: expected 'i32', found 'i64'
+tests/gen_mismatch.svl:1:97: error: argument: expected 'i32', found 'i64'
     1 | module A; fn pick<T>(a: T, b: T) -> T { return a; } fn main() -> i32 { let x = pick(1 as i32, 2 as i64); return 0; }
       |                                                                                                 ^

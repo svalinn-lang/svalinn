@@ -1,4 +1,4 @@
-// Aegis lexer as a library: turns source text into an array of tokens.
+// Svalinn lexer as a library: turns source text into an array of tokens.
 module Lex;
 
 import std.sys;
@@ -285,7 +285,7 @@ unsafe fn lex_to_array(src: *u8, n: i32, file: i32, ref count: i32) -> *Token {
     lx_file = file;
     lx_ls = 0;
     lx_tok_start = 0;
-    if file >= 32 { dprintf(2, "aegisc: too many source files (at most 32)\n", 0, 0, 0); exit(1); }
+    if file >= 32 { dprintf(2, "svalinnc: too many source files (at most 32)\n", 0, 0, 0); exit(1); }
     file_src[file] = src;
     lex_loop();
     push_tok(TK_EOF, lxl(), null, 0, 0);

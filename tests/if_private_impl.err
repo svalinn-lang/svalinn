@@ -1,3 +1,3 @@
-tests/if_private_impl.ag:1:51: error: 'R.area' must be public to implement interface 'S'
+tests/if_private_impl.svl:1:51: error: 'R.area' must be public to implement interface 'S'
     1 | module A; interface S { fn area() -> i64; } class R : S { private: fn area() -> i64 { return 1; } } fn main() -> i32 { return 0; }
       |                                                   ^

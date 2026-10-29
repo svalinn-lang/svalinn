@@ -1,1 +1,1 @@
-tests/deny.ag:1: error: capability 'Console' is both allowed and denied
+tests/deny.svl:1: error: capability 'Console' is both allowed and denied

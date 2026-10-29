@@ -1,3 +1,3 @@
-tests/foreach_nolen.ag:6:5: error: cannot iterate over 'C': it needs methods len() and item(i: i64)
+tests/foreach_nolen.svl:6:5: error: cannot iterate over 'C': it needs methods len() and item(i: i64)
     6 |     for x in c { println(x); }
       |     ^

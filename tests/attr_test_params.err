@@ -1,3 +1,3 @@
-tests/attr_test_params.ag:3:4: error: a @test function takes no parameters and returns nothing (fail with panic())
+tests/attr_test_params.svl:3:4: error: a @test function takes no parameters and returns nothing (fail with panic())
     3 | fn t(x: i32) {}
       |    ^

@@ -1,3 +1,3 @@
-tests/const_call.ag:4:1: error: constant 'N' must be a literal or an integer expression of literals and constants
+tests/const_call.svl:4:1: error: constant 'N' must be a literal or an integer expression of literals and constants
     4 | const N = f();
       | ^

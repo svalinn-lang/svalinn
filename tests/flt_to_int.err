@@ -1,3 +1,3 @@
-tests/flt_to_int.ag:1:43: error: initializer: expected 'i32', found 'float literal'
+tests/flt_to_int.svl:1:43: error: initializer: expected 'i32', found 'float literal'
     1 | module A; fn main() -> i32 { let x: i32 = 1.5; return 0; }
       |                                           ^

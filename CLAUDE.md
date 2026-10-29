@@ -2,36 +2,41 @@
 
 A compiled, C-syntax systems language with ownership, reference-counted Strings, classes, interfaces,
 generics, Result/`?`, async tasks and a compile-time capability system (`allow File.Read;`, `requires`).
-The code still uses the old name Aegis (`aegisc`, `.ag`, `aegis:` messages); renaming to Svalinn is the
-next planned branch (proposed: compiler `svalinnc`, extension `.svl` — confirm with the user first).
+The language was called Aegis until 1.0.0-rc.1; the code is renamed: compiler `svalinnc`, source files `.svl`,
+runtime errors `svalinn:`, capability section `.svalinn.caps`. One remnant is intentional: generated
+assembly symbols keep the `ag_` prefix (`ag_main`, `ag__drop_X`), shared by both compilers and `lib/rt/*.s`.
 Current version: 1.0.0-rc.1. Linux x86-64 only; on Windows the user works inside WSL2.
 
 ## Layout
-- `src/aegisc.c` — the bootstrap compiler in C (one file): lex → parse → sema → optimizer (-O) → x86-64
+- `src/svalinnc.c` — the bootstrap compiler in C (one file): lex → parse → sema → optimizer (-O) → x86-64
   Intel-syntax assembly, assembled and linked with `gcc -no-pie ... -lm`.
-- `selfhost/*.ag` — the SAME compiler written in Aegis (lex.ag, parse.ag, sema.ag, opt.ag, gen.ag, dump.ag,
-  types.ag, ast.ag, err.ag; drivers aegisc.ag, lexer.ag, parser.ag, semac.ag).
-- `lib/rt/prelude.ag` — runtime in Aegis (Strings, panic, parse), part of every program and trusted.
+- `selfhost/*.svl` — the SAME compiler written in Svalinn (lex.svl, parse.svl, sema.svl, opt.svl, gen.svl, dump.svl,
+  types.svl, ast.svl, err.svl; drivers svalinnc.svl, lexer.svl, parser.svl, semac.svl).
+- `lib/rt/prelude.svl` — runtime in Svalinn (Strings, panic, parse), part of every program and trusted.
 - `lib/rt/fault.s` (runtime error messages, signal handlers), `lib/rt/async.s` (task runtime).
-- `lib/std/*.ag` — standard library: fs, console, env, process, time, math, vec, error (new, capability-
+- `lib/std/*.svl` — standard library: fs, console, env, process, time, math, vec, error (new, capability-
   gated with `requires`), mem, io, sys (low-level, used by the self-hosted compiler).
-- `tests/` — negative tests `*.ag` with exact expected output `*.err`; `tests/run/` programs + `.out`;
+- `tests/` — negative tests `*.svl` with exact expected output `*.err`; `tests/run/` programs + `.out`;
   `tests/io`, `tests/testmode`, `tests/security`, `tests/fuzz` (optimizer fuzz, String fuzz with a
-  Python oracle). `bench/` — benchmarks against C, Rust, Go, Java, Node, Python.
-- `RELEASE-1.0.0.md` — release review; the release plan lives in a separate doc ("Aegis 1.0 Release Plan").
+  Python oracle). `bench/` — benchmarks against C, Rust, Go, Java, Node, Python (results in
+  `bench/RESULTS.md`). `examples/*.svl` — sample programs (also built by `make test`).
+- `docs/RELEASE-PLAN.md` — the 1.0 release plan (priorities, roadmap, checklist, decisions). It is a copy of
+  the shared doc "Aegis 1.0 Release Plan" on claude.ai: when the plan changes, update both.
+- `.github/workflows/test.yml` — CI: runs `make test` on every push and pull request.
+- `README.md` — user-facing overview of the language as it is today; keep it in sync with the plan's status.
 
 ## The one rule that matters
-Every compiler change is made TWICE — in `src/aegisc.c` and in `selfhost/*.ag` — and the two must stay
+Every compiler change is made TWICE — in `src/svalinnc.c` and in `selfhost/*.svl` — and the two must stay
 byte-identical: same token/AST/typed-AST dumps, same error messages, same assembly at -O0 and -O, and both
 bootstraps (C → stage 1 → stage 2, also with -O) must be fixed points. `make test` checks all of it.
-Port C changes line by line in the same order; when output differs, diff `./aegisc --dump-sema f.ag`
-against `./selfhost/semac f.ag`, or `-S` assembly of `./aegisc` against `./selfhost/aegisc1`.
+Port C changes line by line in the same order; when output differs, diff `./svalinnc --dump-sema f.svl`
+against `./selfhost/semac f.svl`, or `-S` assembly of `./svalinnc` against `./selfhost/svalinnc1`.
 
 ## Commands
-- `make` builds `./aegisc`; `make test` runs everything (about a minute; needs gcc, python3, valgrind).
-- `./aegisc file.ag -o out [-O] [-S] [--test] [--dump-tokens|--dump-ast|--dump-sema] [--version]`
-- New negative test: add `tests/x.ag`, generate `tests/x.err` with `./aegisc tests/x.ag -o /tmp/x 2> tests/x.err`
-  and check the message reads well. New runtime test: `tests/run/x.ag` + `tests/run/x.out`.
+- `make` builds `./svalinnc`; `make test` runs everything (about a minute; needs gcc, python3, valgrind).
+- `./svalinnc file.svl -o out [-O] [-S] [--test] [--dump-tokens|--dump-ast|--dump-sema] [--version]`
+- New negative test: add `tests/x.svl`, generate `tests/x.err` with `./svalinnc tests/x.svl -o /tmp/x 2> tests/x.err`
+  and check the message reads well. New runtime test: `tests/run/x.svl` + `tests/run/x.out`.
 - `make clean` before committing; build outputs are in `.gitignore`.
 
 ## Conventions
@@ -49,8 +54,11 @@ against `./selfhost/semac f.ag`, or `-S` assembly of `./aegisc` against `./selfh
 - `main` is protected on GitHub (svalinn-lang/svalinn): work on a branch, open a pull request, merge when
   the `test` check is green.
 - Commit messages: a short summary line, then what and why.
+- The repo lives in WSL (`/home/mathias_giller/svalinn`). Git for Windows refuses the `\\wsl.localhost\...`
+  path ("dubious ownership"), so run git, make and the compiler inside WSL, e.g.
+  `wsl -d Ubuntu --cd /home/mathias_giller/svalinn -- bash -lc "git status"`.
 
-## Decisions already made (release plan)
+## Decisions already made (summary of `docs/RELEASE-PLAN.md`)
 Java-style imports (`import std.fs.File;`, `import std.fs.*;`), module items private unless `public`;
 `allowAccess` = a module lists the modules allowed to call it; closures capture by copy/move only;
 integer overflow wraps (+ checked_* functions, opt-in --overflow-checks); `char` becomes a 32-bit Unicode

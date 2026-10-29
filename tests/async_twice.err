@@ -1,3 +1,3 @@
-tests/async_twice.ag:1:108: error: use of moved value 't'
+tests/async_twice.svl:1:108: error: use of moved value 't'
     1 | module A; async fn f() -> i32 { return 1; } fn main() -> i32 { let t = f(); let a = await t; let b = await t; return 0; }
       |                                                                                                            ^

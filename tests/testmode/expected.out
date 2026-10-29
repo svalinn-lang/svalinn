@@ -1,17 +1,17 @@
 running 5 tests
 test adds ... ok
 test strings ... ok
-aegis: panic: expectation failed: 1 + 1 == 3
+svalinn: panic: expectation failed: 1 + 1 == 3
 test fails ... FAILED
-aegis: index out of bounds
+svalinn: index out of bounds
 test crashes ... FAILED
 test uses_old ... ok
 test result: FAILED. 3 passed, 2 failed
 exit 1
-tests/testmode/deprecated.ag:5:28: warning: 'old_name' is deprecated
+tests/testmode/deprecated.svl:5:28: warning: 'old_name' is deprecated
     5 | fn main() -> i32 { println(old_name() + old_name()); return 0; }
       |                            ^
-tests/testmode/deprecated.ag:5:41: warning: 'old_name' is deprecated
+tests/testmode/deprecated.svl:5:41: warning: 'old_name' is deprecated
     5 | fn main() -> i32 { println(old_name() + old_name()); return 0; }
       |                                         ^
 2

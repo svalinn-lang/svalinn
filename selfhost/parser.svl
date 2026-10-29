@@ -1,4 +1,4 @@
-// AST dump driver: prints the same output as `aegisc --dump-ast`.
+// AST dump driver: prints the same output as `svalinnc --dump-ast`.
 module ParserDriver;
 allow Console;
 allow Native;
@@ -14,7 +14,7 @@ import parse;
 import dump;
 
 unsafe fn main(argc: i32, argv: **u8) -> i32 {
-    if argc < 2 { println("usage: parser <file.ag>"); return 1; }
+    if argc < 2 { println("usage: parser <file.svl>"); return 1; }
     add_file_name(argv[1]);
     src_dir = dir_of(argv[1]);
     exe_dir = dir_of(argv[0]);

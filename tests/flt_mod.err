@@ -1,3 +1,3 @@
-tests/flt_mod.ag:1:42: error: '%' is not supported for floating point
+tests/flt_mod.svl:1:42: error: '%' is not supported for floating point
     1 | module A; fn main() -> i32 { let x = 1.5 % 2.0; return 0; }
       |                                          ^

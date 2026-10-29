@@ -1,3 +1,3 @@
-tests/cap_requires.ag:4:30: error: calling 'File.read_to_string' requires capability 'File.Read' (add 'allow File.Read;' to the module)
+tests/cap_requires.svl:4:30: error: calling 'File.read_to_string' requires capability 'File.Read' (add 'allow File.Read;' to the module)
     4 | fn main() -> i32 { match File.read_to_string("x.txt") { Ok(s) => { println(s); } Err(e) => { } } return 0; }
       |                              ^

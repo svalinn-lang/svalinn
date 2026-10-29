@@ -1,4 +1,4 @@
-// Aegis type system for the self-hosted compiler: a port of the Type machinery in aegisc.c.
+// Svalinn type system for the self-hosted compiler: a port of the Type machinery in svalinnc.c.
 module Types;
 
 import std.sys;

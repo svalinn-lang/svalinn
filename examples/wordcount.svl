@@ -1,5 +1,5 @@
 // wordcount: lines, words and bytes of files, like `wc`, plus the most common word.
-//   ./aegisc examples/wordcount.ag -o wc && ./wc README.md src/aegisc.c
+//   ./svalinnc examples/wordcount.svl -o wc && ./wc README.md src/svalinnc.c
 module WordCount;
 allow Console;
 allow File.Read;

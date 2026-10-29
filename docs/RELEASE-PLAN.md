@@ -5,7 +5,7 @@ this copy is in the repository so Claude Code and contributors can read it. Upda
 changes.
 
 Svalinn 1.0.0 ships when the language is frozen, documented end to end and usable in VS Code. Three phases
-get there from today's 1.0.0-rc.1 (still named Aegis in the code), each ending in a release candidate
+get there from today's 1.0.0-rc.1 (released as Aegis, now renamed in the code), each ending in a release candidate
 that must pass its gate.
 
 ## Where rc.1 stands
@@ -168,8 +168,8 @@ What it takes:
 
 ## Decisions
 
-All decisions are made. What remains is renaming the code from Aegis to Svalinn and confirming the
-compiler's name and file extension (proposed: `svalinnc`, a `svalinn` build tool later, and `.svl`).
+All decisions are made, and the code is renamed from Aegis to Svalinn: the compiler is `svalinnc`, source
+files end in `.svl`, and a `svalinn` build tool follows later.
 
 | # | Decision | Outcome |
 | --- | --- | --- |

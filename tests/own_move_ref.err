@@ -1,3 +1,3 @@
-tests/own_move_ref.ag:1:77: error: cannot move out of 'r' (it is borrowed with 'ref')
+tests/own_move_ref.svl:1:77: error: cannot move out of 'r' (it is borrowed with 'ref')
     1 | module A; class R { public: var x: i32; dtor { } } fn f(ref r: R) { let x = r; } fn main() -> i32 { return 0; }
       |                                                                             ^

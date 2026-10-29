@@ -5,7 +5,7 @@ allow File.Write;
 import std.fs;
 
 fn main() -> i32 {
-    let path = "/tmp/aegis_std_fs_test.txt";
+    let path = "/tmp/svalinn_std_fs_test.txt";
     match File.write_string(path, "line one\nline two\r\nlast") { Ok() => { println("written"); } Err(e) => { println("write failed: " + io_error_text(e)); } }
     match File.read_to_string(path) { Ok(s) => { println(s.len()); } Err(e) => { println("read failed"); } }
     match File.open(path) {
