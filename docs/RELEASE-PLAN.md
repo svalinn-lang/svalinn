@@ -37,38 +37,40 @@ editor support, all in one installable package.
 28 items remain: 8 are P0 blockers that change the language, 11 are P1 work a 1.0 needs, and 9 can wait
 for 1.x. Every compiler change is made twice (C and self-hosted) and must keep the two byte-identical.
 
-| # | Item | Priority | Area | Why it matters | Size |
-| --- | --- | --- | --- | --- | --- |
-| 1 | Module namespaces: Java-style imports, qualified names, `public` vs private items | P0 | Language | Names are global today, so any new std function can break user code | L |
-| 2 | Enums with payloads, `Option<T>`, destructuring `match` | P0 | Language | "Absent" is faked with `Result` and `NotFound`; the std API shape depends on it | M |
-| 3 | Owning interface values (`Vec<Shape>`, interface fields and returns) | P0 | Language | Mixed collections are the core OOP and game case; impossible today | M |
-| 4 | Function values and closures | P0 | Language | Sort, callbacks and iterators need them; adding them later means a second API style | L |
-| 5 | Generic methods (`fn map<U>(...)` in a class) | P0 | Language | Collection APIs depend on them | M |
-| 6 | `allowAccess` module permissions (spec) | P0 | Capabilities | Spec feature; semantics now decided (see Decisions) | S |
-| 7 | Fixed rules for `char`, UTF-8, `usize`/`isize` and integer overflow | P0 | Language | Cannot change after 1.0 without breaking programs | S |
-| 8 | Normative language reference | P0 | Docs | 1.0 freezes what is written down | M |
-| 9 | `HashMap`, `HashSet`, sort, binary search, `Vec` insert/remove | P1 | Std library | Expected in every 1.0 standard library | M |
-| 10 | String formatting, `StringBuilder`, split/join/lines | P1 | Std library | Building strings in a loop is O(n²) today | M |
-| 11 | Directories and paths, random numbers | P1 | Std library | Basic scripting and games need them | S |
-| 12 | `check` mode and JSON diagnostics | P1 | Tooling | The base every editor integration builds on | S |
-| 13 | VS Code extension with a language server | P1 | Tooling | Requested for the release; see the VS Code section | L |
-| 14 | Formatter (`fmt`) | P1 | Tooling | One code style for docs, examples and users | M |
-| 15 | Debug info `-g` (DWARF lines and locals) | P1 | Tooling | Breakpoints and stepping in VS Code and gdb | M |
-| 16 | Parser error recovery; warnings for unused names and unreachable code | P1 | Compiler | One syntax error currently stops the compile | M |
-| 17 | Guide, std API reference, capability reference, error index, docs site | P1 | Docs | Requested for the release; see the docs section | L |
-| 18 | Install and packaging: `make install`, tarball and .deb, `svalinn new/build/run/test` | P1 | Release | Today the compiler only runs from its source tree | M |
-| 19 | CHANGELOG, versioning and compatibility policy (CI and license are done) | P1 | Release | Keeps the compatibility promise checkable | S |
-| 20 | Network module (TCP, UDP, HTTP client) | P2 | Std library | Capabilities exist; the library does not | M |
-| 21 | Threads and async I/O (epoll event loop, timers) | P2 | Runtime | Tasks are cooperative on one thread today | L |
-| 22 | Graphics, audio and input libraries (spec example) | P2 | Std library | The spec's game use case | L |
-| 23 | `allowExternal` and the OS manifest | P2 | Capabilities | Needs operating-system support beyond the compiler | L |
-| 24 | Windows backend first (PE files, Windows x64 calling convention), then macOS and ARM64; own assembler and linker | P2 | Compiler | Linux only today; Windows comes before macOS | L |
-| 25 | Package manager and registry | P2 | Tooling | Sharing libraries between projects | L |
-| 26 | Optimizer: CSE, loop-invariant motion, FMA/AVX, tail calls | P2 | Compiler | Closes the remaining gap to C | M |
-| 27 | Checked-arithmetic build mode, slices and views | P2 | Language | Additive; can come in 1.x | M |
-| 28 | Tree-sitter grammar, JetBrains plugin, rename and refactoring in the language server | P2 | Tooling | Other editors; VS Code comes first | M |
+| # | Item | Priority | Area | Why it matters | Size | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | Module namespaces: Java-style imports, qualified names, `public` vs private items | P0 | Language | Names are global today, so any new std function can break user code | L | Not started: `import std.fs.File;` and top-level `public` are rejected |
+| 2 | Enums with payloads, `Option<T>`, destructuring `match` | P0 | Language | "Absent" is faked with `Result` and `NotFound`; the std API shape depends on it | M | Not started: enums are plain integers, no `Option` |
+| 3 | Owning interface values (`Vec<Shape>`, interface fields and returns) | P0 | Language | Mixed collections are the core OOP and game case; impossible today | M | Not started: interface types are parameter-only |
+| 4 | Function values and closures | P0 | Language | Sort, callbacks and iterators need them; adding them later means a second API style | L | Not started: no `fn` types, no closure syntax |
+| 5 | Generic methods (`fn map<U>(...)` in a class) | P0 | Language | Collection APIs depend on them | M | Not started: methods take no type parameters |
+| 6 | `allowAccess` module permissions (spec) | P0 | Capabilities | Spec feature; semantics now decided (see Decisions) | S | Not started |
+| 7 | Fixed rules for `char`, UTF-8, `usize`/`isize` and integer overflow | P0 | Language | Cannot change after 1.0 without breaking programs | S | Partly: `usize`/`isize` exist and arithmetic wraps; missing 32-bit `char`, `s.chars()`, `checked_*`, `--overflow-checks` |
+| 8 | Normative language reference | P0 | Docs | 1.0 freezes what is written down | M | Not started |
+| 9 | `HashMap`, `HashSet`, sort, binary search, `Vec` insert/remove | P1 | Std library | Expected in every 1.0 standard library | M | Not started: `Vec` has push/pop/get/set/clear only |
+| 10 | String formatting, `StringBuilder`, split/join/lines | P1 | Std library | Building strings in a loop is O(n²) today | M | Not started |
+| 11 | Directories and paths, random numbers | P1 | Std library | Basic scripting and games need them | S | Not started |
+| 12 | `check` mode and JSON diagnostics | P1 | Tooling | The base every editor integration builds on | S | Not started |
+| 13 | VS Code extension with a language server | P1 | Tooling | Requested for the release; see the VS Code section | L | Not started: no `editors/` |
+| 14 | Formatter (`fmt`) | P1 | Tooling | One code style for docs, examples and users | M | Not started |
+| 15 | Debug info `-g` (DWARF lines and locals) | P1 | Tooling | Breakpoints and stepping in VS Code and gdb | M | Not started |
+| 16 | Parser error recovery; warnings for unused names and unreachable code | P1 | Compiler | One syntax error currently stops the compile | M | Not started: a warning mechanism exists (`@deprecated`), unused names are silent |
+| 17 | Guide, std API reference, capability reference, error index, docs site | P1 | Docs | Requested for the release; see the docs section | L | Not started: the README is the only user documentation |
+| 18 | Install and packaging: `make install`, tarball and .deb, `svalinn new/build/run/test` | P1 | Release | Today the compiler only runs from its source tree | M | Not started |
+| 19 | CHANGELOG, versioning and compatibility policy | P1 | Release | Keeps the compatibility promise checkable | S | Partly: CI and MIT license done; no CHANGELOG or policy |
+| 20 | Network module (TCP, UDP, HTTP client) | P2 | Std library | Capabilities exist; the library does not | M | Not started (the `Network` capabilities exist) |
+| 21 | Threads and async I/O (epoll event loop, timers) | P2 | Runtime | Tasks are cooperative on one thread today | L | Not started |
+| 22 | Graphics, audio and input libraries (spec example) | P2 | Std library | The spec's game use case | L | Not started |
+| 23 | `allowExternal` and the OS manifest | P2 | Capabilities | Needs operating-system support beyond the compiler | L | Not started |
+| 24 | Windows backend first (PE files, Windows x64 calling convention), then macOS and ARM64; own assembler and linker | P2 | Compiler | Linux only today; Windows comes before macOS | L | Not started |
+| 25 | Package manager and registry | P2 | Tooling | Sharing libraries between projects | L | Not started |
+| 26 | Optimizer: CSE, loop-invariant motion, FMA/AVX, tail calls | P2 | Compiler | Closes the remaining gap to C | M | Not started (loop-invariant scalars are only hoisted inside the float vectorizer) |
+| 27 | Checked-arithmetic build mode, slices and views | P2 | Language | Additive; can come in 1.x | M | Not started |
+| 28 | Tree-sitter grammar, JetBrains plugin, rename and refactoring in the language server | P2 | Tooling | Other editors; VS Code comes first | M | Not started |
 
 Size: S = one feature and its tests; M = several files in both compilers plus tests; L = a new subsystem.
+Status was checked against the compiler on `main` (2026-10-29) with a small program per feature; an item is
+marked **Done** when it is merged with tests, and the table is updated in the same pull request.
 
 ## Release roadmap
 
