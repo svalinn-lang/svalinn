@@ -51,11 +51,11 @@ A complete version is `examples/wordcount.svl`.
 - `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `bool`, `char`, `String`; `as` casts
 - structs, struct literals `Point { x: 1, y: 2 }`, enums, fixed arrays `[N]T` (bounds-checked)
 - `if`, `while`, `for i in a..b`, `for x in array / string / collection`, `break`, `continue`
-- `match` on integers, enums and `Result` (exhaustiveness-checked)
+- `match` on integers, enums, `Result` and `Option` (exhaustiveness-checked)
 - functions with any number of parameters, `ref` parameters, struct/class returns
 - classes (constructors, destructors, visibility, static methods, single inheritance, `super`), interfaces
   (dynamic dispatch), generic structs/classes/functions with interface constraints (monomorphised)
-- `Result<T, E>`, `Ok`/`Err`, `?`
+- `Result<T, E>`, `Ok`/`Err`, `Option<T>`, `Some`/`None`, `?`
 - ownership: values with destructors are moved, never copied; compile-time use-after-move errors
 - `async fn`, `await`, `yield_now()`: cooperative tasks with structured lifetimes
 - `unsafe` blocks/functions: pointers, `&`, `*`, pointer arithmetic, `extern fn` (C functions)
@@ -161,6 +161,17 @@ Every negative test in `tests/*.svl` has its exact expected output in `tests/*.e
 - `Result<T, E>` is a tagged value; `T` may be `void` (`Ok()`, matched as `Ok() =>`)
 - `Ok(x)`/`Err(e)` take their type from context; `expr?` returns early with the same error type
 
+## Option
+    fn find(ref v: Vec<i32>, x: i32) -> Option<i64> {
+        for i in 0..v.len() { if v.item(i) == x { return Some(i); } }
+        return None;
+    }
+    fn next(o: Option<i32>) -> Option<i32> { let v = o?; return Some(v + 1); }   // None returns None
+    match find(ref v, 7) { Some(i) => { println(i); }  None => { println("missing"); } }
+- `Option<T>` is a value that may be absent: `Some(x)` or `None`, both typed by their context
+- `match` must handle both `Some(name)` (or `Some(_)`) and `None`, or use `_ =>`
+- `expr?` on an Option returns `None` early; it works only in a function that returns an Option
+
 ## Interfaces and inheritance
     interface Shape { fn area() -> i64; fn name() -> String; }
     class Rect : Shape { ... public: fn area() -> i64 { ... } fn name() -> String { ... } }
@@ -222,7 +233,7 @@ dumps and every error message of the two compilers. Check by hand:
 `./svalinnc --dump-sema f.svl` vs `./selfhost/semac f.svl`.
 
 ## Tests (`make test`)
-examples; 90 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
+examples; 96 negative tests with their exact expected compiler output (`tests/*.err`); runtime tests with expected
 output under `-O0`, `-O` and both compilers, each run under valgrind (no memory errors, no leaks); command line,
 stdin, runtime-error messages and the `--test` runner; the `protect Process` attack test; lexer/parser/checker/code
 generator identity between the compilers; both bootstraps; differential fuzzing of the optimizer; String fuzzing

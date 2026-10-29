@@ -28,6 +28,7 @@ struct Type {
     kind: i32; size: i32; align: i32; sign: i32; is_char: i32;
     n: i64;
     elem: *Type; sd: *StructDef; ed: *EnumDef; err: *Type; ifc: *Iface;
+    opt: i32;   // Option<T> (a Result<T, void> spelled Some/None)
 }
 struct FieldDef { name: *u8; ty: *Type; off: i32; is_mut: i32; vis: i32; init: *Expr; owner: *StructDef; }
 struct Generic { name: *u8; kind: i32; np: i32; start: i32; is_unsafe: i32; is_async: i32; line: i32; pn: [8]*u8; pc: [8]*u8; }
@@ -122,6 +123,11 @@ unsafe fn mk_result(t: *Type, e: *Type) -> *Type {
     r.err = e;
     r.align = 8;
     r.size = 8 + (pl + 7) / 8 * 8;
+    return r;
+}
+unsafe fn mk_option(t: *Type) -> *Type {   // tag 0 Some, 1 None
+    let r = mk_result(t, ty_void);
+    r.opt = 1;
     return r;
 }
 unsafe fn is_agg(t: *Type) -> bool { return t.kind == TY_STRUCT || t.kind == TY_ARRAY || t.kind == TY_RESULT || t.kind == TY_IFACE || t.kind == TY_TASK; }
@@ -223,7 +229,7 @@ unsafe fn same(a: *Type, b: *Type) -> bool {
     if k == TY_ARRAY { return a.n == b.n && same(a.elem, b.elem); }
     if k == TY_STRUCT { return a.sd == b.sd; }
     if k == TY_ENUM { return a.ed == b.ed; }
-    if k == TY_RESULT { return same(a.elem, b.elem) && same(a.err, b.err); }
+    if k == TY_RESULT { return a.opt == b.opt && same(a.elem, b.elem) && same(a.err, b.err); }
     if k == TY_IFACE { return a.ifc == b.ifc; }
     if k == TY_TASK { return same(a.elem, b.elem); }
     return true;
@@ -260,6 +266,11 @@ unsafe fn tname_into(ref b: StrBuf, t: *Type) {
     }
     else if k == TY_STRUCT { sb_cat_c(ref b, t.sd.name); }
     else if k == TY_ENUM { sb_cat_c(ref b, t.ed.name); }
+    else if k == TY_RESULT && t.opt != 0 {
+        sb_cat(ref b, "Option<");
+        tname_into(ref b, t.elem);
+        sb_cat(ref b, ">");
+    }
     else if k == TY_RESULT {
         sb_cat(ref b, "Result<");
         tname_into(ref b, t.elem);
@@ -270,8 +281,10 @@ unsafe fn tname_into(ref b: StrBuf, t: *Type) {
     else if k == TY_PARAM { sb_cat(ref b, "type parameter"); }
     else if k == TY_IFACE { sb_cat_c(ref b, t.ifc.name); }
     else if k == TY_TASK { sb_cat(ref b, "Task<"); tname_into(ref b, t.elem); sb_cat(ref b, ">"); }
+    else if k == TY_RESPEND && t.opt != 0 && t.n != 0 { sb_cat(ref b, "None"); }
     else if k == TY_RESPEND {
-        if t.n != 0 { sb_cat(ref b, "Err("); } else { sb_cat(ref b, "Ok("); }
+        if t.opt != 0 { sb_cat(ref b, "Some("); }
+        else if t.n != 0 { sb_cat(ref b, "Err("); } else { sb_cat(ref b, "Ok("); }
         tname_into(ref b, t.elem);
         sb_cat(ref b, ")");
     }

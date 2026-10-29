@@ -1,0 +1,3 @@
+tests/opt_badpattern.svl:1:51: error: match patterns on an Option must be Some(name) or None
+    1 | module A; fn f(o: Option<i32>) -> i32 { match o { Ok(v) => { return v; } Err(e) => { return 0; } } } fn main() -> i32 { return f(None); }
+      |                                                   ^

@@ -1,0 +1,1 @@
+module A; fn f(o: Option<i32>) -> i32 { match o { Some(v) => { return v; } } return 0; } fn main() -> i32 { return f(None); }

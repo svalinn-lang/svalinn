@@ -1,0 +1,3 @@
+tests/opt_nonexh.svl:1:41: error: non-exhaustive match on Option: handle both Some and None (or add '_ =>')
+    1 | module A; fn f(o: Option<i32>) -> i32 { match o { Some(v) => { return v; } } return 0; } fn main() -> i32 { return f(None); }
+      |                                         ^
